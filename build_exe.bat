@@ -9,14 +9,6 @@ if errorlevel 1 (
     python -m pip install pyinstaller
 )
 
-REM Create icon if it doesn't exist
-if not exist "icon.ico" (
-    if not exist "icon.png" (
-        echo Creating icon files...
-        python create_simple_icon.py
-    )
-)
-
 REM Build the executable (Qt splash handles loading feedback)
 if exist "icon.ico" (
     echo Building with icon...

@@ -31,3 +31,10 @@ desktop.ini
 # Logs / temp
 output.txt
 *.log
+
+# Dev-only helper scripts and orphan assets (not needed to run or build)
+create_simple_icon.py
+create_splash.py
+test_icon.py
+convert_icon.py
+logo.png
