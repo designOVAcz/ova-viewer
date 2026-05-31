@@ -1,0 +1,3 @@
+PySide6>=6.0
+PyMuPDF>=1.20
+rarfile>=4

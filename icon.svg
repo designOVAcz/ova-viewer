@@ -1,0 +1,25 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#2D5AA0" stroke="#1E3F73" stroke-width="2"/>
+  
+  <!-- Photo frame -->
+  <rect x="20" y="25" width="88" height="66" rx="4" ry="4" fill="#FFFFFF" stroke="#CCCCCC" stroke-width="2"/>
+  <rect x="24" y="29" width="80" height="58" rx="2" ry="2" fill="#F0F0F0"/>
+  
+  <!-- Mountain landscape -->
+  <path d="M24 70 L44 45 L64 60 L84 35 L104 55 L104 87 L24 87 Z" fill="#4A90E2"/>
+  <path d="M24 75 L35 65 L50 70 L65 60 L80 65 L95 60 L104 65 L104 87 L24 87 Z" fill="#7CB342"/>
+  
+  <!-- Sun -->
+  <circle cx="85" cy="45" r="8" fill="#FFD54F"/>
+  
+  <!-- Random dice indicator -->
+  <rect x="90" y="95" width="16" height="16" rx="2" ry="2" fill="#FF5722" stroke="#D84315" stroke-width="1"/>
+  <circle cx="94" cy="99" r="1" fill="white"/>
+  <circle cx="98" cy="103" r="1" fill="white"/>
+  <circle cx="102" cy="107" r="1" fill="white"/>
+  
+  <!-- Folder icon -->
+  <path d="M22 95 L22 107 L42 107 L42 95 Z" fill="#FFA726"/>
+  <path d="M22 95 L28 95 L30 97 L42 97 L42 95" fill="#FF8F00"/>
+</svg>

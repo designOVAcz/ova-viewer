@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# PyInstaller
+*.pkg
+*.pyz
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Logs / temp
+output.txt
+*.log
