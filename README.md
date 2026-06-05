@@ -4,6 +4,13 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ---
 
+## Recent Updates
+
+- Added an eraser tool that removes annotations without touching the underlying image.
+- Added live free-line preview while placing 2-click line annotations.
+- Added posterize/value-filter controls for reducing images to N grayscale tones.
+- Added Canny-based edge detection with OpenCV support and adjustable sensitivity.
+
 ## Features
 
 **Viewing**
@@ -18,7 +25,9 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 **Annotation**
 - 📏 Vertical, horizontal, and free-angle line tools
+- 🧽 Eraser tool for removing parts of line and free-draw annotations
 - ✏️ Freehand draw with pressure-sensitive thickness (pen/stylus/tablet)
+- 👀 Live rubber-band preview for free-angle line placement
 - Undo, toggle visibility, clear all lines
 - Save annotated view to file
 
@@ -27,6 +36,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🪄 **Auto-extract palette** — extracts dominant colors into the floating palette panel
 - 🎨 **Floating palette panel** — resizable, draggable, persists across tool switches; swatches organized by extraction session
 - 🎞️ **CUBE LUT support** with GPU-accelerated (OpenCL) processing and adjustable strength
+- ◑ **Posterize/value filter** — reduce images to 2-10 grayscale tones for value studies
+- 📐 **Edge detection** with Canny filtering and multiple display modes
 - Grayscale, contrast, and gamma sliders with per-effect toggles
 
 **Other**
@@ -44,6 +55,7 @@ cd ova-viewer
 pip install -r requirements.txt
 # Optional GPU LUT acceleration:
 # pip install pyopencl
+# If installing dependencies manually, include opencv-python for edge detection.
 python main.py
 ```
 

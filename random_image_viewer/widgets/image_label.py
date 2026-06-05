@@ -143,6 +143,52 @@ class ImageLabel(QLabel):
             original_y = original_size.height() - unrotated_y
         return original_x, original_y
 
+    def _map_pos_with_cache(self, pos, cache):
+        """Fast label→original mapping using a precomputed geometry cache.
+
+        Same math as _map_label_pos_to_original but with NO per-event image
+        reload — used on the eraser hot path so high-frequency tablet events
+        don't freeze the UI. Returns (x, y) or (None, None) if outside image.
+        """
+        draw_x = cache['draw_x']
+        draw_y = cache['draw_y']
+        zoomed_width = cache['zoomed_width']
+        zoomed_height = cache['zoomed_height']
+        rel_x = pos.x() - draw_x
+        rel_y = pos.y() - draw_y
+        if not (0 <= rel_x <= zoomed_width and 0 <= rel_y <= zoomed_height):
+            return None, None
+        original_size = cache['original_size']
+        rotation = cache['rotation']
+        if rotation == 90 or rotation == 270:
+            scale_x = zoomed_width / original_size.height()
+            scale_y = zoomed_height / original_size.width()
+        else:
+            scale_x = zoomed_width / original_size.width()
+            scale_y = zoomed_height / original_size.height()
+        if scale_x == 0 or scale_y == 0:
+            return None, None
+        display_x = rel_x / scale_x
+        display_y = rel_y / scale_y
+
+        if rotation == 0:
+            unrotated_x, unrotated_y = display_x, display_y
+        elif rotation == 90:
+            unrotated_x, unrotated_y = display_y, original_size.width() - display_x
+        elif rotation == 180:
+            unrotated_x, unrotated_y = original_size.width() - display_x, original_size.height() - display_y
+        elif rotation == 270:
+            unrotated_x, unrotated_y = original_size.height() - display_y, display_x
+        else:
+            unrotated_x, unrotated_y = display_x, display_y
+
+        original_x, original_y = unrotated_x, unrotated_y
+        if cache['flipped_h']:
+            original_x = original_size.width() - unrotated_x
+        if cache['flipped_v']:
+            original_y = original_size.height() - unrotated_y
+        return original_x, original_y
+
     def update_animation_size(self, scaled_size):
         """Update the scaled size of the running animation (e.g. on resize)"""
         if self._current_movie is not None and self._current_movie.state() == QMovie.Running:
@@ -386,7 +432,8 @@ class ImageLabel(QLabel):
             is_any_drawing_mode = (self.parent_viewer.line_drawing_mode or
                                  self.parent_viewer.horizontal_line_drawing_mode or
                                  self.parent_viewer.free_line_drawing_mode or
-                                 self.parent_viewer.free_draw_mode)
+                                 self.parent_viewer.free_draw_mode or
+                                 getattr(self.parent_viewer, 'eraser_mode', False))
 
             if not is_any_drawing_mode:
                 super().mousePressEvent(event)
@@ -513,6 +560,8 @@ class ImageLabel(QLabel):
                     # PEN PRESSURE: Store current pressure for real-time painting
                     if self.parent_viewer and self.parent_viewer.pen_pressure_enabled:
                         self.parent_viewer._current_pressure = pressure
+                if getattr(self.parent_viewer, 'eraser_mode', False):
+                    self.parent_viewer.start_erase_stroke(original_x, original_y)
 
         super().mousePressEvent(event)
 
@@ -551,6 +600,32 @@ class ImageLabel(QLabel):
                 if t is not None:
                     t.stop()
             # Don't return — let normal hover handling continue (e.g., tooltips)
+
+        # 📏 Free line: live rubber-band preview from the first click to the pen.
+        # Triggers on hover (no button) once a start point exists, so the user sees
+        # the line forming before committing it with the second click.
+        if (self.parent_viewer and getattr(self.parent_viewer, 'free_line_drawing_mode', False)
+                and getattr(self.parent_viewer, 'current_line_start', None) is not None
+                and self.pixmap() and not self.pixmap().isNull()):
+            self.parent_viewer.update_free_line_preview(event.position())
+            # Don't return — allow normal hover handling to continue.
+
+        # 🧽 Eraser: live erase while dragging with the left button held
+        if (self.parent_viewer and getattr(self.parent_viewer, 'eraser_mode', False) and
+            getattr(self.parent_viewer, 'is_erasing', False) and (event.buttons() & Qt.LeftButton) and
+            self.pixmap() and not self.pixmap().isNull()):
+            # ⚡ Use the precomputed stroke cache for mapping — NO image reload and
+            # NO widgetAt()/smooth-scale per event. This is what keeps the tablet's
+            # high event rate from saturating the UI thread (which froze the app).
+            cache = getattr(self.parent_viewer, 'eraser_cache', None)
+            if not cache:
+                super().mouseMoveEvent(event)
+                return
+            ox, oy = self._map_pos_with_cache(event.position(), cache)
+            if ox is not None:
+                self.parent_viewer.add_erase_point(ox, oy)
+            event.accept()
+            return
 
         # OPTIMIZED: Handle free draw mode with ultra-fast real-time painting
         if (self.parent_viewer and self.parent_viewer.free_draw_mode and
@@ -737,6 +812,14 @@ class ImageLabel(QLabel):
             self.parent_viewer.free_draw_mode and self.parent_viewer.is_drawing_free_stroke):
             print(f"Mouse release in free draw mode")
             self.parent_viewer.end_free_draw_stroke()
+            event.accept()
+            return
+
+        # 🧽 Eraser mouse release
+        if (event.button() == Qt.LeftButton and self.parent_viewer and
+            getattr(self.parent_viewer, 'eraser_mode', False) and
+            getattr(self.parent_viewer, 'is_erasing', False)):
+            self.parent_viewer.end_erase_stroke()
             event.accept()
             return
 

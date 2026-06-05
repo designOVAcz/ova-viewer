@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QPixmap, QPainter, QColor, QPen, QFont, QIcon, QColorTransform,
-    QMouseEvent, QImageReader, QTransform, QAction, QShortcut, QImage, QTabletEvent
+    QMouseEvent, QImageReader, QTransform, QAction, QShortcut, QImage, QTabletEvent, QCursor
 )
-from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QEvent, QPropertyAnimation, QEasingCurve, QThread
+from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QEvent, QPropertyAnimation, QEasingCurve, QThread, QPoint
+from PySide6.QtWidgets import QLayout, QWidgetAction
 
 from random_image_viewer.constants import IMAGE_EXTENSIONS, MEDIA_EXTENSIONS, DOCUMENT_EXTENSIONS, PLAYLIST_EXTENSIONS
 from random_image_viewer.platform_utils import (
@@ -448,6 +449,11 @@ class RandomImageViewer(QMainWindow):
                 return
             if not self.lines_visible:
                 return
+            # 🧽 Eraser active: the fast overlay path paints onto the already-drawn
+            # pixmap and cannot reveal the clean image. Use the full erase-aware path.
+            if self.erase_strokes or self.current_erase_stroke:
+                self.display_image(self.current_image)
+                return
             # Get currently displayed pixmap (may already have LUT/enhancements applied)
             current_pixmap = self.image_label.pixmap()
             if (not current_pixmap) or current_pixmap.isNull():
@@ -645,13 +651,15 @@ class RandomImageViewer(QMainWindow):
                             for i in range(len(stroke) - 1):
                                 # 🎨 PEN PRESSURE: Handle both old 2-tuple and new 3-tuple formats
                                 if len(stroke[i]) == 3:
-                                    start_x, start_y, _ = stroke[i]
+                                    start_x, start_y, start_pressure = stroke[i]
                                 else:
                                     start_x, start_y = stroke[i]
+                                    start_pressure = 1.0
                                 if len(stroke[i + 1]) == 3:
-                                    end_x, end_y, _ = stroke[i + 1]
+                                    end_x, end_y, end_pressure = stroke[i + 1]
                                 else:
                                     end_x, end_y = stroke[i + 1]
+                                    end_pressure = 1.0
                                 
                                 # Apply flip transformations first
                                 flip_start_x = start_x if not self.flipped_h else original_size.width() - start_x
@@ -682,6 +690,10 @@ class RandomImageViewer(QMainWindow):
                                     display_end_x = int(flip_end_x * scale_x) + offset_x
                                     display_end_y = int(flip_end_y * scale_y) + offset_y
                                 
+                                # 🎨 PEN PRESSURE: Per-segment thickness matches the live preview
+                                avg_pressure = (start_pressure + end_pressure) / 2.0
+                                dynamic_thickness = self._pressure_to_thickness(avg_pressure)
+                                painter.setPen(QPen(self.line_color, dynamic_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                 painter.drawLine(display_start_x, display_start_y, display_end_x, display_end_y)
                         painter.setRenderHint(QPainter.Antialiasing, False)
                 else:
@@ -708,13 +720,19 @@ class RandomImageViewer(QMainWindow):
                             for i in range(len(stroke) - 1):
                                 # 🎨 PEN PRESSURE: Handle both old 2-tuple and new 3-tuple formats
                                 if len(stroke[i]) == 3:
-                                    start_x, start_y, _ = stroke[i]
+                                    start_x, start_y, start_pressure = stroke[i]
                                 else:
                                     start_x, start_y = stroke[i]
+                                    start_pressure = 1.0
                                 if len(stroke[i + 1]) == 3:
-                                    end_x, end_y, _ = stroke[i + 1]
+                                    end_x, end_y, end_pressure = stroke[i + 1]
                                 else:
                                     end_x, end_y = stroke[i + 1]
+                                    end_pressure = 1.0
+                                # 🎨 PEN PRESSURE: Per-segment thickness matches the live preview
+                                avg_pressure = (start_pressure + end_pressure) / 2.0
+                                dynamic_thickness = self._pressure_to_thickness(avg_pressure)
+                                painter.setPen(QPen(self.line_color, dynamic_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                 painter.drawLine(int(start_x * scale_x) + offset_x, int(start_y * scale_y) + offset_y,
                                                int(end_x * scale_x) + offset_x, int(end_y * scale_y) + offset_y)
                         painter.setRenderHint(QPainter.Antialiasing, False)
@@ -749,13 +767,19 @@ class RandomImageViewer(QMainWindow):
                         for i in range(len(stroke) - 1):
                             # 🎨 PEN PRESSURE: Handle both old 2-tuple and new 3-tuple formats
                             if len(stroke[i]) == 3:
-                                start_x, start_y, _ = stroke[i]
+                                start_x, start_y, start_pressure = stroke[i]
                             else:
                                 start_x, start_y = stroke[i]
+                                start_pressure = 1.0
                             if len(stroke[i + 1]) == 3:
-                                end_x, end_y, _ = stroke[i + 1]
+                                end_x, end_y, end_pressure = stroke[i + 1]
                             else:
                                 end_x, end_y = stroke[i + 1]
+                                end_pressure = 1.0
+                            # 🎨 PEN PRESSURE: Per-segment thickness matches the live preview
+                            avg_pressure = (start_pressure + end_pressure) / 2.0
+                            dynamic_thickness = self._pressure_to_thickness(avg_pressure)
+                            painter.setPen(QPen(self.line_color, dynamic_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                             painter.drawLine(int(start_x * scale_x), int(start_y * scale_y),
                                            int(end_x * scale_x), int(end_y * scale_y))
                     painter.setRenderHint(QPainter.Antialiasing, False)
@@ -770,7 +794,7 @@ class RandomImageViewer(QMainWindow):
         super().__init__()
         self.setFocusPolicy(Qt.StrongFocus)
         self.setWindowTitle("Ova Viewer")
-        self.setGeometry(100, 100, 950, 650)
+        self.setGeometry(100, 100, 1200, 760)
         
         # Set window icon
         self.set_window_icon()
@@ -854,16 +878,47 @@ class RandomImageViewer(QMainWindow):
         self.temp_stroke_overlay = None  # Temporary overlay for real-time drawing
         self.last_draw_point = None  # Track last painted point for incremental drawing
         
-        # ⚡ ULTRA-FAST: Timer-based updates for true real-time performance
+        # ⚡ ULTRA-FAST: Timer-based updates for true real-time performance.
+        # Free-draw paints onto a cached overlay (cheap, no per-event image reload),
+        # so it can refresh almost immediately for low-latency pen feedback. The
+        # eraser freeze was a separate issue (fixed via its own coord cache), so a
+        # fast interval here is safe.
         self.stroke_update_timer = QTimer(self)
         self.stroke_update_timer.setSingleShot(True)
         self.stroke_update_timer.timeout.connect(self._update_display_with_overlay)
-        self.stroke_update_timer.setInterval(2)  # ⚡ INCREASED: ~500 FPS for ultra-responsive drawing
+        self.stroke_update_timer.setInterval(8)  # ~120 FPS steady refresh during strokes; low latency, input-flood-safe
         self.drawn_lines = []  # List of x positions for vertical lines
         self.drawn_horizontal_lines = []  # List of y positions for horizontal lines
         self.drawn_free_lines = []  # List of free lines, each with start and end points
         self.drawn_free_strokes = []  # NEW: List of free draw strokes (continuous paths)
+        # 🧽 Eraser tool: partial pixel-erase of the drawing/line layer (never the image).
+        # Each stroke is a list of (x, y, radius) points in ORIGINAL image coords;
+        # radius is stored in original-image px so erased holes stay anchored under zoom.
+        self.eraser_mode = False
+        self.eraser_size = 20  # Eraser diameter in screen px (range 1-30)
+        self.erase_strokes = []  # List[List[(x, y, radius)]]
+        # For each committed erase stroke, snapshot how many free strokes/lines existed
+        # at that moment. Drawings added AFTER the most recent erase are kept visible
+        # inside erase holes, so you can draw again over an erased area.
+        self._erase_state_marks = []  # Parallel to erase_strokes: [{'free_strokes': n, 'free_lines': n}]
+        self.current_erase_stroke = None  # Stroke being drawn
+        self.is_erasing = False  # Track if currently erasing
+        self.eraser_cache = None  # Precomputed coord-mapping geometry during a stroke
+        # ⚡ Coalesce high-frequency tablet/mouse erase points into ~60 FPS redraws
+        # so a fast drag doesn't fire a full display_image per event and freeze.
+        self.erase_update_timer = QTimer(self)
+        self.erase_update_timer.setSingleShot(True)
+        self.erase_update_timer.setInterval(16)
+        self.erase_update_timer.timeout.connect(self._flush_erase_update)
         self.current_line_start = None  # Store first click point for free line
+        self._line_preview_base = None  # Snapshot pixmap for free-line rubber-band preview
+        self._line_preview_geom = None  # Geometry cache for the preview
+        self._line_preview_pending_pos = None  # Latest pen pos awaiting render
+        # ⚡ Throttle the free-line preview to ~60 FPS (tablet-event-rate safe)
+        self.line_preview_timer = QTimer(self)
+        self.line_preview_timer.setSingleShot(True)
+        self.line_preview_timer.setInterval(16)
+        self.line_preview_timer.timeout.connect(self._flush_line_preview)
         self.current_stroke = None  # NEW: Current stroke being drawn
         self.is_drawing = False  # NEW: Track if currently drawing a stroke
         self.lines_visible = True  # New: Toggle line visibility
@@ -889,6 +944,15 @@ class RandomImageViewer(QMainWindow):
         self.grayscale_value = 0  # 0 = color, 100 = full grayscale
         self.contrast_value = 50  # 50 = normal, -130 to 200 range
         self.gamma_value = 0     # 0 = normal, -200 to +500 range
+        self.value_filter_enabled = False  # Posterize to N grayscale tones (value study)
+        self.value_levels = 4              # Number of value levels when posterize is enabled (2-10)
+        # Edge detection (Canny "plane change" filter)
+        self.edge_detection_enabled = False  # Toggle Canny edge detection
+        self.edge_mode = "white_on_black"    # white_on_black | black_on_white | overlay
+        self.edge_sensitivity = 50           # 0-100, drives Canny thresholds
+        # Edge line color override. None = each mode's default (white on dark,
+        # black on light, line color over image). Set by the line-color tools.
+        self.edge_color = None
         self.rotation_angle = 0   # Rotation angle in degrees
         self.flipped_h = False    # Horizontal flip state
         self.flipped_v = False    # Vertical flip state
@@ -938,9 +1002,9 @@ class RandomImageViewer(QMainWindow):
         self.timer.timeout.connect(self._on_timer_tick)
 
         self.init_ui()
-        # Set initial window geometry (width 885 triggers two-row layout below threshold 1500)
+        # Set initial window geometry — a bit wider than before.
         try:
-            self.resize(885, 700)
+            self.resize(1200, 760)
         except Exception as _e:
             pass
         
@@ -1024,36 +1088,49 @@ class RandomImageViewer(QMainWindow):
         # 🎨 Enable tablet tracking on main window for proper pressure support
         self.setTabletTracking(True)
         self.setAttribute(Qt.WA_TabletTracking, True)
-        
-        # Create main toolbar
+
+        # Create main toolbar — Qt's native overflow ('»') button appears
+        # automatically when items don't fit at the current window width,
+        # giving access to clipped icons via a popup.
         self.main_toolbar = QToolBar("Main Toolbar")
         self.main_toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(Qt.TopToolBarArea, self.main_toolbar)
         self.main_toolbar.setMovable(False)
-        self.main_toolbar.setStyleSheet("QToolBar { spacing: 4px; }")
+        # Right padding keeps the last icon clear of the native overflow
+        # ('»') button when the bar is narrow.
+        self.main_toolbar.setStyleSheet("QToolBar { spacing: 4px; padding-right: 24px; }")
 
         # Force a toolbar break to ensure next toolbar goes on new line
         self.addToolBarBreak(Qt.TopToolBarArea)
-        
+
         # Create secondary toolbar for sliders (initially hidden) - this will be BELOW main toolbar
         self.slider_toolbar = QToolBar("Slider Toolbar")
         self.slider_toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(Qt.TopToolBarArea, self.slider_toolbar)
         self.slider_toolbar.setMovable(False)
-        self.slider_toolbar.setStyleSheet("QToolBar { spacing: 4px; background: #2a2d30; border-top: 1px solid #35383b; }")
-        self.slider_toolbar.setMinimumHeight(32)  # Ensure minimum height
-        self.slider_toolbar.setMaximumHeight(40)  # Set reasonable max height
+        self.slider_toolbar.setStyleSheet("QToolBar { spacing: 4px; padding-right: 24px; background: #2a2d30; border-top: 1px solid #35383b; }")
+        self.slider_toolbar.setMinimumHeight(32)
+        self.slider_toolbar.setMaximumHeight(40)
         self.slider_toolbar.hide()
 
-        # Track which mode we're in
+        # Track which mode we're in. Lowered threshold (was 1500) so the
+        # second row appears earlier and fewer icons get hidden behind the
+        # native '»' overflow popup at common window widths.
+        # Track which mode we're in. Threshold raised (was 1100) so the
+        # second row appears before any icon would overflow into the
+        # native '»' popup, which is hard to keep open on hover-out.
         self.two_row_mode = False
-        self.width_threshold = 1500  # Higher threshold - switch to two rows below this width (was 900)
+        self.width_threshold = 1600
 
         # Setup main toolbar with all controls
         self._setup_main_toolbar()
         
         # Setup enhancement controls on BOTH toolbars permanently
         self._setup_enhancement_controls()
+
+        # Keep the toolbar overflow ('»') popup open for 2 seconds after
+        # the cursor leaves it, so the user has time to come back.
+        self._install_popup_persistence()
 
         # Central widget and layout setup
         central_splitter = QSplitter(Qt.Horizontal)
@@ -1190,6 +1267,10 @@ class RandomImageViewer(QMainWindow):
         self.right_shortcut = QShortcut("Right", self)
         self.right_shortcut.activated.connect(lambda: self._video_shortcut_seek(5000))
 
+        # Delete current file (move to Recycle Bin)
+        self.delete_shortcut = QShortcut("Delete", self)
+        self.delete_shortcut.activated.connect(self.delete_current_file)
+
         print("Global shortcuts set up successfully")
 
     def emergency_exit_fullscreen(self):
@@ -1236,6 +1317,10 @@ class RandomImageViewer(QMainWindow):
 
         # ── SECTION: File ──
         open_btn = QToolButton(); open_btn.setText("📁"); open_btn.setToolTip("Open Folder"); open_btn.setFixedSize(24,24); open_btn.clicked.connect(self.choose_folder); toolbar.addWidget(open_btn)
+        add_spacer(2)
+        self.delete_file_btn = QToolButton(); self.delete_file_btn.setText("🗑"); self.delete_file_btn.setToolTip("Move current file to Recycle Bin (Delete)"); self.delete_file_btn.setFixedSize(24,24); self.delete_file_btn.clicked.connect(self.delete_current_file); toolbar.addWidget(self.delete_file_btn)
+        add_spacer(2)
+        save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view to Downloads (includes LUT, enhancements and lines)"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self.save_current_view); toolbar.addWidget(save_btn)
         add_section_divider()
 
         # ── SECTION: Draw Tools ──
@@ -1246,6 +1331,10 @@ class RandomImageViewer(QMainWindow):
         self.free_line_tool_btn = QToolButton(); self.free_line_tool_btn.setText("╱"); self.free_line_tool_btn.setToolTip("Draw Free Lines (2 clicks per line)"); self.free_line_tool_btn.setCheckable(True); self.free_line_tool_btn.setFixedSize(24,24); self.free_line_tool_btn.toggled.connect(self.toggle_free_line_drawing); toolbar.addWidget(self.free_line_tool_btn)
         add_spacer(2)
         self.free_draw_tool_btn = QToolButton(); self.free_draw_tool_btn.setText("✏"); self.free_draw_tool_btn.setToolTip("Free Draw Tool (drag to draw)"); self.free_draw_tool_btn.setCheckable(True); self.free_draw_tool_btn.setFixedSize(24,24); self.free_draw_tool_btn.toggled.connect(self.toggle_free_draw); toolbar.addWidget(self.free_draw_tool_btn)
+        add_spacer(2)
+        self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Eraser (erase parts of lines/drawings, not the image)"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_eraser); toolbar.addWidget(self.eraser_tool_btn)
+        add_spacer(2)
+        self.eraser_size_spin = QSpinBox(); self.eraser_size_spin.setRange(1,30); self.eraser_size_spin.setValue(self.eraser_size); self.eraser_size_spin.setSuffix("px"); self.eraser_size_spin.setFixedHeight(24); self.eraser_size_spin.setFixedWidth(50); self.eraser_size_spin.setToolTip("Eraser Size"); self.eraser_size_spin.valueChanged.connect(self.update_eraser_size); toolbar.addWidget(self.eraser_size_spin)
         add_spacer(2)
         self.undo_line_btn = QToolButton(); self.undo_line_btn.setText("↶"); self.undo_line_btn.setToolTip("Undo Last Line"); self.undo_line_btn.setFixedSize(24,24); self.undo_line_btn.clicked.connect(self.undo_last_line); toolbar.addWidget(self.undo_line_btn)
         add_section_divider()
@@ -1301,6 +1390,29 @@ class RandomImageViewer(QMainWindow):
         self.gamma_toggle_btn = QToolButton(); self.gamma_toggle_btn.setText("💡"); self.gamma_toggle_btn.setToolTip("Toggle Enhanced Brightness On/Off"); self.gamma_toggle_btn.setCheckable(True); self.gamma_toggle_btn.setFixedSize(24,24); self.gamma_toggle_btn.toggled.connect(self.toggle_gamma); toolbar.addWidget(self.gamma_toggle_btn)
         add_spacer(2)
         self.lut_toggle_btn = QToolButton(); self.lut_toggle_btn.setText("🎞"); self.lut_toggle_btn.setToolTip("Toggle LUT On/Off (preserves selection)"); self.lut_toggle_btn.setCheckable(True); self.lut_toggle_btn.setFixedSize(24,24); self.lut_toggle_btn.toggled.connect(self.toggle_lut_enabled); self.lut_toggle_btn.setChecked(False); toolbar.addWidget(self.lut_toggle_btn)
+        add_spacer(2)
+        self.value_filter_toggle_btn = QToolButton(); self.value_filter_toggle_btn.setText("◑"); self.value_filter_toggle_btn.setToolTip("Toggle Value Filter (posterize to N grayscale tones)"); self.value_filter_toggle_btn.setCheckable(True); self.value_filter_toggle_btn.setChecked(self.value_filter_enabled); self.value_filter_toggle_btn.setFixedSize(24,24); self.value_filter_toggle_btn.toggled.connect(self.toggle_value_filter); toolbar.addWidget(self.value_filter_toggle_btn)
+        self.value_levels_spin = QSpinBox(); self.value_levels_spin.setRange(2, 10); self.value_levels_spin.setValue(self.value_levels); self.value_levels_spin.setFixedHeight(24); self.value_levels_spin.setFixedWidth(40); self.value_levels_spin.setToolTip("Number of value levels (2-10)"); self.value_levels_spin.valueChanged.connect(self.update_value_levels); toolbar.addWidget(self.value_levels_spin)
+        add_spacer(2)
+        # Edge detection (Canny "plane change") toggle + mode menu + sensitivity
+        self.edge_toggle_btn = QToolButton(); self.edge_toggle_btn.setText("📐"); self.edge_toggle_btn.setToolTip("Toggle Edge Detection (plane changes)"); self.edge_toggle_btn.setCheckable(True); self.edge_toggle_btn.setChecked(self.edge_detection_enabled); self.edge_toggle_btn.setFixedSize(24,24); self.edge_toggle_btn.toggled.connect(self.toggle_edge_detection); toolbar.addWidget(self.edge_toggle_btn)
+        from PySide6.QtWidgets import QMenu as _QMenuEdge
+        from PySide6.QtGui import QAction as _QActionEdge
+        self.edge_mode_btn = QToolButton(); self.edge_mode_btn.setText("▦"); self.edge_mode_btn.setToolTip("Edge look: white-on-black / black-on-white / overlay on image"); self.edge_mode_btn.setFixedSize(24,24); self.edge_mode_btn.setPopupMode(QToolButton.InstantPopup)
+        edge_menu = _QMenuEdge(self.edge_mode_btn)
+        self._edge_mode_actions = {}
+        for mode_key, label in (("white_on_black", "Edges on dark background"),
+                                ("black_on_white", "Edges on white background"),
+                                ("overlay", "Edges over image")):
+            act = _QActionEdge(label, self)
+            act.setCheckable(True)
+            act.setChecked(self.edge_mode == mode_key)
+            act.triggered.connect(lambda _checked=False, m=mode_key: self.set_edge_mode(m))
+            edge_menu.addAction(act)
+            self._edge_mode_actions[mode_key] = act
+        self.edge_mode_btn.setMenu(edge_menu)
+        toolbar.addWidget(self.edge_mode_btn)
+        self.edge_sensitivity_spin = QSpinBox(); self.edge_sensitivity_spin.setRange(0, 100); self.edge_sensitivity_spin.setValue(self.edge_sensitivity); self.edge_sensitivity_spin.setFixedHeight(24); self.edge_sensitivity_spin.setFixedWidth(44); self.edge_sensitivity_spin.setToolTip("Edge sensitivity (0-100)"); self.edge_sensitivity_spin.valueChanged.connect(self.update_edge_sensitivity); toolbar.addWidget(self.edge_sensitivity_spin)
         add_section_divider()
 
         # ── SECTION: Navigation & Timer ──
@@ -1315,10 +1427,6 @@ class RandomImageViewer(QMainWindow):
         self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(56); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
         add_spacer(2)
         self.circle_timer = CircularCountdown(self.timer_spin.value()); self.circle_timer.set_parent_viewer(self); toolbar.addWidget(self.circle_timer)
-        add_section_divider()
-
-        # ── SECTION: Save ──
-        save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view (includes LUT, enhancements and lines)"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self.save_current_view); toolbar.addWidget(save_btn)
         add_section_divider()
 
         # ── PDF page navigation (hidden until a PDF is loaded) ──
@@ -1871,6 +1979,7 @@ class RandomImageViewer(QMainWindow):
             self.drawn_free_lines.clear()
             self.drawn_free_strokes.clear()  # Clear free draw strokes
             self.current_line_start = None
+            self._clear_line_preview()
             # Reset rotation angle and flips for new image
             self.rotation_angle = 0
             self.flipped_h = False
@@ -2013,6 +2122,14 @@ class RandomImageViewer(QMainWindow):
         if self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
             frame_pixmap = self.apply_fast_enhancements(frame_pixmap.copy())
 
+        # --- Apply value filter (posterize) ---
+        if self.value_filter_enabled:
+            frame_pixmap = self.apply_value_filter(frame_pixmap)
+
+        # --- Apply edge detection (plane changes) ---
+        if self.edge_detection_enabled:
+            frame_pixmap = self.apply_edge_detection(frame_pixmap)
+
         # --- Apply rotation / flips ---
         if self.rotation_angle != 0 or self.flipped_h or self.flipped_v:
             frame_pixmap = self._apply_cached_transforms(frame_pixmap)
@@ -2150,6 +2267,14 @@ class RandomImageViewer(QMainWindow):
         # --- Apply enhancements (grayscale / contrast / gamma) ---
         if self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
             frame_pixmap = self.apply_fast_enhancements(frame_pixmap.copy())
+
+        # --- Apply value filter (posterize) ---
+        if self.value_filter_enabled:
+            frame_pixmap = self.apply_value_filter(frame_pixmap)
+
+        # --- Apply edge detection (plane changes) ---
+        if self.edge_detection_enabled:
+            frame_pixmap = self.apply_edge_detection(frame_pixmap)
 
         # --- Apply rotation / flips ---
         if self.rotation_angle != 0 or self.flipped_h or self.flipped_v:
@@ -2325,7 +2450,7 @@ class RandomImageViewer(QMainWindow):
             strokes = len(self.drawn_free_strokes) if self.drawn_free_strokes else 0
             lines_info = f"_lines_{vlines}_{hlines}_{flines}_{strokes}_{self.line_color.name()}_{self.line_thickness}"
         
-        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}{lines_info}"
+        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}-{self.line_color.name()}{lines_info}"
         
         # Check enhanced cache first
         if cache_key in self.enhancement_cache:
@@ -2364,7 +2489,15 @@ class RandomImageViewer(QMainWindow):
                 pixmap = self.apply_fast_enhancements(base_pixmap.copy())
             else:
                 pixmap = base_pixmap
-            
+
+            # Apply value filter (posterize) AFTER color enhancements / LUT
+            if self.value_filter_enabled:
+                pixmap = self.apply_value_filter(pixmap)
+
+            # Apply edge detection (plane changes) AFTER all tonal processing
+            if self.edge_detection_enabled:
+                pixmap = self.apply_edge_detection(pixmap)
+
             # Apply rotation and flips if needed
             if self.rotation_angle != 0 or self.flipped_h or self.flipped_v:
                 image = pixmap.toImage()
@@ -2581,9 +2714,10 @@ class RandomImageViewer(QMainWindow):
                                     start_pressure = end_pressure = 1.0
                                 
                                 # 🎨 PEN PRESSURE: Calculate dynamic thickness based on pressure
+                                # Use shared helper so final width matches the live preview
                                 if self.pen_pressure_enabled:
                                     avg_pressure = (start_pressure + end_pressure) / 2.0
-                                    dynamic_thickness = max(1, int(self.line_thickness * avg_pressure))
+                                    dynamic_thickness = self._pressure_to_thickness(avg_pressure)
                                 else:
                                     dynamic_thickness = self.line_thickness
                                 
@@ -2651,8 +2785,9 @@ class RandomImageViewer(QMainWindow):
                                     start_pressure = end_pressure = 1.0
                                 
                                 # 🎨 PEN PRESSURE: Calculate dynamic thickness based on pressure
+                                # Use shared helper so final width matches the live preview
                                 avg_pressure = (start_pressure + end_pressure) / 2.0
-                                dynamic_thickness = max(1, int(self.line_thickness * avg_pressure))
+                                dynamic_thickness = self._pressure_to_thickness(avg_pressure)
                                 
                                 # Direct scaling without any transformations
                                 display_start_x = int(start_x * scale_x) + draw_x
@@ -2734,15 +2869,10 @@ class RandomImageViewer(QMainWindow):
                                     end_x, end_y = stroke[i + 1]
                                 start_pressure = end_pressure = 1.0
 
-                            # 🎨 PEN PRESSURE: Calculate dynamic thickness for the final render
-                            if self.pen_pressure_enabled:
-                                avg_pressure = (start_pressure + end_pressure) / 2.0
-                                # Scale thickness with zoom factor to maintain visual consistency
-                                base_thickness = max(1, int(self.line_thickness * avg_pressure))
-                                dynamic_thickness = max(1, base_thickness)
-                            else:
-                                # Scale regular thickness with zoom factor too
-                                dynamic_thickness = max(1, self.line_thickness)
+                            # 🎨 PEN PRESSURE: Use shared helper so the final width
+                            # matches the live preview (1.5x at full pressure).
+                            avg_pressure = (start_pressure + end_pressure) / 2.0
+                            dynamic_thickness = self._pressure_to_thickness(avg_pressure)
 
                             # Create a pen with the correct thickness for this specific segment
                             pen = QPen(self.line_color, dynamic_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
@@ -2806,11 +2936,9 @@ class RandomImageViewer(QMainWindow):
                             if len(stroke[i]) == 3:
                                 start_x, start_y, start_pressure = stroke[i]
                                 end_x, end_y, end_pressure = stroke[i + 1]
-                                # Use average pressure for this segment
+                                # 🎨 Shared helper so final width matches the live preview
                                 segment_pressure = (start_pressure + end_pressure) / 2.0
-                                base_thickness = max(1, int(self.line_thickness * segment_pressure))
-                                # Scale thickness with zoom factor to maintain visual consistency
-                                segment_thickness = max(1, base_thickness)
+                                segment_thickness = self._pressure_to_thickness(segment_pressure)
                             else:
                                 start_x, start_y = stroke[i]
                                 end_x, end_y = stroke[i + 1]
@@ -2871,6 +2999,23 @@ class RandomImageViewer(QMainWindow):
                             painter.drawLine(display_start_x, display_start_y, display_end_x, display_end_y)
             
             painter.end()
+            # 🧽 Eraser: restore the clean (line-free) image inside erase strokes,
+            # punching holes through only the line layer (not the photo).
+            self._last_display_scale_x = scale_x
+            # Strokes drawn AFTER the most recent erase must survive the erase holes,
+            # so you can draw again over an erased area. Composite them onto the
+            # "revealed" image that the eraser exposes inside its holes.
+            reveal_pixmap = scaled_pixmap
+            if self.erase_strokes and self.current_erase_stroke is None and self._erase_state_marks:
+                mark = self._erase_state_marks[-1]
+                post_strokes = self.drawn_free_strokes[mark.get('free_strokes', 0):]
+                post_lines = self.drawn_free_lines[mark.get('free_lines', 0):]
+                if post_strokes or post_lines:
+                    reveal_pixmap = scaled_pixmap.copy()
+                    self._draw_post_erase_overlay(
+                        reveal_pixmap, post_strokes, post_lines,
+                        scale_x, scale_y, draw_x, draw_y, original_size)
+            self._apply_erase_holes(final_pixmap, reveal_pixmap, scale_x, scale_y, draw_x, draw_y, original_size)
             scaled_pixmap = final_pixmap
         
         # Handle image visibility toggle
@@ -2938,11 +3083,9 @@ class RandomImageViewer(QMainWindow):
                             if len(stroke[i]) == 3:
                                 start_x, start_y, start_pressure = stroke[i]
                                 end_x, end_y, end_pressure = stroke[i + 1]
-                                # Use average pressure for this segment
+                                # 🎨 Shared helper so final width matches the live preview
                                 segment_pressure = (start_pressure + end_pressure) / 2.0
-                                base_thickness = max(1, int(self.line_thickness * segment_pressure))
-                                # Scale thickness with zoom factor to maintain visual consistency
-                                segment_thickness = max(1, base_thickness)
+                                segment_thickness = self._pressure_to_thickness(segment_pressure)
                             else:
                                 start_x, start_y = stroke[i]
                                 end_x, end_y = stroke[i + 1]
@@ -2970,11 +3113,9 @@ class RandomImageViewer(QMainWindow):
                             if len(stroke[i]) == 3:
                                 start_x, start_y, start_pressure = stroke[i]
                                 end_x, end_y, end_pressure = stroke[i + 1]
-                                # Use average pressure for this segment
+                                # 🎨 Shared helper so final width matches the live preview
                                 segment_pressure = (start_pressure + end_pressure) / 2.0
-                                base_thickness = max(1, int(self.line_thickness * segment_pressure))
-                                # Scale thickness with zoom factor to maintain visual consistency
-                                segment_thickness = max(1, base_thickness)
+                                segment_thickness = self._pressure_to_thickness(segment_pressure)
                             else:
                                 start_x, start_y = stroke[i]
                                 end_x, end_y = stroke[i + 1]
@@ -2991,6 +3132,10 @@ class RandomImageViewer(QMainWindow):
                             painter.drawLine(display_start_x, display_start_y, display_end_x, display_end_y)
                 
                 painter.end()
+                # 🧽 Eraser holes reveal the black background in image-hidden mode
+                _clean_black = QPixmap(blank_pixmap.size())
+                _clean_black.fill(Qt.black)
+                self._apply_erase_holes(blank_pixmap, _clean_black, scale_x, scale_y, draw_x, draw_y, original_size)
             
             scaled_pixmap = blank_pixmap
         
@@ -3763,6 +3908,139 @@ class RandomImageViewer(QMainWindow):
         
         return lut_files
 
+    def apply_value_filter(self, pixmap):
+        """Posterize the image into N evenly-spaced grayscale tones (value study).
+
+        Converts to luminance (Rec. 709) and quantizes to ``self.value_levels``
+        discrete brightness bands. Returns a new grayscale QPixmap. If the
+        filter is disabled or numpy is unavailable, returns ``pixmap`` unchanged.
+        """
+        try:
+            if not pixmap or pixmap.isNull() or not self.value_filter_enabled:
+                return pixmap
+            n = max(2, min(10, int(self.value_levels)))
+
+            import numpy as np
+            image = pixmap.toImage()
+            if image.isNull():
+                return pixmap
+            if image.format() != QImage.Format.Format_RGBA8888:
+                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            w, h = image.width(), image.height()
+            bpl = image.bytesPerLine()
+            ptr = image.constBits()
+            buf = bytes(ptr)[: bpl * h]
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+
+            # Rec. 709 luminance
+            r = arr[:, :, 0].astype(np.float32)
+            g = arr[:, :, 1].astype(np.float32)
+            b = arr[:, :, 2].astype(np.float32)
+            lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+            # Quantize into N bands then map to N evenly spaced output levels in [0, 255]
+            bins = np.clip(np.floor(lum * n / 256.0), 0, n - 1).astype(np.uint8)
+            output_levels = np.linspace(0, 255, n, dtype=np.uint8)
+            quantized = output_levels[bins]
+
+            # Build a Grayscale8 QImage; copy to detach from the numpy buffer
+            quantized = np.ascontiguousarray(quantized)
+            out = QImage(quantized.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+            return QPixmap.fromImage(out)
+        except Exception as e:
+            print(f"apply_value_filter error: {e}")
+            return pixmap
+
+    def apply_edge_detection(self, pixmap):
+        """Run Canny edge detection to reveal plane changes (art reference).
+
+        Renders the result according to ``self.edge_mode``:
+          - white_on_black: edge lines on a black background (default white)
+          - black_on_white: edge lines on a white background (default black)
+          - overlay: edge lines drawn over the original image
+
+        Edge line color follows ``self.edge_color`` when set by the line-color
+        tools/presets; otherwise each mode uses its default look.
+
+        ``self.edge_sensitivity`` (0-100) drives the Canny thresholds. Returns
+        ``pixmap`` unchanged if disabled, on error, or if OpenCV is missing.
+        """
+        try:
+            if not pixmap or pixmap.isNull() or not self.edge_detection_enabled:
+                return pixmap
+
+            try:
+                import cv2
+            except ImportError:
+                # Graceful fallback: disable and inform the user once
+                self.edge_detection_enabled = False
+                if hasattr(self, 'edge_toggle_btn') and self.edge_toggle_btn is not None:
+                    self.edge_toggle_btn.blockSignals(True)
+                    self.edge_toggle_btn.setChecked(False)
+                    self.edge_toggle_btn.blockSignals(False)
+                self.statusBar().showMessage(
+                    "Edge detection requires opencv-python (pip install opencv-python)", 5000)
+                return pixmap
+
+            import numpy as np
+            image = pixmap.toImage()
+            if image.isNull():
+                return pixmap
+            if image.format() != QImage.Format.Format_RGBA8888:
+                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            w, h = image.width(), image.height()
+            bpl = image.bytesPerLine()
+            ptr = image.constBits()
+            buf = bytes(ptr)[: bpl * h]
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+            rgb = np.ascontiguousarray(arr[:, :, :3])
+
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            # Light blur reduces noise edges; map sensitivity (0-100) -> thresholds.
+            # Higher sensitivity => lower thresholds => more edges.
+            s = max(0, min(100, int(self.edge_sensitivity)))
+            low = int(10 + (100 - s) * 1.4)      # ~10..150
+            high = min(255, low * 2)
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+            edges = cv2.Canny(blurred, low, high)  # uint8 (h, w), 0 or 255
+
+            mode = self.edge_mode
+            mask = edges > 0
+            # Resolve the edge line color. None => each mode's default look;
+            # once the user picks a line color it drives every mode.
+            if self.edge_color is not None:
+                ec = (self.edge_color.red(), self.edge_color.green(), self.edge_color.blue())
+            else:
+                ec = None
+
+            if mode == "overlay":
+                out_rgb = rgb.copy()
+                lc = self.line_color
+                line_rgb = ec if ec is not None else (lc.red(), lc.green(), lc.blue())
+                out_rgb[mask] = line_rgb
+            elif mode == "black_on_white":
+                # White background; default edge color black
+                out_rgb = np.full((h, w, 3), 255, dtype=np.uint8)
+                out_rgb[mask] = ec if ec is not None else (0, 0, 0)
+            else:  # white_on_black
+                # Black background; default edge color white
+                out_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+                out_rgb[mask] = ec if ec is not None else (255, 255, 255)
+
+            out_rgba = np.dstack([
+                out_rgb,
+                np.full((h, w), 255, dtype=np.uint8),
+            ])
+            out_rgba = np.ascontiguousarray(out_rgba)
+            out = QImage(out_rgba.tobytes(), w, h, w * 4,
+                         QImage.Format.Format_RGBA8888).copy()
+            return QPixmap.fromImage(out)
+        except Exception as e:
+            print(f"apply_edge_detection error: {e}")
+            return pixmap
+
     def apply_fast_enhancements(self, pixmap):
         """Apply fast image enhancements using Qt's optimized color effects."""
         try:
@@ -3937,22 +4215,169 @@ class RandomImageViewer(QMainWindow):
             return pixmap
 
     def resizeEvent(self, event):
-        # Simple debounced resize handling
-        self.resize_timer.start(100)  # 100ms debounce
+        # Debounced resize handling — longer delay prevents the slider row
+        # from flickering hide/show while the user drags the window border.
+        self.resize_timer.start(300)  # 300ms debounce
         super().resizeEvent(event)
-        
+
+    # ── toolbar overflow ('»') popup: replace Qt's hover-close native
+    #     popup with our own click-outside-to-close QMenu ──
+    def _install_popup_persistence(self):
+        """Hijack the native QToolBarExtension '»' button on each toolbar.
+
+        Qt creates the extension button lazily and *reconfigures or
+        recreates* it on every relayout, and it uses InstantPopup mode
+        (its native popup opens on mouse-press and closes on hover-out).
+        We therefore (1) poll continuously, (2) install an event filter
+        on whatever extension button currently exists, and (3) swallow
+        its mouse-press so the native popup never opens — showing our own
+        QMenu instead, which only closes on outside-click / select / Esc."""
+        self._filtered_ext_ids = set()   # id() of buttons we've filtered
+        self._ext_menu_open = False
+        self._ext_capture_timer = QTimer(self)
+        self._ext_capture_timer.setInterval(250)
+        self._ext_capture_timer.timeout.connect(self._capture_extension_buttons)
+        self._ext_capture_timer.start()
+        self._capture_extension_buttons()
+
+    def _capture_extension_buttons(self):
+        for tb in (getattr(self, 'main_toolbar', None),
+                   getattr(self, 'slider_toolbar', None)):
+            if tb is None:
+                continue
+            btn = tb.findChild(QToolButton, "qt_toolbar_ext_button")
+            if btn is None:
+                continue
+            btn._owning_toolbar = tb
+            # Re-apply each tick in case Qt recreated/reconfigured the
+            # button; only (re)install the filter for buttons we haven't
+            # already filtered (tracked by object id).
+            if id(btn) not in self._filtered_ext_ids:
+                self._filtered_ext_ids.add(id(btn))
+                btn.installEventFilter(self)
+
+    def _show_overflow_menu(self, toolbar, anchor_btn):
+        """Show our own click-outside-to-close popup for the toolbar's
+        clipped items.
+
+        We do NOT move the live widgets into the menu (sliders/combos
+        render blank inside a QMenu). Instead, for each clipped button we
+        add a proxy QAction that re-fires the original button's click, so
+        everything renders natively and the menu only closes on
+        outside-click / item-select / Esc — never on hover-leave."""
+        if self._ext_menu_open:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #26292c;
+                border: 1px solid #3a3d40;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QMenu::item {
+                color: #e6e6e6;
+                padding: 8px 18px 8px 14px;
+                margin: 2px 4px;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+            QMenu::item:selected {
+                background-color: #3d6fb4;
+                color: #ffffff;
+            }
+            QMenu::item:checked {
+                background-color: #2f3338;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #3a3d40;
+                margin: 6px 10px;
+            }
+            QMenu::indicator {
+                width: 14px;
+                height: 14px;
+                left: 6px;
+            }
+        """)
+        vis_w = toolbar.width()
+        added = 0
+        for action in toolbar.actions():
+            w = toolbar.widgetForAction(action)
+            # Only buttons make sense as menu entries; skip spacers/labels/sliders/combos.
+            if not isinstance(w, QToolButton):
+                continue
+            geom = toolbar.actionGeometry(action)
+            # A button is hidden if Qt gave it no geometry, or it extends
+            # past the visible right edge, or the widget itself is hidden.
+            clipped = (geom.isEmpty() or geom.right() > vis_w
+                       or geom.x() < 0 or not w.isVisible())
+            if not clipped:
+                continue
+            label = w.toolTip() or w.text() or "(button)"
+            text = f"{w.text()}  {label}".strip()
+            proxy = menu.addAction(text)
+            proxy.setCheckable(w.isCheckable())
+            if w.isCheckable():
+                proxy.setChecked(w.isChecked())
+            proxy.triggered.connect(lambda _checked=False, b=w: b.click())
+            added += 1
+        # Guarantee the menu is never empty: if detection found nothing
+        # (window-state quirks), list every button on the toolbar so the
+        # user always gets a usable popup.
+        if added == 0:
+            for action in toolbar.actions():
+                w = toolbar.widgetForAction(action)
+                if not isinstance(w, QToolButton):
+                    continue
+                label = w.toolTip() or w.text() or "(button)"
+                text = f"{w.text()}  {label}".strip()
+                proxy = menu.addAction(text)
+                proxy.setCheckable(w.isCheckable())
+                if w.isCheckable():
+                    proxy.setChecked(w.isChecked())
+                proxy.triggered.connect(lambda _checked=False, b=w: b.click())
+                added += 1
+        if added == 0:
+            return
+        pos = anchor_btn.mapToGlobal(QPoint(0, anchor_btn.height()))
+        self._ext_menu_open = True
+        try:
+            menu.exec(pos)
+        finally:
+            self._ext_menu_open = False
+
+    def eventFilter(self, obj, event):
+        # Swallow the extension button's mouse-press (which would open
+        # Qt's native hover-closing popup) and show our own menu instead.
+        if getattr(obj, '_owning_toolbar', None) is not None:
+            et = event.type()
+            if et in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+                try:
+                    if event.button() == Qt.LeftButton:
+                        self._show_overflow_menu(obj._owning_toolbar, obj)
+                        return True
+                except Exception:
+                    pass
+        return super().eventFilter(obj, event)
+
     def _delayed_resize(self):
         """Handle resize events with a delay to improve performance"""
         # Check if we need to move sliders to second row
         current_width = self.width()
         should_use_two_rows = current_width < self.width_threshold
         
-        # Only switch if the mode actually needs to change AND we have minimal hysteresis
+        # Asymmetric hysteresis: easy to ENTER two-row mode, much harder to
+        # LEAVE it — once the second row is visible, the user needs to
+        # widen the window substantially before it collapses back. This
+        # prevents the second panel from flickering away while the user
+        # moves the cursor toward its leftmost icons.
         if should_use_two_rows != self.two_row_mode:
-            # Reduced hysteresis to prevent rapid switching
-            if should_use_two_rows and current_width < (self.width_threshold - 10):
+            enter_buffer = 40   # px below threshold to switch to two rows
+            exit_buffer = 250   # px above threshold to switch back to one row
+            if should_use_two_rows and current_width < (self.width_threshold - enter_buffer):
                 self._update_toolbar_layout(current_width)
-            elif not should_use_two_rows and current_width > (self.width_threshold + 10):
+            elif not should_use_two_rows and current_width > (self.width_threshold + exit_buffer):
                 self._update_toolbar_layout(current_width)
         
         # Handle image display resize using smart caching system
@@ -4167,6 +4592,7 @@ class RandomImageViewer(QMainWindow):
             self.current_line_start = None
             self.hline_tool_btn.setChecked(False)
             self.free_line_tool_btn.setChecked(False)
+            self._disable_eraser_silent()
             self._disable_color_snap_silent()
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
@@ -4180,6 +4606,7 @@ class RandomImageViewer(QMainWindow):
             self.current_line_start = None
             self.line_tool_btn.setChecked(False)
             self.free_line_tool_btn.setChecked(False)
+            self._disable_eraser_silent()
             self._disable_color_snap_silent()
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
@@ -4195,10 +4622,16 @@ class RandomImageViewer(QMainWindow):
             self.hline_tool_btn.setChecked(False)
             if hasattr(self, 'free_draw_tool_btn'):
                 self.free_draw_tool_btn.setChecked(False)
+            self._disable_eraser_silent()
             self._disable_color_snap_silent()
         if not checked:
             # Reset current line start when mode is deactivated
+            had_pending = self.current_line_start is not None
             self.current_line_start = None
+            self._clear_line_preview()
+            # If a preview line was on screen, repaint the committed image cleanly
+            if had_pending and self.current_image:
+                self.display_image(self.current_image)
         self._update_cursor_and_status()
 
     def toggle_free_draw(self, checked):
@@ -4212,6 +4645,7 @@ class RandomImageViewer(QMainWindow):
             self.line_tool_btn.setChecked(False)
             self.hline_tool_btn.setChecked(False)
             self.free_line_tool_btn.setChecked(False)
+            self._disable_eraser_silent()
             self._disable_color_snap_silent()
             # Enable tablet tracking for pressure sensitivity, but handle events carefully
             if hasattr(self, 'image_label'):
@@ -4226,6 +4660,311 @@ class RandomImageViewer(QMainWindow):
                 self.image_label.setAttribute(Qt.WA_TabletTracking, False)
             print(f"Free draw mode deactivated")
         self._update_cursor_and_status()
+
+    # ───────────────────── Eraser tool ─────────────────────
+    def toggle_eraser(self, checked):
+        """Toggle the eraser tool (partial pixel-erase of the drawing layer)."""
+        self.eraser_mode = bool(checked)
+        if self.eraser_mode:
+            # Disable all other drawing/line modes
+            self.line_drawing_mode = False
+            self.horizontal_line_drawing_mode = False
+            self.free_line_drawing_mode = False
+            self.free_draw_mode = False
+            self.current_line_start = None
+            for btn_name in ('line_tool_btn', 'hline_tool_btn',
+                             'free_line_tool_btn', 'free_draw_tool_btn'):
+                btn = getattr(self, btn_name, None)
+                if btn is not None and btn.isChecked():
+                    btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
+            self._disable_color_snap_silent()
+            # Tablet tracking not required; eraser is mouse-driven
+            if hasattr(self, 'image_label'):
+                self.image_label.setAttribute(Qt.WA_TabletTracking, False)
+        else:
+            self.current_erase_stroke = None
+            self.is_erasing = False
+        self._update_eraser_cursor()
+        self._update_cursor_and_status()
+
+    def _disable_eraser_silent(self):
+        """Turn the eraser off without recursive signal emission."""
+        self.eraser_mode = False
+        self.current_erase_stroke = None
+        self.is_erasing = False
+        btn = getattr(self, 'eraser_tool_btn', None)
+        if btn is not None and btn.isChecked():
+            btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
+        self._update_eraser_cursor()
+
+    def update_eraser_size(self, value):
+        """Update eraser diameter (1-30 screen px) and refresh the cursor."""
+        self.eraser_size = int(value)
+        self._update_eraser_cursor()
+
+    def _update_eraser_cursor(self):
+        """Show a round cursor sized to the eraser while active, else default."""
+        if not hasattr(self, 'image_label'):
+            return
+        if getattr(self, 'eraser_mode', False):
+            d = max(4, int(self.eraser_size))
+            pix = QPixmap(d + 2, d + 2)
+            pix.fill(Qt.transparent)
+            p = QPainter(pix)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setPen(QPen(QColor(0, 0, 0, 200), 1))
+            p.drawEllipse(1, 1, d, d)
+            p.setPen(QPen(QColor(255, 255, 255, 200), 1))
+            p.drawEllipse(2, 2, d - 2, d - 2)
+            p.end()
+            self.image_label.setCursor(QCursor(pix))
+        else:
+            self.image_label.unsetCursor()
+
+    def start_erase_stroke(self, x, y):
+        """Begin an erase stroke at ORIGINAL image coords (x, y)."""
+        radius = self._eraser_radius_in_original_px()
+        self.current_erase_stroke = [(x, y, radius)]
+        self.is_erasing = True
+        # ⚡ Build a one-time coordinate cache so each live erase point maps
+        # label→original WITHOUT reloading/decoding the image per event (that
+        # per-event reload is what froze the UI under the tablet's high event rate).
+        self.eraser_cache = self._build_display_geometry_cache()
+        self._invalidate_line_caches()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def _build_display_geometry_cache(self):
+        """Precompute display geometry for fast original↔label coordinate mapping.
+
+        Mirrors the math in ImageLabel._map_label_pos_to_original but resolves the
+        original image size ONCE here instead of on every move event. Shared by the
+        eraser hot-path and the free-line live preview."""
+        try:
+            label = self.image_label
+            if not label or not label.pixmap() or label.pixmap().isNull():
+                return None
+            original_pixmap, error = safe_load_pixmap(self.current_image)
+            if error or original_pixmap.isNull():
+                return None
+            original_size = original_pixmap.size()
+            rotation = self.rotation_angle
+            if rotation == 90 or rotation == 270:
+                display_reference_size = QSize(original_size.height(), original_size.width())
+            else:
+                display_reference_size = original_size
+            label_size = label.size()
+            base_scaled = display_reference_size.scaled(label_size, Qt.KeepAspectRatio)
+            zoom_factor = label.zoom_factor
+            zoomed_width = int(base_scaled.width() * zoom_factor)
+            zoomed_height = int(base_scaled.height() * zoom_factor)
+            draw_x = (label_size.width() - zoomed_width) // 2 + int(label.pan_offset_x)
+            draw_y = (label_size.height() - zoomed_height) // 2 + int(label.pan_offset_y)
+            if rotation == 90 or rotation == 270:
+                scale_x = zoomed_width / original_size.height() if original_size.height() else 1.0
+                scale_y = zoomed_height / original_size.width() if original_size.width() else 1.0
+            else:
+                scale_x = zoomed_width / original_size.width() if original_size.width() else 1.0
+                scale_y = zoomed_height / original_size.height() if original_size.height() else 1.0
+            return {
+                'original_size': original_size,
+                'rotation': rotation,
+                'flipped_h': self.flipped_h,
+                'flipped_v': self.flipped_v,
+                'zoomed_width': zoomed_width,
+                'zoomed_height': zoomed_height,
+                'draw_x': draw_x,
+                'draw_y': draw_y,
+                'scale_x': scale_x,
+                'scale_y': scale_y,
+            }
+        except Exception as e:
+            print(f"_build_display_geometry_cache error: {e}")
+            return None
+
+    def _build_eraser_cache(self):
+        """Backward-compatible alias for the shared geometry cache."""
+        return self._build_display_geometry_cache()
+
+    def add_erase_point(self, x, y):
+        """Append a point to the active erase stroke and live-update."""
+        if not self.is_erasing or self.current_erase_stroke is None:
+            return
+        radius = self._eraser_radius_in_original_px()
+        self.current_erase_stroke.append((x, y, radius))
+        # ⚡ Throttle: coalesce bursts of tablet move events into ~60 FPS redraws
+        # instead of running the full erase-aware redraw on every single event.
+        if not self.erase_update_timer.isActive():
+            self.erase_update_timer.start()
+
+    def _flush_erase_update(self):
+        """Render the in-progress erase stroke (driven by the throttle timer)."""
+        if self.current_image and (self.is_erasing or self.current_erase_stroke):
+            self.display_image(self.current_image)
+
+    def end_erase_stroke(self):
+        """Finalize the active erase stroke."""
+        self.erase_update_timer.stop()
+        if self.current_erase_stroke and len(self.current_erase_stroke) > 0:
+            self.erase_strokes.append(self.current_erase_stroke)
+            # Snapshot the current drawing counts so anything drawn AFTER this erase
+            # is rendered on top of the erase holes (lets you re-draw over erased areas).
+            self._erase_state_marks.append({
+                'free_strokes': len(self.drawn_free_strokes),
+                'free_lines': len(self.drawn_free_lines),
+            })
+        self.current_erase_stroke = None
+        self.is_erasing = False
+        self.eraser_cache = None
+        self._invalidate_line_caches()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def _eraser_radius_in_original_px(self):
+        """Convert the eraser screen-px radius to original-image px so erased
+        holes stay anchored to the image content at any zoom level."""
+        scale = getattr(self, '_last_display_scale_x', None)
+        if not scale or scale <= 0:
+            scale = 1.0
+        return max(1.0, (self.eraser_size / 2.0) / scale)
+
+    def _transform_point_to_display(self, x, y, scale_x, scale_y, draw_x, draw_y, original_size):
+        """Map an ORIGINAL-coords point to display coords using the same flip/
+        rotation/scale sequence the line renderer uses for free strokes."""
+        fx, fy = x, y
+        if self.flipped_h:
+            fx = original_size.width() - x
+        if self.flipped_v:
+            fy = original_size.height() - y
+        rot = self.rotation_angle
+        if rot == 90:
+            tx = fy; ty = original_size.width() - fx
+        elif rot == 180:
+            tx = original_size.width() - fx; ty = original_size.height() - fy
+        elif rot == 270:
+            tx = original_size.height() - fy; ty = fx
+        else:
+            tx, ty = fx, fy
+        dx = int(tx * scale_x) + draw_x
+        dy = int(ty * scale_y) + draw_y
+        return dx, dy
+
+    def _draw_post_erase_overlay(self, pixmap, strokes, free_lines, scale_x, scale_y, draw_x, draw_y, original_size):
+        """Draw drawings made AFTER the most recent erase onto the revealed image.
+
+        The eraser exposes this image inside its holes, so these strokes stay
+        visible there — letting the user draw again over an erased area. Uses the
+        same point transform as the erase mask so the overlay aligns with the holes."""
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            # Free draw strokes (continuous paths) — always safe to overlay since
+            # _transform_point_to_display matches the free-stroke renderer exactly.
+            for stroke in strokes:
+                if len(stroke) < 2:
+                    continue
+                for i in range(len(stroke) - 1):
+                    a = stroke[i]
+                    b = stroke[i + 1]
+                    if len(a) == 3 and self.pen_pressure_enabled:
+                        ax, ay, ap = a
+                        bx, by, bp = b
+                        thickness = max(1, int(self.line_thickness * ((ap + bp) / 2.0)))
+                    else:
+                        ax, ay = a[0], a[1]
+                        bx, by = b[0], b[1]
+                        thickness = max(1, self.line_thickness)
+                    sx, sy = self._transform_point_to_display(ax, ay, scale_x, scale_y, draw_x, draw_y, original_size)
+                    ex, ey = self._transform_point_to_display(bx, by, scale_x, scale_y, draw_x, draw_y, original_size)
+                    painter.setPen(QPen(self.line_color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    painter.drawLine(sx, sy, ex, ey)
+            # Two-point free lines — only overlay when un-rotated/un-flipped, where
+            # the transform matches the main free-line renderer (avoids misalignment).
+            if free_lines and self.rotation_angle == 0 and not self.flipped_h and not self.flipped_v:
+                pen = QPen(self.line_color, max(1, self.line_thickness), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                painter.setPen(pen)
+                for line in free_lines:
+                    s = line['start']
+                    e = line['end']
+                    sx, sy = self._transform_point_to_display(s[0], s[1], scale_x, scale_y, draw_x, draw_y, original_size)
+                    ex, ey = self._transform_point_to_display(e[0], e[1], scale_x, scale_y, draw_x, draw_y, original_size)
+                    painter.drawLine(sx, sy, ex, ey)
+        finally:
+            painter.end()
+
+    def _apply_erase_holes(self, target_pixmap, clean_pixmap, scale_x, scale_y, draw_x, draw_y, original_size):
+        """Restore the clean (line-free) image inside each erase stroke, which
+        visually erases only the touched portions of lines/drawings."""
+        if not (self.erase_strokes or self.current_erase_stroke):
+            return
+        if clean_pixmap is None or clean_pixmap.isNull():
+            return
+        from PySide6.QtGui import QPolygonF
+        from PySide6.QtCore import QPointF
+        strokes = list(self.erase_strokes)
+        if self.current_erase_stroke:
+            strokes.append(self.current_erase_stroke)
+
+        # ── Build a SOLID coverage mask of every erased region ──────────────
+        # Painting opaque white strokes onto a transparent mask is robust against
+        # self-overlap (back-and-forth drags): overlapping opaque paint just stays
+        # opaque, with none of the odd/even or winding cancellation that made
+        # path-union clipping leave holes. Cost is O(points), so it stays fast
+        # even on long tablet strokes.
+        mask = QPixmap(target_pixmap.size())
+        mask.fill(Qt.transparent)
+        mp = QPainter(mask)
+        mp.setRenderHint(QPainter.Antialiasing, True)
+        white = QColor(255, 255, 255, 255)
+        any_drawn = False
+        for stroke in strokes:
+            if not stroke:
+                continue
+            pts = []
+            max_r = 1.0
+            for (x, y, r) in stroke:
+                dx, dy = self._transform_point_to_display(x, y, scale_x, scale_y, draw_x, draw_y, original_size)
+                rd = max(1.0, r * scale_x)
+                pts.append((dx, dy))
+                if rd > max_r:
+                    max_r = rd
+            if len(pts) == 1:
+                # Single tap → a filled dot
+                mp.setPen(Qt.NoPen)
+                mp.setBrush(white)
+                mp.drawEllipse(QPointF(pts[0][0], pts[0][1]), max_r, max_r)
+            else:
+                # Continuous band: a round-cap/round-join pen stroke is fully
+                # solid and self-overlap-safe.
+                mp.setBrush(Qt.NoBrush)
+                pen = QPen(white, max_r * 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                mp.setPen(pen)
+                mp.drawPolyline(QPolygonF([QPointF(px, py) for px, py in pts]))
+            any_drawn = True
+        mp.end()
+        if not any_drawn:
+            return
+
+        # ── Keep the clean image only inside the mask, then paint it over the
+        #    drawn pixmap → reveals the untouched image exactly where erased ──
+        patch = QPixmap(clean_pixmap.size())
+        patch.fill(Qt.transparent)
+        pp = QPainter(patch)
+        pp.drawPixmap(0, 0, clean_pixmap)
+        pp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        pp.drawPixmap(0, 0, mask)
+        pp.end()
+
+        ep = QPainter(target_pixmap)
+        ep.drawPixmap(0, 0, patch)
+        ep.end()
+
+    def _invalidate_line_caches(self):
+        """Clear caches so the next render repaints lines/erases."""
+        if isinstance(getattr(self, 'enhancement_cache', None), dict):
+            self.enhancement_cache.clear()
+        if isinstance(getattr(self, 'scaled_cache', None), dict):
+            self.scaled_cache.clear()
 
     # ───────────────────── Color Snap (eyedropper) tool ─────────────────────
     def toggle_color_snap(self, checked):
@@ -4244,10 +4983,11 @@ class RandomImageViewer(QMainWindow):
             self.free_line_drawing_mode = False
             self.free_draw_mode = False
             for btn_name in ('line_tool_btn', 'hline_tool_btn',
-                             'free_line_tool_btn', 'free_draw_tool_btn'):
+                             'free_line_tool_btn', 'free_draw_tool_btn', 'eraser_tool_btn'):
                 btn = getattr(self, btn_name, None)
                 if btn is not None and btn.isChecked():
                     btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
+            self._disable_eraser_silent()
             if self._color_snap_preview is None:
                 self._color_snap_preview = ColorSnapPreview(self)
             # Show floating palette panel (re-open if user previously closed it)
@@ -4597,7 +5337,10 @@ class RandomImageViewer(QMainWindow):
 
     def _update_cursor_and_status(self):
         """Update cursor and status message based on active drawing modes"""
-        if getattr(self, 'color_snap_mode', False):
+        if getattr(self, 'eraser_mode', False):
+            self._update_eraser_cursor()
+            self.status.showMessage("Eraser: drag over lines/drawings to erase them (the image stays intact)")
+        elif getattr(self, 'color_snap_mode', False):
             self.image_label.setCursor(Qt.CrossCursor)
             self.status.showMessage("Color Snap: hover over image and click to pick a color (toggle button to exit)")
         elif self.free_draw_mode:
@@ -4701,6 +5444,8 @@ class RandomImageViewer(QMainWindow):
             self.line_color = color
             # Preserve current transparency setting
             self.line_color.setAlpha(self.line_transparency)
+            # Drive the edge-detection line color too (opaque copy)
+            self.edge_color = QColor(color.red(), color.green(), color.blue())
             # Update button background to show selected color
             self.line_color_btn.setStyleSheet(f"QToolButton {{ background-color: {self.line_color.name()}; border: 1px solid #666; }}")
             # Clear LUT cache since line appearance changed
@@ -4710,7 +5455,7 @@ class RandomImageViewer(QMainWindow):
             self.enhancement_cache.clear()
             self.scaled_cache.clear()
             # Redraw current image with new color if there are lines
-            if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes):
+            if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes or self.edge_detection_enabled):
                 # Force full display_image to ensure changes are visible
                 self.display_image(self.current_image)
 
@@ -4719,6 +5464,8 @@ class RandomImageViewer(QMainWindow):
         self.line_color = QColor(color_hex)
         # Preserve current transparency setting
         self.line_color.setAlpha(self.line_transparency)
+        # Drive the edge-detection line color too (opaque copy)
+        self.edge_color = QColor(color_hex)
         # Update main color button background to show selected color
         self.line_color_btn.setStyleSheet(f"QToolButton {{ background-color: {self.line_color.name()}; border: 1px solid #666; }}")
         # Clear LUT cache since line appearance changed
@@ -4728,7 +5475,7 @@ class RandomImageViewer(QMainWindow):
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         # Redraw current image with new color if there are lines
-        if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes):
+        if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes or self.edge_detection_enabled):
             # Force full display_image to ensure changes are visible
             self.display_image(self.current_image)
 
@@ -4763,6 +5510,12 @@ class RandomImageViewer(QMainWindow):
         if self.current_line_start is None:
             # First click - set start point
             self.current_line_start = (x, y)
+            # ⚡ Prepare live-preview state: snapshot the currently displayed pixmap
+            # (with all committed lines baked in) and precompute display geometry so
+            # the rubber-band preview can be composited cheaply on each pen move.
+            self._line_preview_geom = self._build_display_geometry_cache()
+            base = self.image_label.pixmap()
+            self._line_preview_base = base.copy() if base and not base.isNull() else None
             self.status.showMessage(f"Line start set at ({x:.0f}, {y:.0f}) - Click second point to complete line")
         else:
             # Second click - complete the line
@@ -4785,6 +5538,7 @@ class RandomImageViewer(QMainWindow):
             
             # Reset for next line
             self.current_line_start = None
+            self._clear_line_preview()
             
             # Update display - use fast GPU-accelerated update instead of full display_image
             if self.current_image:
@@ -4792,6 +5546,48 @@ class RandomImageViewer(QMainWindow):
                 self.display_image(self.current_image)
             
             self.status.showMessage(f"Line drawn from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f})")
+
+    def _clear_line_preview(self):
+        """Drop the free-line live-preview snapshot and geometry."""
+        self._line_preview_base = None
+        self._line_preview_geom = None
+        if hasattr(self, 'line_preview_timer'):
+            self.line_preview_timer.stop()
+        self._line_preview_pending_pos = None
+
+    def update_free_line_preview(self, label_pos):
+        """Render a live rubber-band preview from the first click to the current
+        pen position. Throttled to ~60 FPS so the tablet's high event rate can't
+        saturate the UI thread."""
+        if self.current_line_start is None or self._line_preview_base is None:
+            return
+        self._line_preview_pending_pos = (label_pos.x(), label_pos.y())
+        if not self.line_preview_timer.isActive():
+            self.line_preview_timer.start()
+
+    def _flush_line_preview(self):
+        """Composite the pending free-line preview onto the snapshot and show it."""
+        if (self.current_line_start is None or self._line_preview_base is None
+                or self._line_preview_pending_pos is None):
+            return
+        geom = self._line_preview_geom
+        if not geom:
+            return
+        sx, sy = self.current_line_start
+        start_dx, start_dy = self._transform_point_to_display(
+            sx, sy, geom['scale_x'], geom['scale_y'],
+            geom['draw_x'], geom['draw_y'], geom['original_size'])
+        end_x, end_y = self._line_preview_pending_pos
+
+        preview = self._line_preview_base.copy()
+        painter = QPainter(preview)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen_color = QColor(self.line_color)
+        pen_color.setAlpha(self.line_transparency)
+        painter.setPen(QPen(pen_color, self.line_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawLine(int(start_dx), int(start_dy), int(end_x), int(end_y))
+        painter.end()
+        self.image_label.setPixmap(preview)
 
     def start_free_draw_stroke(self, x, y, pressure=1.0):
         """⚡ PERFORMANCE: Start a new free draw stroke with aggressive caching"""
@@ -4932,33 +5728,10 @@ class RandomImageViewer(QMainWindow):
 
         # ⚡ INCREMENTAL PAINTING: Only paint the new segment
         if self.last_draw_point is not None:
-            # ✨ SMOOTH PATH: Add intermediate points for ultra-smooth curves
-            if self.line_antialiasing and self.free_draw_mode:
-                # Calculate distance between points
-                dx = final_x - self.last_draw_point[0]
-                dy = final_y - self.last_draw_point[1]
-                distance = (dx * dx + dy * dy) ** 0.5
-                
-                # If points are far apart, add intermediate points for smoothness
-                if distance > 3.0:
-                    num_steps = max(2, int(distance / 2.0))
-                    for i in range(1, num_steps):
-                        t = i / num_steps
-                        inter_x = self.last_draw_point[0] + dx * t
-                        inter_y = self.last_draw_point[1] + dy * t
-                        prev_point = (self.last_draw_point[0] + dx * (t - 1/num_steps), 
-                                     self.last_draw_point[1] + dy * (t - 1/num_steps)) if i > 1 else self.last_draw_point
-                        self._paint_stroke_segment_realtime(prev_point, (inter_x, inter_y), pressure)
-                    # Paint final segment
-                    self._paint_stroke_segment_realtime((self.last_draw_point[0] + dx * (num_steps-1)/num_steps, 
-                                                       self.last_draw_point[1] + dy * (num_steps-1)/num_steps), 
-                                                      (final_x, final_y), pressure)
-                else:
-                    # Normal segment painting for close points
-                    self._paint_stroke_segment_realtime(self.last_draw_point, (final_x, final_y), pressure)
-            else:
-                # 🎨 PEN PRESSURE: Pass pressure to painting method
-                self._paint_stroke_segment_realtime(self.last_draw_point, (final_x, final_y), pressure)
+            # A single round-capped/round-joined line already renders smoothly, so we
+            # paint one segment per point instead of subdividing it into many collinear
+            # micro-segments (which only added CPU cost and made the pen feel heavy).
+            self._paint_stroke_segment_realtime(self.last_draw_point, (final_x, final_y), pressure)
         else:
             # First point - paint a small dot with correct pressure
             # 🎨 PEN PRESSURE: Ensure first point uses the actual pressure, not default
@@ -4967,6 +5740,27 @@ class RandomImageViewer(QMainWindow):
             self._paint_stroke_segment_realtime((final_x, final_y), (final_x, final_y), pressure)
 
         self.last_draw_point = (final_x, final_y)
+
+    def _pressure_to_thickness(self, pressure):
+        """🎨 SINGLE SOURCE OF TRUTH: Map pen pressure to line thickness.
+
+        Used by BOTH the live preview (while drawing) and the final committed
+        render (after pen release) so the stroke keeps the exact same width.
+        When pen pressure is disabled, returns the plain base thickness.
+        """
+        if not self.pen_pressure_enabled:
+            return max(1, self.line_thickness)
+
+        # 🎨 ENHANCED PRESSURE MAPPING: Use a curve for more natural feel
+        # Apply a slight curve to make light pressure more usable
+        curved_pressure = max(0.0, pressure) ** 0.8  # Power curve for natural response
+
+        # Map pressure to thickness with a better range
+        min_thickness = max(1, int(self.line_thickness * 0.2))  # Minimum 20% of base thickness
+        max_thickness = int(self.line_thickness * 1.5)  # Maximum 150% of base thickness
+        thickness_range = max_thickness - min_thickness
+        base_thickness = min_thickness + int(thickness_range * curved_pressure)
+        return max(1, base_thickness)
 
     def _paint_stroke_segment_realtime(self, start_point, end_point, pressure=1.0):
         """⚡ ULTRA-FAST: Hybrid drawing with performance/quality options and pressure support"""
@@ -4988,23 +5782,10 @@ class RandomImageViewer(QMainWindow):
                 actual_pressure = self._tablet_pressure
             else:
                 actual_pressure = 1.0
-            
-            # 🎨 ENHANCED PRESSURE MAPPING: Use a curve for more natural feel
-            # Apply a slight curve to make light pressure more usable
-            curved_pressure = actual_pressure ** 0.8  # Power curve for more natural response
-            
-            # Map pressure to thickness with a better range
-            min_thickness = max(1, int(self.line_thickness * 0.2))  # Minimum 20% of base thickness
-            max_thickness = int(self.line_thickness * 1.5)  # Maximum 150% of base thickness
-            thickness_range = max_thickness - min_thickness
-            base_thickness = min_thickness + int(thickness_range * curved_pressure)
-            
-            # Apply zoom factor for consistent visual thickness
-            zoom_factor = self.image_label.zoom_factor if hasattr(self, 'image_label') else 1.0
-            dynamic_thickness = max(1, base_thickness)
+
+            # 🎨 Use shared formula so the final render matches this preview exactly
+            dynamic_thickness = self._pressure_to_thickness(actual_pressure)
         else:
-            # Apply zoom factor for consistent visual thickness
-            zoom_factor = self.image_label.zoom_factor if hasattr(self, 'image_label') else 1.0
             dynamic_thickness = max(1, self.line_thickness)
         
         if use_smooth:
@@ -5014,10 +5795,13 @@ class RandomImageViewer(QMainWindow):
             # ⚡ ULTRA-FAST: Direct pixel manipulation for maximum speed
             self._paint_fast_segment(start_point, end_point, dynamic_thickness)
         
-        # ⚡ TIMER-BASED UPDATE: Schedule display update
-        if self.stroke_update_timer.isActive():
-            self.stroke_update_timer.stop()
-        self.stroke_update_timer.start()
+        # ⚡ TIMER-BASED UPDATE: Schedule a display refresh. Use a "start only if
+        # not already pending" pattern (NOT stop+restart): restarting on every pen
+        # move meant a continuous fast stroke never left an idle gap for the timer
+        # to fire, so the line only appeared once the pen slowed/lifted. This way
+        # the overlay refreshes at a steady cadence *during* the stroke.
+        if not self.stroke_update_timer.isActive():
+            self.stroke_update_timer.start()
 
     def _paint_smooth_segment(self, start_point, end_point, thickness=None):
         """✨ HIGH-QUALITY: Smooth antialiased line drawing with improved interpolation"""
@@ -5050,32 +5834,12 @@ class RandomImageViewer(QMainWindow):
             # Get coordinates
             x0, y0 = start_point
             x1, y1 = end_point
-            
-            # Calculate distance between points
-            dx = x1 - x0
-            dy = y1 - y0
-            distance = (dx * dx + dy * dy) ** 0.5
-            
-            # For very short segments, just draw a simple line
-            if distance < 2.0:
-                painter.drawLine(x0, y0, x1, y1)
-            else:
-                # ✨ SMOOTH INTERPOLATION: Draw multiple sub-segments for ultra-smooth curves
-                # Use adaptive subdivision based on distance
-                num_segments = max(2, int(distance / 2.0))
-                
-                for i in range(num_segments):
-                    t0 = i / num_segments
-                    t1 = (i + 1) / num_segments
-                    
-                    # Interpolate points
-                    seg_x0 = x0 + dx * t0
-                    seg_y0 = y0 + dy * t0
-                    seg_x1 = x0 + dx * t1
-                    seg_y1 = y0 + dy * t1
-                    
-                    painter.drawLine(seg_x0, seg_y0, seg_x1, seg_y1)
-                    
+
+            # A round cap + round join pen renders a straight segment perfectly
+            # smooth on its own; subdividing it into collinear sub-segments only
+            # multiplied painter work and made fast strokes feel laggy.
+            painter.drawLine(x0, y0, x1, y1)
+
         finally:
             painter.end()
 
@@ -5251,6 +6015,10 @@ class RandomImageViewer(QMainWindow):
         self.drawn_horizontal_lines.clear()
         self.drawn_free_lines.clear()
         self.drawn_free_strokes.clear()  # NEW: Clear free draw strokes
+        self.erase_strokes.clear()  # 🧽 Clear eraser strokes
+        self._erase_state_marks.clear()
+        self.current_erase_stroke = None
+        self.is_erasing = False
         self.current_line_start = None
         self.current_stroke = None  # NEW: Clear current stroke
         self.is_drawing = False  # NEW: Reset drawing state
@@ -5268,8 +6036,13 @@ class RandomImageViewer(QMainWindow):
         """Remove the most recently added line (vertical, horizontal, free line, or free draw stroke)"""
         removed_something = False
         
-        # Prioritize free draw strokes, then free lines, then horizontal, then vertical
-        if self.drawn_free_strokes:
+        # 🧽 Eraser strokes undo first, then free draw strokes, free lines, horizontal, vertical
+        if self.erase_strokes:
+            self.erase_strokes.pop()
+            if self._erase_state_marks:
+                self._erase_state_marks.pop()
+            removed_something = True
+        elif self.drawn_free_strokes:
             # Remove the last free draw stroke
             self.drawn_free_strokes.pop()
             removed_something = True
@@ -5345,24 +6118,36 @@ class RandomImageViewer(QMainWindow):
                     return
                 final_pixmap = self.image_label.pixmap().copy()
 
-            # Ask user for save location
-            options = QFileDialog.Options()
-            file_path, _ = QFileDialog.getSaveFileName(self, "Save Current View", os.path.expanduser("~"), "PNG Files (*.png);;JPEG Files (*.jpg *.jpeg);;All Files (*)", options=options)
-            if not file_path:
-                return
+            # Auto-save to the Downloads folder with a unique name (no dialog)
+            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            try:
+                if not os.path.isdir(downloads_dir):
+                    os.makedirs(downloads_dir, exist_ok=True)
+            except Exception:
+                # Fall back to the home directory if Downloads is unavailable
+                downloads_dir = os.path.expanduser("~")
 
-            # Determine format from extension
-            _, ext = os.path.splitext(file_path)
-            ext = ext.lower()
-            if ext in ('.jpg', '.jpeg'):
-                fmt = 'JPEG'
+            # Build a unique filename from the source name + timestamp
+            if self.current_image:
+                base = os.path.splitext(os.path.basename(self.current_image))[0]
             else:
-                fmt = 'PNG'
+                base = "view"
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"OvaViewer_{base}_{timestamp}.png"
+            file_path = os.path.join(downloads_dir, file_name)
 
-            # Save using QPixmap save - this preserves pixel data including lines
-            saved = final_pixmap.save(file_path, fmt)
+            # Guard against collisions (e.g. multiple saves within the same second)
+            counter = 1
+            while os.path.exists(file_path):
+                file_name = f"OvaViewer_{base}_{timestamp}_{counter}.png"
+                file_path = os.path.join(downloads_dir, file_name)
+                counter += 1
+
+            # Save as PNG - preserves pixel data including lines and transparency
+            saved = final_pixmap.save(file_path, 'PNG')
             if saved:
-                self.status.showMessage(f"Saved view to {os.path.basename(file_path)}")
+                self.status.showMessage(f"Saved to Downloads: {file_name}")
             else:
                 self.status.showMessage("Failed to save image")
 
@@ -5656,6 +6441,73 @@ class RandomImageViewer(QMainWindow):
         if self.current_image:
             self.display_image(self.current_image)
 
+    def toggle_value_filter(self, checked):
+        """Enable/disable the posterize value filter."""
+        self.value_filter_enabled = bool(checked)
+        if hasattr(self, 'value_filter_toggle_btn') and self.value_filter_toggle_btn is not None:
+            self.value_filter_toggle_btn.blockSignals(True)
+            self.value_filter_toggle_btn.setChecked(self.value_filter_enabled)
+            self.value_filter_toggle_btn.blockSignals(False)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def update_value_levels(self, value):
+        """Change the number of posterize tones (2-10). Does not auto-enable."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.value_levels = max(2, min(10, value))
+        # Only need to re-render if the filter is currently on
+        if self.value_filter_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def toggle_edge_detection(self, checked):
+        """Enable/disable the Canny edge-detection filter."""
+        self.edge_detection_enabled = bool(checked)
+        if hasattr(self, 'edge_toggle_btn') and self.edge_toggle_btn is not None:
+            self.edge_toggle_btn.blockSignals(True)
+            self.edge_toggle_btn.setChecked(self.edge_detection_enabled)
+            self.edge_toggle_btn.blockSignals(False)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def set_edge_mode(self, mode):
+        """Set the edge-detection look (white_on_black/black_on_white/overlay)."""
+        if mode not in ("white_on_black", "black_on_white", "overlay"):
+            return
+        self.edge_mode = mode
+        if hasattr(self, '_edge_mode_actions'):
+            for key, act in self._edge_mode_actions.items():
+                act.blockSignals(True)
+                act.setChecked(key == mode)
+                act.blockSignals(False)
+        if self.edge_detection_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def update_edge_sensitivity(self, value):
+        """Change edge sensitivity (0-100). Does not auto-enable."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.edge_sensitivity = max(0, min(100, value))
+        if self.edge_detection_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
     def update_contrast(self, value):
         self.contrast_value = value
         # Update toggle button state (block signals to prevent loops)
@@ -5717,6 +6569,18 @@ class RandomImageViewer(QMainWindow):
         self.current_lut = None
         self.current_lut_name = "None"
         self.lut_strength = 100
+        self.value_filter_enabled = False
+        self.value_levels = 4
+
+        # Reset value-filter UI
+        if hasattr(self, 'value_filter_toggle_btn') and self.value_filter_toggle_btn is not None:
+            self.value_filter_toggle_btn.blockSignals(True)
+            self.value_filter_toggle_btn.setChecked(False)
+            self.value_filter_toggle_btn.blockSignals(False)
+        if hasattr(self, 'value_levels_spin') and self.value_levels_spin is not None:
+            self.value_levels_spin.blockSignals(True)
+            self.value_levels_spin.setValue(4)
+            self.value_levels_spin.blockSignals(False)
         
         # Update toggle button states (block signals to prevent loops)
         if hasattr(self, 'grayscale_toggle_btn') and self.grayscale_toggle_btn is not None:
@@ -6874,6 +7738,14 @@ class RandomImageViewer(QMainWindow):
         # nothing extra to do here — next frame will pick up the new zoom factor.
         if self.image_label.is_animation_playing():
             return
+
+        # The fast zoom path reuses a cached pre-posterize image, which would
+        # drop the value filter or edge detection on resize/zoom. When either
+        # is on, fall back to the full display path so the effect is preserved.
+        if (getattr(self, 'value_filter_enabled', False) or getattr(self, 'edge_detection_enabled', False)
+                or getattr(self, 'erase_strokes', None) or getattr(self, 'current_erase_stroke', None)):
+            self.display_image(self.current_image)
+            return
             
         try:
             # CRITICAL OPTIMIZATION: During zoom, use the last processed image to avoid GPU calls
@@ -6966,8 +7838,7 @@ class RandomImageViewer(QMainWindow):
                                     end_x, end_y = stroke[i + 1][:2]
                                     p2 = 1.0
                                 avg_pressure = (p1 + p2) / 2.0 if self.pen_pressure_enabled else 1.0
-                                base_thick = max(1, int(self.line_thickness * avg_pressure))
-                                seg_thick = max(1, base_thick)
+                                seg_thick = self._pressure_to_thickness(avg_pressure)
                                 painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                 display_start_x = int(start_x * scale_x) + draw_x
                                 display_start_y = int(start_y * scale_y) + draw_y
@@ -7052,8 +7923,7 @@ class RandomImageViewer(QMainWindow):
                                         end_x, end_y = stroke[i + 1][:2]
                                         p2 = 1.0
                                     avg_pressure = (p1 + p2)/2.0 if self.pen_pressure_enabled else 1.0
-                                    base_thick = max(1, int(self.line_thickness * avg_pressure))
-                                    seg_thick = max(1, base_thick)
+                                    seg_thick = self._pressure_to_thickness(avg_pressure)
                                     painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                     display_start_x = int(start_x * scale_x) + draw_x
                                     display_start_y = int(start_y * scale_y) + draw_y
@@ -7162,8 +8032,7 @@ class RandomImageViewer(QMainWindow):
                                         end_x, end_y = stroke[i + 1][:2]
                                         p2 = 1.0
                                     avg_pressure = (p1 + p2)/2.0 if self.pen_pressure_enabled else 1.0
-                                    base_thick = max(1, int(self.line_thickness * avg_pressure))
-                                    seg_thick = max(1, base_thick)
+                                    seg_thick = self._pressure_to_thickness(avg_pressure)
                                     painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                     display_start_x = int(start_x * scale_x) + draw_x
                                     display_start_y = int(start_y * scale_y) + draw_y
@@ -7249,8 +8118,7 @@ class RandomImageViewer(QMainWindow):
                                             end_x, end_y = stroke[i + 1][:2]
                                             p2 = 1.0
                                         avg_pressure = (p1 + p2)/2.0 if self.pen_pressure_enabled else 1.0
-                                        base_thick = max(1, int(self.line_thickness * avg_pressure))
-                                        seg_thick = max(1, base_thick)
+                                        seg_thick = self._pressure_to_thickness(avg_pressure)
                                         painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                         display_start_x = int(start_x * scale_x) + draw_x
                                         display_start_y = int(start_y * scale_y) + draw_y
@@ -7361,8 +8229,7 @@ class RandomImageViewer(QMainWindow):
                                 end_x, end_y = stroke[i + 1][:2]
                                 p2 = 1.0
                             avg_pressure = (p1 + p2)/2.0 if self.pen_pressure_enabled else 1.0
-                            base_thick = max(1, int(self.line_thickness * avg_pressure))
-                            seg_thick = max(1, base_thick)
+                            seg_thick = self._pressure_to_thickness(avg_pressure)
                             painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                             display_start_x = int(start_x * scale_x) + draw_x
                             display_start_y = int(start_y * scale_y) + draw_y
@@ -7448,8 +8315,7 @@ class RandomImageViewer(QMainWindow):
                                     end_x, end_y = stroke[i + 1][:2]
                                     p2 = 1.0
                                 avg_pressure = (p1 + p2)/2.0 if self.pen_pressure_enabled else 1.0
-                                base_thick = max(1, int(self.line_thickness * avg_pressure))
-                                seg_thick = max(1, base_thick)
+                                seg_thick = self._pressure_to_thickness(avg_pressure)
                                 painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                 display_start_x = int(start_x * scale_x) + draw_x
                                 display_start_y = int(start_y * scale_y) + draw_y
@@ -7537,8 +8403,7 @@ class RandomImageViewer(QMainWindow):
                                     end_x, end_y = stroke[i + 1][:2]
                                     p2 = 1.0
                                 avg_pressure = (p1 + p2)/2.0 if self.pen_pressure_enabled else 1.0
-                                base_thick = max(1, int(self.line_thickness * avg_pressure))
-                                seg_thick = max(1, base_thick)
+                                seg_thick = self._pressure_to_thickness(avg_pressure)
                                 painter.setPen(QPen(self.line_color, seg_thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                                 display_start_x = int(start_x * scale_x)
                                 display_start_y = int(start_y * scale_y)
@@ -7988,6 +8853,56 @@ class RandomImageViewer(QMainWindow):
             # Mixed playlist: images, videos, GIFs, and PDF/EPUB/CBR all walk
             # through the same Next/Previous flow.
             self._load_playlist([folder], source="from folder dialog")
+
+    def delete_current_file(self):
+        """Move the currently displayed file to the Recycle Bin."""
+        # Guard: only available for regular media files, not document page viewers
+        if not self.current_image:
+            return
+        if getattr(self, '_pdf_doc', None) or getattr(self, '_epub_doc', None) or getattr(self, '_cbr_doc', None):
+            return
+
+        file_path = self.current_image
+        file_name = os.path.basename(file_path)
+
+        # Determine next item to show before removing from playlist
+        images = self.images
+        try:
+            idx = images.index(file_path)
+        except ValueError:
+            idx = -1
+
+        # Remove from playlist list
+        if idx >= 0:
+            images.pop(idx)
+
+        # Clean from history
+        self.history = [p for p in self.history if p != file_path]
+        self.history_index = max(0, min(self.history_index, len(self.history) - 1))
+
+        # Attempt trash
+        from PySide6.QtCore import QFile
+        ok = QFile.moveToTrash(file_path)
+
+        if not ok:
+            # Restore to playlist and report failure
+            if idx >= 0:
+                images.insert(idx, file_path)
+            self.statusBar().showMessage(f"Failed to move to Recycle Bin: {file_name}", 4000)
+            return
+
+        self.statusBar().showMessage(f"Moved to Recycle Bin: {file_name}", 3000)
+        self.current_image = None
+
+        if not images:
+            # Nothing left — clear display
+            self.image_label.clear()
+            self._stop_current_animation()
+            return
+
+        # Advance: clamp index, then load
+        next_idx = min(idx, len(images) - 1)
+        self._load_playlist_item(images[next_idx])
 
     def mousePressEvent(self, event):
         """Handle mouse press for window dragging and resizing in frameless mode."""
