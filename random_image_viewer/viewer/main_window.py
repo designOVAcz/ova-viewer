@@ -398,6 +398,94 @@ class VideoControlsOverlay(QWidget):
 
 class RandomImageViewer(QMainWindow):
     # ...existing code...
+    def _create_overlay_icon(self, icon_type):
+        """Create a QPainter-drawn icon for overlay tool buttons.
+        icon_type: 'crosshair' or 'grid'
+        """
+        size = 18
+        img = QImage(size, size, QImage.Format_ARGB32)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        pen = QPen(QColor("#c8c8c8"), 1, Qt.SolidLine)
+        p.setPen(pen)
+
+        if icon_type == 'crosshair':
+            cx, cy = size // 2, size // 2
+            gap = 3  # gap around center
+            # Vertical arm: top segment + bottom segment
+            p.drawLine(cx, 0, cx, cy - gap)
+            p.drawLine(cx, cy + gap, cx, size - 1)
+            # Horizontal arm: left segment + right segment
+            p.drawLine(0, cy, cx - gap, cy)
+            p.drawLine(cx + gap, cy, size - 1, cy)
+        elif icon_type == 'grid':
+            # Outer border
+            p.drawRect(0, 0, size - 1, size - 1)
+            # Two vertical dividers at 1/3 and 2/3
+            v1 = size // 3
+            v2 = (size * 2) // 3
+            p.drawLine(v1, 0, v1, size - 1)
+            p.drawLine(v2, 0, v2, size - 1)
+            # Two horizontal dividers at 1/3 and 2/3
+            h1 = size // 3
+            h2 = (size * 2) // 3
+            p.drawLine(0, h1, size - 1, h1)
+            p.drawLine(0, h2, size - 1, h2)
+
+        p.end()
+        return QIcon(QPixmap.fromImage(img))
+
+    def _draw_fixed_overlays(self, painter, draw_x, draw_y, zoomed_width, zoomed_height):
+        """Draw crosshair and/or 3x3 grid overlay onto an already-active QPainter.
+        Coordinates are in display/pixmap space.
+        """
+        pen = QPen(self.line_color, self.line_thickness, Qt.SolidLine)
+        painter.setPen(pen)
+
+        if self.crosshair_overlay:
+            cx = draw_x + zoomed_width // 2
+            cy = draw_y + zoomed_height // 2
+            # Full-length vertical and horizontal cross through image center
+            painter.drawLine(cx, draw_y, cx, draw_y + zoomed_height)
+            painter.drawLine(draw_x, cy, draw_x + zoomed_width, cy)
+
+        if self.grid_overlay:
+            # 3x3 grid: 2 vertical + 2 horizontal dividers
+            for i in (1, 2):
+                # Vertical line at i/3 of width
+                x = draw_x + (zoomed_width * i) // 3
+                painter.drawLine(x, draw_y, x, draw_y + zoomed_height)
+                # Horizontal line at i/3 of height
+                y = draw_y + (zoomed_height * i) // 3
+                painter.drawLine(draw_x, y, draw_x + zoomed_width, y)
+
+    def _apply_fixed_overlays_to_pixmap(self, pixmap):
+        """Apply crosshair/grid overlay on top of pixmap (display space).
+        Returns a copy with overlays painted, or the original if nothing to draw.
+        """
+        if not (self.crosshair_overlay or self.grid_overlay):
+            return pixmap
+        if not getattr(self, 'lines_visible', True):
+            return pixmap
+        if not pixmap or pixmap.isNull():
+            return pixmap
+
+        tx = self._compute_line_transform()
+        if not tx:
+            return pixmap
+
+        result = pixmap.copy()
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        self._draw_fixed_overlays(
+            painter,
+            tx['draw_x'], tx['draw_y'],
+            tx['zoomed_width'], tx['zoomed_height']
+        )
+        painter.end()
+        return result
+
     def _compute_line_transform(self):
         """Compute scaling and offset for mapping original image coords to current displayed pixmap.
         Returns dict with scale_x, scale_y, draw_x, draw_y. Now supports rotation and flips."""
@@ -517,9 +605,10 @@ class RandomImageViewer(QMainWindow):
                             painter.drawLine(int(sx * scale_x) + offset_x, int(sy * scale_y) + offset_y,
                                              int(ex * scale_x) + offset_x, int(ey * scale_y) + offset_y)
                         painter.end()
+                        overlay = self._apply_fixed_overlays_to_pixmap(overlay)
                         self.image_label.setPixmap(overlay)
                     else:
-                        self.image_label.setPixmap(gpu_result)
+                        self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(gpu_result))
                     return
             # CPU fallback: manually paint over current_pixmap copy
             overlay = current_pixmap.copy()
@@ -784,6 +873,7 @@ class RandomImageViewer(QMainWindow):
                                            int(end_x * scale_x), int(end_y * scale_y))
                     painter.setRenderHint(QPainter.Antialiasing, False)
             painter.end()
+            overlay = self._apply_fixed_overlays_to_pixmap(overlay)
             self.image_label.setPixmap(overlay)
         except Exception as e:
             print(f"_fast_line_update failed: {e}; skipping line overlay to prevent loops")
@@ -795,6 +885,9 @@ class RandomImageViewer(QMainWindow):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setWindowTitle("Ova Viewer")
         self.setGeometry(100, 100, 1200, 760)
+        # Accept touch events at the top-level window so Qt does not discard
+        # them before they reach the ImageLabel child widget.
+        self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         
         # Set window icon
         self.set_window_icon()
@@ -901,6 +994,7 @@ class RandomImageViewer(QMainWindow):
         # at that moment. Drawings added AFTER the most recent erase are kept visible
         # inside erase holes, so you can draw again over an erased area.
         self._erase_state_marks = []  # Parallel to erase_strokes: [{'free_strokes': n, 'free_lines': n}]
+        self._undo_stack = []  # Chronological record: 'line'|'hline'|'free_line'|'free_stroke'|'erase'
         self.current_erase_stroke = None  # Stroke being drawn
         self.is_erasing = False  # Track if currently erasing
         self.eraser_cache = None  # Precomputed coord-mapping geometry during a stroke
@@ -933,6 +1027,9 @@ class RandomImageViewer(QMainWindow):
         self._current_pressure = 1.0  # 🎨 NEW: Current pressure value for real-time painting
         self._tablet_pressure = 1.0  # 🎨 NEW: Stored tablet pressure for mouse event compatibility
         self._last_pressure = 1.0  # 🎨 NEW: Last pressure for smoothing interpolation
+        # Fixed overlay tools (non-interactive, passive overlays over the image)
+        self.crosshair_overlay = False  # Draw cross lines at image center
+        self.grid_overlay = False       # Draw 3x3 grid over the image
         # Always on top functionality
         self.always_on_top = False
 
@@ -1337,6 +1434,24 @@ class RandomImageViewer(QMainWindow):
         self.eraser_size_spin = QSpinBox(); self.eraser_size_spin.setRange(1,30); self.eraser_size_spin.setValue(self.eraser_size); self.eraser_size_spin.setSuffix("px"); self.eraser_size_spin.setFixedHeight(24); self.eraser_size_spin.setFixedWidth(50); self.eraser_size_spin.setToolTip("Eraser Size"); self.eraser_size_spin.valueChanged.connect(self.update_eraser_size); toolbar.addWidget(self.eraser_size_spin)
         add_spacer(2)
         self.undo_line_btn = QToolButton(); self.undo_line_btn.setText("↶"); self.undo_line_btn.setToolTip("Undo Last Line"); self.undo_line_btn.setFixedSize(24,24); self.undo_line_btn.clicked.connect(self.undo_last_line); toolbar.addWidget(self.undo_line_btn)
+        add_section_divider()
+
+        # ── SECTION: Fixed Overlays ──
+        self.crosshair_tool_btn = QToolButton()
+        self.crosshair_tool_btn.setIcon(self._create_overlay_icon('crosshair'))
+        self.crosshair_tool_btn.setToolTip("Crosshair: draw cross lines at image center")
+        self.crosshair_tool_btn.setCheckable(True)
+        self.crosshair_tool_btn.setFixedSize(24, 24)
+        self.crosshair_tool_btn.toggled.connect(self.toggle_crosshair_overlay)
+        toolbar.addWidget(self.crosshair_tool_btn)
+        add_spacer(2)
+        self.grid_tool_btn = QToolButton()
+        self.grid_tool_btn.setIcon(self._create_overlay_icon('grid'))
+        self.grid_tool_btn.setToolTip("3×3 Grid: divide image into 9 equal parts")
+        self.grid_tool_btn.setCheckable(True)
+        self.grid_tool_btn.setFixedSize(24, 24)
+        self.grid_tool_btn.toggled.connect(self.toggle_grid_overlay)
+        toolbar.addWidget(self.grid_tool_btn)
         add_section_divider()
 
         # ── SECTION: Line Style ──
@@ -2139,6 +2254,7 @@ class RandomImageViewer(QMainWindow):
 
         # --- Scale / zoom / pan ---
         final = self._scale_pixmap(frame_pixmap, self.current_image)
+        final = self._apply_fixed_overlays_to_pixmap(final)
         self.image_label.setPixmap(final)
 
     # ── Video toolbar signal handlers ─────────────────────────────
@@ -2285,6 +2401,7 @@ class RandomImageViewer(QMainWindow):
 
         # --- Scale / zoom / pan ---
         final = self._scale_pixmap(frame_pixmap, self.current_image)
+        final = self._apply_fixed_overlays_to_pixmap(final)
         self.image_label.setPixmap(final)
 
     def _get_gif_lut_table_np(self):
@@ -3140,6 +3257,7 @@ class RandomImageViewer(QMainWindow):
             scaled_pixmap = blank_pixmap
         
         # Display the final scaled pixmap
+        scaled_pixmap = self._apply_fixed_overlays_to_pixmap(scaled_pixmap)
         self.image_label.setPixmap(scaled_pixmap)
         self.image_label.setToolTip("")
         self.current_image = img_path
@@ -4813,6 +4931,7 @@ class RandomImageViewer(QMainWindow):
                 'free_strokes': len(self.drawn_free_strokes),
                 'free_lines': len(self.drawn_free_lines),
             })
+            self._undo_stack.append('erase')
         self.current_erase_stroke = None
         self.is_erasing = False
         self.eraser_cache = None
@@ -5419,7 +5538,8 @@ class RandomImageViewer(QMainWindow):
         # Clear enhancement cache to force full redraw with new thickness
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
-        if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes):
+        if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes
+                                     or self.crosshair_overlay or self.grid_overlay):
             # Force full display_image to ensure changes are visible
             self.display_image(self.current_image)
 
@@ -5434,7 +5554,8 @@ class RandomImageViewer(QMainWindow):
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         # Refresh display to show transparency changes
-        if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes):
+        if self.current_image and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes
+                                    or self.crosshair_overlay or self.grid_overlay):
             self.display_image(self.current_image)
 
     def choose_line_color(self):
@@ -5482,6 +5603,7 @@ class RandomImageViewer(QMainWindow):
     def add_line(self, x_position):
         if x_position not in self.drawn_lines:
             self.drawn_lines.append(x_position)
+            self._undo_stack.append('line')
             # Clear LUT cache since lines changed
             if hasattr(self, '_lut_process_cache'):
                 self._lut_process_cache.clear()
@@ -5495,6 +5617,7 @@ class RandomImageViewer(QMainWindow):
     def add_hline(self, y_position):
         if y_position not in self.drawn_horizontal_lines:
             self.drawn_horizontal_lines.append(y_position)
+            self._undo_stack.append('hline')
             # Clear LUT cache since lines changed
             if hasattr(self, '_lut_process_cache'):
                 self._lut_process_cache.clear()
@@ -5528,6 +5651,7 @@ class RandomImageViewer(QMainWindow):
                 'end': (end_x, end_y)
             }
             self.drawn_free_lines.append(line)
+            self._undo_stack.append('free_line')
             
             # Clear LUT cache since lines changed
             if hasattr(self, '_lut_process_cache'):
@@ -5978,6 +6102,7 @@ class RandomImageViewer(QMainWindow):
         if self.current_stroke is not None and len(self.current_stroke) > 1:
             # Add completed stroke to the permanent list
             self.drawn_free_strokes.append(self.current_stroke.copy())
+            self._undo_stack.append('free_stroke')
             print(f"Stroke completed with {len(self.current_stroke)} points, total strokes: {len(self.drawn_free_strokes)}")
             
             # ⚡ CLEAN FINALIZATION: Clear caches and perform single clean redraw
@@ -6033,51 +6158,45 @@ class RandomImageViewer(QMainWindow):
             self.display_image(self.current_image)
 
     def undo_last_line(self):
-        """Remove the most recently added line (vertical, horizontal, free line, or free draw stroke)"""
-        removed_something = False
-        
-        # 🧽 Eraser strokes undo first, then free draw strokes, free lines, horizontal, vertical
-        if self.erase_strokes:
-            self.erase_strokes.pop()
-            if self._erase_state_marks:
-                self._erase_state_marks.pop()
-            removed_something = True
-        elif self.drawn_free_strokes:
-            # Remove the last free draw stroke
-            self.drawn_free_strokes.pop()
-            removed_something = True
-        elif self.drawn_free_lines:
-            # Remove the last free line
-            self.drawn_free_lines.pop()
-            removed_something = True
-        elif self.drawn_horizontal_lines:
-            # Remove the last horizontal line
-            self.drawn_horizontal_lines.pop()
-            removed_something = True
-        elif self.drawn_lines:
-            # Remove the last vertical line
-            self.drawn_lines.pop()
-            removed_something = True
-        
-        # Also reset current line start if we're in the middle of drawing a free line
+        """Remove the most recently added annotation in chronological order."""
+        # Cancel a half-drawn free line first (no stack entry for an uncommitted line).
         if self.current_line_start is not None:
             self.current_line_start = None
-            removed_something = True
-            self._update_cursor_and_status()  # Update status message
-        
-        if removed_something:
-            # Clear LUT cache since lines changed
-            if hasattr(self, '_lut_process_cache'):
-                self._lut_process_cache.clear()
-            # Clear enhancement cache to force full redraw
-            self.enhancement_cache.clear()
-            self.scaled_cache.clear()
-            if self.current_image:
-                # Force full display_image to ensure changes are visible
-                self.display_image(self.current_image)
-            self.status.showMessage("Removed last line")
-        else:
+            self._clear_line_preview()
+            self._update_cursor_and_status()
+            self.status.showMessage("Cancelled free line")
+            return
+
+        if not self._undo_stack:
             self.status.showMessage("No lines to remove")
+            return
+
+        action = self._undo_stack.pop()
+        if action == 'erase':
+            if self.erase_strokes:
+                self.erase_strokes.pop()
+            if self._erase_state_marks:
+                self._erase_state_marks.pop()
+        elif action == 'free_stroke':
+            if self.drawn_free_strokes:
+                self.drawn_free_strokes.pop()
+        elif action == 'free_line':
+            if self.drawn_free_lines:
+                self.drawn_free_lines.pop()
+        elif action == 'hline':
+            if self.drawn_horizontal_lines:
+                self.drawn_horizontal_lines.pop()
+        elif action == 'line':
+            if self.drawn_lines:
+                self.drawn_lines.pop()
+
+        if hasattr(self, '_lut_process_cache'):
+            self._lut_process_cache.clear()
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+        self.status.showMessage("Removed last line")
 
     def toggle_line_visibility(self, checked):
         """Toggle visibility of all drawn lines"""
@@ -6098,7 +6217,31 @@ class RandomImageViewer(QMainWindow):
         if self.current_image:
             # Force full display_image to ensure visibility changes are applied
             self.display_image(self.current_image)
-    
+
+    def toggle_crosshair_overlay(self, checked):
+        """Toggle the centered crosshair overlay."""
+        self.crosshair_overlay = bool(checked)
+        if hasattr(self, 'crosshair_tool_btn'):
+            self.crosshair_tool_btn.blockSignals(True)
+            self.crosshair_tool_btn.setChecked(self.crosshair_overlay)
+            self.crosshair_tool_btn.blockSignals(False)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def toggle_grid_overlay(self, checked):
+        """Toggle the 3x3 grid overlay."""
+        self.grid_overlay = bool(checked)
+        if hasattr(self, 'grid_tool_btn'):
+            self.grid_tool_btn.blockSignals(True)
+            self.grid_tool_btn.setChecked(self.grid_overlay)
+            self.grid_tool_btn.blockSignals(False)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
     def save_current_view(self):
         """Save the currently displayed view to a file, including LUT/enhancements and visible lines."""
         # Create the final pixmap representing current view
@@ -6649,6 +6792,17 @@ class RandomImageViewer(QMainWindow):
             else:
                 self.status.showMessage(f"Found {len(self.lut_files)} LUT files in {os.path.basename(folder)}")
 
+    def _update_lut_item_tooltips(self):
+        """Update the LUT combo tooltip to show the currently applied LUT."""
+        if not hasattr(self, 'lut_combo'):
+            return
+        applied = getattr(self, 'current_lut_name', 'None') or 'None'
+        if applied and applied != 'None':
+            tip = f"Select LUT  (applied: {applied})"
+        else:
+            tip = "Select LUT"
+        self.lut_combo.setToolTip(tip)
+
     def update_lut_combo(self):
         """Update the LUT combo box with available LUT files"""
         if hasattr(self, 'lut_combo'):
@@ -6670,6 +6824,7 @@ class RandomImageViewer(QMainWindow):
                 self.lut_combo.addItem(display_name)
             
             self.lut_combo.blockSignals(False)
+            self._update_lut_item_tooltips()
 
     def apply_selected_lut(self, lut_name):
         """Apply the selected LUT from the combo box with fast preview"""
@@ -6761,6 +6916,7 @@ class RandomImageViewer(QMainWindow):
             if self.current_lut and self.lut_enabled:
                 lut_name_display = self.current_lut_name if self.current_lut_name != "None" else "LUT"
                 self.status.showMessage(f"{lut_name_display} applied")
+        self._update_lut_item_tooltips()
 
     def toggle_lut_enabled(self, checked):
         """Toggle current LUT on/off without losing selection."""
@@ -7246,7 +7402,7 @@ class RandomImageViewer(QMainWindow):
             
             # Scale, display and cache immediately - NO DELAYS
             final_pixmap = self._scale_pixmap(processed_pixmap, self.current_image)
-            self.image_label.setPixmap(final_pixmap)
+            self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(final_pixmap))
             # Reapply lines post-scale to avoid being lost by scaling
             if (self.lines_visible and (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes)) and hasattr(self, '_fast_line_update'):
                 self._fast_line_update()
@@ -7936,7 +8092,7 @@ class RandomImageViewer(QMainWindow):
                     
                     final_pixmap = blank_pixmap
                 
-                self.image_label.setPixmap(final_pixmap)
+                self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(final_pixmap))
                 
                 # Show zoom status
                 zoom = getattr(self.image_label, 'zoom_factor', 1.0)
@@ -8131,7 +8287,7 @@ class RandomImageViewer(QMainWindow):
                         
                         final_pixmap = blank_pixmap
                     
-                    self.image_label.setPixmap(final_pixmap)
+                    self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(final_pixmap))
                     
                     zoom = getattr(self.image_label, 'zoom_factor', 1.0)
                     self.status.showMessage(f"Zoom: {zoom:.1f}x (LUT cached)")
@@ -8328,7 +8484,7 @@ class RandomImageViewer(QMainWindow):
                 
                 final_pixmap = blank_pixmap
             
-            self.image_label.setPixmap(final_pixmap)
+            self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(final_pixmap))
             zoom = getattr(self.image_label, 'zoom_factor', 1.0)
             # Show more specific status based on whether LUT was applied
             if self.lut_enabled and self.current_lut and self.lut_strength > 0:
@@ -8482,7 +8638,7 @@ class RandomImageViewer(QMainWindow):
                     
                     final_pixmap = blank_pixmap
                 
-                self.image_label.setPixmap(final_pixmap)
+                self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(final_pixmap))
             except Exception as fallback_e:
                 print(f"Fallback also failed: {fallback_e}")
                 pass

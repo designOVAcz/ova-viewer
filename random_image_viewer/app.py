@@ -4,6 +4,11 @@ import sys
 def main():
     # ---- Stage 0: Minimal Qt to show splash ASAP ----
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    # MUST be set before the QApplication is fully initialised.
+    # Without this Qt silently converts all touch input into synthesised mouse
+    # events, so widgets never see TouchBegin/TouchUpdate/TouchEnd.
+    QApplication.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents, False)
     app = QApplication(sys.argv)
 
     from random_image_viewer.splash import show_splash, close_splash

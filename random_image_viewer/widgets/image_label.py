@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QLabel, QApplication, QMenu
 from PySide6.QtGui import QPainter, QColor, QPen, QAction, QTabletEvent, QMovie
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink, QAudioOutput
 
 from random_image_viewer.image_utils import safe_load_pixmap
@@ -40,6 +40,13 @@ class ImageLabel(QLabel):
 
         # Store original pixmap size for proper zoom calculations
         self.original_pixmap = None
+
+        # Touch support (Wacom finger touch, trackpad, multi-touch)
+        # WA_AcceptTouchEvents tells Qt to deliver raw QTouchEvents to this widget
+        # instead of silently converting them all to mouse events.
+        self.setAttribute(Qt.WA_AcceptTouchEvents, True)
+        self._pinch_active = False  # True while a two-finger pinch is in progress
+        self._touch_points = {}     # point_id -> (x, y), manual delta tracking
 
         # Enable context menu
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -278,6 +285,26 @@ class ImageLabel(QLabel):
         if self._audio_output is not None:
             self._audio_output.setMuted(muted)
 
+    def event(self, event):
+        """Route touch events for pinch-zoom and pan; pass everything else through.
+
+        Note: many Windows tablet drivers (incl. Wacom) deliver finger gestures
+        as QWheelEvents rather than QTouchEvents — pinch arrives as Ctrl+wheel
+        and two-finger pan as a plain wheel. Those are handled in wheelEvent().
+        This touch path covers real touchscreens / trackpads that send raw touch.
+        """
+        t = event.type()
+        if t == QEvent.Type.TouchBegin:
+            # Accepting TouchBegin is required — Qt will not deliver TouchUpdate/End
+            # unless the widget explicitly claims the sequence here.  Accepting also
+            # prevents Qt from synthesising spurious mouse events from our touch input.
+            event.accept()
+            return True
+        if t in (QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
+            self._handle_touch_event(event)
+            return True
+        return super().event(event)
+
     def wheelEvent(self, event):
         """Handle mouse wheel events for image navigation (when not zoomed) or zooming (when zoomed)"""
         if (self.parent_viewer and
@@ -288,18 +315,47 @@ class ImageLabel(QLabel):
             # Accept the event to prevent it from propagating
             event.accept()
 
-            # Get the wheel delta (positive = scroll up, negative = scroll down)
-            delta = event.angleDelta().y()
+            # Vertical and horizontal wheel deltas.
+            #   * Mouse wheel: delta_y in ±120 steps, delta_x usually 0
+            #   * Wacom/precision touch: pinch → Ctrl+wheel, two-finger pan → plain
+            #     wheel with variable delta_x / delta_y values.
+            delta_y = event.angleDelta().y()
+            delta_x = event.angleDelta().x()
 
-            # Zoom mode: Ctrl+wheel OR right-click+wheel
+            # Zoom mode: Ctrl+wheel (incl. Wacom pinch) OR right-click+wheel
             zoom_mode = (event.modifiers() & Qt.ControlModifier) or (event.buttons() & Qt.RightButton)
 
             # When not zoomed in and not in zoom mode, use wheel for image navigation
             if self.zoom_factor <= 1.0 and not zoom_mode:
-                if delta > 0:
+                if delta_y > 0:
                     self.parent_viewer.show_previous_image()
-                elif delta < 0:
+                elif delta_y < 0:
                     self.parent_viewer.show_next_image()
+                return
+
+            # When zoomed in and NOT in zoom mode, use the wheel to PAN the image.
+            # Many Windows tablet drivers (incl. Wacom) deliver a two-finger pan as
+            # a plain wheel event, so this is what lets a Wacom two-finger drag
+            # scroll the zoomed image instead of zooming. A normal mouse wheel also
+            # pans vertically while zoomed. (Ctrl+wheel / right-drag still zoom.)
+            #
+            # NOTE: With the Wacom "Two finger -> Scroll" gesture enabled the driver
+            # only emits VERTICAL wheel deltas, so horizontal panning is unavailable
+            # via this path. For full 2D panning, disable the Wacom Scroll/Zoom
+            # gestures so raw QTouchEvents reach _handle_touch_event() instead.
+            if self.zoom_factor > 1.0 and not zoom_mode:
+                pan_factor = 0.5
+                # Some drivers report horizontal scroll as Shift+vertical wheel.
+                if delta_x == 0 and (event.modifiers() & Qt.ShiftModifier):
+                    delta_x, delta_y = delta_y, 0
+
+                # Natural ("content follows fingers") direction: invert the deltas.
+                self.pan_offset_x -= delta_x * pan_factor
+                self.pan_offset_y -= delta_y * pan_factor
+                self.parent_viewer._smart_zoom_display()
+                zoom_percent = int(self.zoom_factor * 100)
+                self.parent_viewer.status.showMessage(
+                    f"Zoom: {zoom_percent}% (two-finger / wheel to pan, Ctrl+wheel to zoom)")
                 return
 
             # Store mouse position for zoom centering
@@ -307,6 +363,7 @@ class ImageLabel(QLabel):
 
             old_zoom = self.zoom_factor
 
+            delta = delta_y
             if delta > 0:
                 # Zoom in
                 new_zoom = min(self.zoom_factor * 1.1, self.max_zoom)
@@ -401,6 +458,28 @@ class ImageLabel(QLabel):
             self.zoom_factor > 1.0 and
             self.pixmap() and
             not self.pixmap().isNull()):
+
+            self.is_panning = True
+            self.last_pan_point = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+
+        # Handle LEFT-click drag for panning when zoomed in.
+        # On the Wacom (Windows Ink) a single finger reports as a left-button
+        # mouse drag, so this provides full 2D finger panning of the zoomed image.
+        # Only active when no drawing / color-snap tool is engaged so it never
+        # interferes with annotation.
+        if (event.button() == Qt.LeftButton and
+            self.zoom_factor > 1.0 and
+            self.parent_viewer and
+            self.pixmap() and not self.pixmap().isNull() and
+            not self.parent_viewer.line_drawing_mode and
+            not self.parent_viewer.horizontal_line_drawing_mode and
+            not self.parent_viewer.free_line_drawing_mode and
+            not self.parent_viewer.free_draw_mode and
+            not getattr(self.parent_viewer, 'eraser_mode', False) and
+            not getattr(self.parent_viewer, 'color_snap_mode', False)):
 
             self.is_panning = True
             self.last_pan_point = event.position()
@@ -566,8 +645,9 @@ class ImageLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        # Handle panning (now checks for right-click)
-        if self.is_panning and (event.buttons() & Qt.RightButton) and self.last_pan_point is not None:
+        # Handle panning (right-button drag, or left-button/finger drag when zoomed)
+        if (self.is_panning and self.last_pan_point is not None and
+                (event.buttons() & (Qt.RightButton | Qt.LeftButton))):
             current_point = event.position()
             delta_x = current_point.x() - self.last_pan_point.x()
             delta_y = current_point.y() - self.last_pan_point.y()
@@ -799,8 +879,107 @@ class ImageLabel(QLabel):
 
         event.ignore()
 
+    # ------------------------------------------------------------------
+    # Touch support (Wacom finger touch, trackpad, multi-touch)
+    # ------------------------------------------------------------------
+
+    def _handle_touch_event(self, event):
+        """Manual pinch-to-zoom and single-finger pan from raw QTouchEvent points.
+
+        We track previous positions ourselves (self._touch_points) rather than
+        relying on QEventPoint.lastPosition(), which is unreliable on Windows/
+        Wacom and often returns the same value as position(), giving zero deltas.
+        """
+        if not (self.parent_viewer and
+                self.parent_viewer.current_image and
+                self.pixmap() and
+                not self.pixmap().isNull()):
+            return
+
+        if event.type() == QEvent.Type.TouchEnd:
+            self._pinch_active = False
+            self._touch_points.clear()
+            return
+
+        pts = event.points()
+
+        # Snapshot current positions keyed by stable touch-point ID
+        curr = {p.id(): (p.position().x(), p.position().y()) for p in pts}
+
+        if len(pts) >= 2:
+            # ---- Two-finger: pinch-to-zoom + midpoint pan ----
+            self._pinch_active = True
+            p0, p1 = pts[0], pts[1]
+            id0, id1 = p0.id(), p1.id()
+
+            cx = (p0.position().x() + p1.position().x()) / 2
+            cy = (p0.position().y() + p1.position().y()) / 2
+            curr_dist = ((p0.position().x() - p1.position().x()) ** 2 +
+                         (p0.position().y() - p1.position().y()) ** 2) ** 0.5
+
+            if id0 in self._touch_points and id1 in self._touch_points:
+                lx0, ly0 = self._touch_points[id0]
+                lx1, ly1 = self._touch_points[id1]
+
+                prev_cx   = (lx0 + lx1) / 2
+                prev_cy   = (ly0 + ly1) / 2
+                prev_dist = ((lx0 - lx1) ** 2 + (ly0 - ly1) ** 2) ** 0.5
+
+                # Midpoint translation (pure pan component)
+                dx = cx - prev_cx
+                dy = cy - prev_cy
+
+                if prev_dist > 1.0:
+                    scale      = curr_dist / prev_dist
+                    old_zoom   = self.zoom_factor
+                    new_zoom   = max(self.min_zoom, min(self.max_zoom, old_zoom * scale))
+                    zoom_ratio = new_zoom / old_zoom
+
+                    # Scale anchored to current midpoint
+                    ox = cx - self.width()  / 2
+                    oy = cy - self.height() / 2
+                    self.pan_offset_x = self.pan_offset_x * zoom_ratio - ox * (zoom_ratio - 1)
+                    self.pan_offset_y = self.pan_offset_y * zoom_ratio - oy * (zoom_ratio - 1)
+                    self.zoom_factor  = new_zoom
+
+                    if self.zoom_factor <= 1.0:
+                        self.zoom_factor  = 1.0
+                        self.pan_offset_x = 0
+                        self.pan_offset_y = 0
+
+                # Add midpoint translation (pan) on top — works even when scale==1
+                if self.zoom_factor > 1.0:
+                    self.pan_offset_x += dx
+                    self.pan_offset_y += dy
+
+            self.parent_viewer._smart_zoom_display()
+            zoom_pct = int(self.zoom_factor * 100)
+            suffix = " (drag to pan)" if self.zoom_factor > 1.0 else ""
+            self.parent_viewer.status.showMessage(f"Zoom: {zoom_pct}%{suffix}")
+
+        elif len(pts) == 1 and not self._pinch_active:
+            # ---- Single-finger pan (only when already zoomed in) ----
+            if self.zoom_factor <= 1.0:
+                self._touch_points = curr
+                return
+            pid = pts[0].id()
+            if pid in self._touch_points:
+                lx, ly = self._touch_points[pid]
+                dx = pts[0].position().x() - lx
+                dy = pts[0].position().y() - ly
+                if dx != 0 or dy != 0:
+                    self.pan_offset_x += dx
+                    self.pan_offset_y += dy
+                    self.parent_viewer._smart_zoom_display()
+
+        # Always update stored positions for next frame
+        self._touch_points = curr
+
+    # ------------------------------------------------------------------
+
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.RightButton and self.is_panning:
+        # End panning for either the right-button or the left-button/finger drag
+        if event.button() in (Qt.RightButton, Qt.LeftButton) and self.is_panning:
             self.is_panning = False
             self.last_pan_point = None
             self.setCursor(Qt.ArrowCursor)
