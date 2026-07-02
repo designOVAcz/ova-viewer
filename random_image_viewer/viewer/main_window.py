@@ -45,6 +45,7 @@ from random_image_viewer.widgets.image_label import ImageLabel
 from random_image_viewer.widgets.enhancement_widget import ResponsiveEnhancementWidget
 from random_image_viewer.widgets.color_snap_preview import ColorSnapPreview
 from random_image_viewer.widgets.snapped_palette_window import SnappedPaletteWindow
+from random_image_viewer.widgets.floating_panel import FloatingPanel
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
 
 
@@ -536,6 +537,15 @@ class RandomImageViewer(QMainWindow):
             if not (self.drawn_lines or self.drawn_horizontal_lines or self.drawn_free_lines or self.drawn_free_strokes):
                 return
             if not self.lines_visible:
+                return
+            # Semi-transparent lines cannot use the incremental overlay path:
+            #   • the GPU kernel overwrites pixels (ignoring alpha), and
+            #   • painting onto the already-drawn pixmap double-blends existing
+            #     lines.
+            # Render from the clean base image in a single pass so every line
+            # (new and existing) reflects the current transparency level.
+            if getattr(self, 'line_transparency', 255) < 255:
+                self.display_image(self.current_image)
                 return
             # 🧽 Eraser active: the fast overlay path paints onto the already-drawn
             # pixmap and cannot reveal the clean image. Use the full erase-aware path.
@@ -1043,6 +1053,11 @@ class RandomImageViewer(QMainWindow):
         self.gamma_value = 0     # 0 = normal, -200 to +500 range
         self.value_filter_enabled = False  # Posterize to N grayscale tones (value study)
         self.value_levels = 4              # Number of value levels when posterize is enabled (2-10)
+        # Color Groups (palette quantization) - flat color fields from the image's own colors
+        self.color_groups_enabled = False  # Reduce image to N dominant colors (color map)
+        self.color_groups_count = 8        # Number of palette colors (2-32)
+        self.color_groups_field = 0        # Field-size pre-smoothing to merge regions (0=off, 0-20)
+        self._color_palette_cache = {}     # Cache computed palettes keyed by image+params
         # Edge detection (Canny "plane change" filter)
         self.edge_detection_enabled = False  # Toggle Canny edge detection
         self.edge_mode = "white_on_black"    # white_on_black | black_on_white | overlay
@@ -1076,7 +1091,7 @@ class RandomImageViewer(QMainWindow):
         self._video_muted = False
         self._video_volume = 50  # 0-100
 
-        self.timer_interval = 60  # seconds
+        self.timer_interval = 5  # seconds
         self.timer_remaining = 0
         self._auto_advance_active = False
         self._timer_paused = False  # NEW: Timer pause state
@@ -1118,12 +1133,10 @@ class RandomImageViewer(QMainWindow):
             try:
                 self.lut_files = self.scan_lut_folder(self.default_lut_path)
                 if hasattr(self, 'lut_combo') and self.lut_files:
-                    # Populate combo if empty
-                    self.lut_combo.clear()
-                    self.lut_combo.addItem("None")
-                    for lut_file in self.lut_files:
-                        rel = os.path.relpath(lut_file, self.lut_folder)
-                        self.lut_combo.addItem(rel)
+                    # Populate using the same display-name format as
+                    # update_lut_combo (forward slashes, no .cube extension) so
+                    # the combo text matches what apply_selected_lut expects.
+                    self.update_lut_combo()
                     self.current_lut_name = "None"
                 print(f"Default LUT folder loaded: {self.default_lut_path} ({len(self.lut_files)} files)")
             except Exception as e:
@@ -1297,6 +1310,9 @@ class RandomImageViewer(QMainWindow):
         if hasattr(self, 'gamma_toggle_btn'):
             self.gamma_toggle_btn.setChecked(self.gamma_value != 0)
 
+        # Replace the classic top toolbars with HeavyPaint-style floating panels
+        self._build_floating_panels()
+
     def setup_global_shortcuts(self):
         """Setup global shortcuts that work even when focus is elsewhere"""
         print("Setting up global shortcuts...")
@@ -1375,7 +1391,7 @@ class RandomImageViewer(QMainWindow):
         print("EMERGENCY: Escape shortcut activated")
         if self.is_fullscreen:
             self.force_exit_fullscreen()
-        elif not self.main_toolbar.isVisible():
+        elif not self._ui_chrome_visible():
             print("EMERGENCY: Restoring UI from minimal mode")
             self.toggle_toolbar_visibility(True)  # Show UI
 
@@ -1413,11 +1429,11 @@ class RandomImageViewer(QMainWindow):
         self._add_section_divider = add_section_divider
 
         # ── SECTION: File ──
-        open_btn = QToolButton(); open_btn.setText("📁"); open_btn.setToolTip("Open Folder"); open_btn.setFixedSize(24,24); open_btn.clicked.connect(self.choose_folder); toolbar.addWidget(open_btn)
+        self.open_btn = open_btn = QToolButton(); open_btn.setText("📁"); open_btn.setToolTip("Open Folder"); open_btn.setFixedSize(24,24); open_btn.clicked.connect(self.choose_folder); toolbar.addWidget(open_btn)
         add_spacer(2)
         self.delete_file_btn = QToolButton(); self.delete_file_btn.setText("🗑"); self.delete_file_btn.setToolTip("Move current file to Recycle Bin (Delete)"); self.delete_file_btn.setFixedSize(24,24); self.delete_file_btn.clicked.connect(self.delete_current_file); toolbar.addWidget(self.delete_file_btn)
         add_spacer(2)
-        save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view to Downloads (includes LUT, enhancements and lines)"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self.save_current_view); toolbar.addWidget(save_btn)
+        self.save_btn = save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view to Downloads (includes LUT, enhancements and lines)"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self.save_current_view); toolbar.addWidget(save_btn)
         add_section_divider()
 
         # ── SECTION: Draw Tools ──
@@ -1478,8 +1494,9 @@ class RandomImageViewer(QMainWindow):
 
         # ── SECTION: Color ──
         self.line_color_btn = QToolButton(); self.line_color_btn.setText("🎨"); self.line_color_btn.setToolTip("Choose Line Color"); self.line_color_btn.setFixedSize(24,24); self.line_color_btn.clicked.connect(self.choose_line_color); self.line_color_btn.setStyleSheet(f"QToolButton {{ background-color: {self.line_color.name()}; border:1px solid #666; }}"); toolbar.addWidget(self.line_color_btn)
+        self.quick_color_btns = []
         for color_hex, color_name, emoji in [("#ffffff","White","⚪"),("#000000","Black","⚫"),("#808080","Grey","⚪")]:
-            btn=QToolButton(); btn.setText(emoji); btn.setToolTip(f"Set Line Color to {color_name}"); btn.setFixedSize(18,24); btn.clicked.connect(lambda checked, c=color_hex: self.set_line_color(c)); btn.setStyleSheet("QToolButton { border:1px solid #444; margin:1px; }"); toolbar.addWidget(btn)
+            btn=QToolButton(); btn.setText(emoji); btn.setToolTip(f"Set Line Color to {color_name}"); btn.setFixedSize(18,24); btn.clicked.connect(lambda checked, c=color_hex: self.set_line_color(c)); btn.setStyleSheet("QToolButton { border:1px solid #444; margin:1px; }"); toolbar.addWidget(btn); self.quick_color_btns.append(btn)
         add_spacer(2)
         # 💉 Color Snap (eyedropper) — sample a color from the image as line color
         self.color_snap_btn = QToolButton(); self.color_snap_btn.setText("💉"); self.color_snap_btn.setToolTip("Color Snap: hover to preview (after ~350ms), click to pick (saves to palette →)"); self.color_snap_btn.setCheckable(True); self.color_snap_btn.setFixedSize(24,24); self.color_snap_btn.toggled.connect(self.toggle_color_snap); toolbar.addWidget(self.color_snap_btn)
@@ -1490,7 +1507,7 @@ class RandomImageViewer(QMainWindow):
         add_section_divider()
 
         # ── SECTION: Visibility ──
-        clear_lines_btn = QToolButton(); clear_lines_btn.setText("🗑"); clear_lines_btn.setToolTip("Clear All Lines"); clear_lines_btn.setFixedSize(24,24); clear_lines_btn.clicked.connect(self.clear_lines); toolbar.addWidget(clear_lines_btn)
+        self.clear_lines_btn = clear_lines_btn = QToolButton(); clear_lines_btn.setText("🗑"); clear_lines_btn.setToolTip("Clear All Lines"); clear_lines_btn.setFixedSize(24,24); clear_lines_btn.clicked.connect(self.clear_lines); toolbar.addWidget(clear_lines_btn)
         add_spacer(2)
         self.toggle_lines_btn = QToolButton(); self.toggle_lines_btn.setText("👁"); self.toggle_lines_btn.setToolTip("Toggle Line Visibility On/Off"); self.toggle_lines_btn.setCheckable(True); self.toggle_lines_btn.setChecked(True); self.toggle_lines_btn.setFixedSize(24,24); self.toggle_lines_btn.toggled.connect(self.toggle_line_visibility); toolbar.addWidget(self.toggle_lines_btn)
         add_spacer(2)
@@ -1509,7 +1526,11 @@ class RandomImageViewer(QMainWindow):
         self.value_filter_toggle_btn = QToolButton(); self.value_filter_toggle_btn.setText("◑"); self.value_filter_toggle_btn.setToolTip("Toggle Value Filter (posterize to N grayscale tones)"); self.value_filter_toggle_btn.setCheckable(True); self.value_filter_toggle_btn.setChecked(self.value_filter_enabled); self.value_filter_toggle_btn.setFixedSize(24,24); self.value_filter_toggle_btn.toggled.connect(self.toggle_value_filter); toolbar.addWidget(self.value_filter_toggle_btn)
         self.value_levels_spin = QSpinBox(); self.value_levels_spin.setRange(2, 10); self.value_levels_spin.setValue(self.value_levels); self.value_levels_spin.setFixedHeight(24); self.value_levels_spin.setFixedWidth(40); self.value_levels_spin.setToolTip("Number of value levels (2-10)"); self.value_levels_spin.valueChanged.connect(self.update_value_levels); toolbar.addWidget(self.value_levels_spin)
         add_spacer(2)
-        # Edge detection (Canny "plane change") toggle + mode menu + sensitivity
+        # Color Groups (palette quantization) toggle + colors slider + field-size slider
+        self.color_groups_toggle_btn = QToolButton(); self.color_groups_toggle_btn.setText("🎨"); self.color_groups_toggle_btn.setToolTip("Toggle Color Groups (reduce image to N flat colors sampled from the image)"); self.color_groups_toggle_btn.setCheckable(True); self.color_groups_toggle_btn.setChecked(self.color_groups_enabled); self.color_groups_toggle_btn.setFixedSize(24,24); self.color_groups_toggle_btn.toggled.connect(self.toggle_color_groups); toolbar.addWidget(self.color_groups_toggle_btn)
+        self.color_groups_count_spin = QSpinBox(); self.color_groups_count_spin.setRange(2, 32); self.color_groups_count_spin.setValue(self.color_groups_count); self.color_groups_count_spin.setFixedHeight(24); self.color_groups_count_spin.setFixedWidth(44); self.color_groups_count_spin.setToolTip("Color Groups: number of colors (2-32)"); self.color_groups_count_spin.valueChanged.connect(self.update_color_groups_count); toolbar.addWidget(self.color_groups_count_spin)
+        self.color_groups_field_spin = QSpinBox(); self.color_groups_field_spin.setRange(0, 20); self.color_groups_field_spin.setValue(self.color_groups_field); self.color_groups_field_spin.setFixedHeight(24); self.color_groups_field_spin.setFixedWidth(44); self.color_groups_field_spin.setToolTip("Color Groups: field size (0=off, higher=larger merged color fields)"); self.color_groups_field_spin.valueChanged.connect(self.update_color_groups_field); toolbar.addWidget(self.color_groups_field_spin)
+        add_spacer(2)
         self.edge_toggle_btn = QToolButton(); self.edge_toggle_btn.setText("📐"); self.edge_toggle_btn.setToolTip("Toggle Edge Detection (plane changes)"); self.edge_toggle_btn.setCheckable(True); self.edge_toggle_btn.setChecked(self.edge_detection_enabled); self.edge_toggle_btn.setFixedSize(24,24); self.edge_toggle_btn.toggled.connect(self.toggle_edge_detection); toolbar.addWidget(self.edge_toggle_btn)
         from PySide6.QtWidgets import QMenu as _QMenuEdge
         from PySide6.QtGui import QAction as _QActionEdge
@@ -1531,15 +1552,15 @@ class RandomImageViewer(QMainWindow):
         add_section_divider()
 
         # ── SECTION: Navigation & Timer ──
-        prev_btn = QToolButton(); prev_btn.setText("⬅"); prev_btn.setToolTip("Previous Image (Go Back in History)"); prev_btn.setFixedSize(24,24); prev_btn.clicked.connect(self.show_previous_image); toolbar.addWidget(prev_btn)
+        self.prev_btn = prev_btn = QToolButton(); prev_btn.setText("⬅"); prev_btn.setToolTip("Previous Image (Go Back in History)"); prev_btn.setFixedSize(24,24); prev_btn.clicked.connect(self.show_previous_image); toolbar.addWidget(prev_btn)
         add_spacer(2)
-        next_btn = QToolButton(); next_btn.setText("🎲"); next_btn.setToolTip("Show Next Image"); next_btn.setFixedSize(24,24); next_btn.clicked.connect(self._manual_next_image); toolbar.addWidget(next_btn)
+        self.next_btn = next_btn = QToolButton(); next_btn.setText("🎲"); next_btn.setToolTip("Show Next Image"); next_btn.setFixedSize(24,24); next_btn.clicked.connect(self._manual_next_image); toolbar.addWidget(next_btn)
         add_spacer(2)
         self.sort_order_button = QToolButton(); self.sort_order_button.setCheckable(True); self.sort_order_button.setChecked(True); self.sort_order_button.setText("🔀"); self.sort_order_button.setToolTip("Toggle Random/Alphabetical Order"); self.sort_order_button.setFixedSize(24,24); self.sort_order_button.toggled.connect(self.toggle_sort_order); toolbar.addWidget(self.sort_order_button)
         add_spacer(2)
         self.timer_button = QToolButton(); self.timer_button.setCheckable(True); self.timer_button.setText("⚡"); self.timer_button.setToolTip("Toggle Auto Advance"); self.timer_button.setFixedSize(24,24); self.timer_button.toggled.connect(self.toggle_timer); toolbar.addWidget(self.timer_button)
         add_spacer(2)
-        self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(56); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
+        self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(44); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
         add_spacer(2)
         self.circle_timer = CircularCountdown(self.timer_spin.value()); self.circle_timer.set_parent_viewer(self); toolbar.addWidget(self.circle_timer)
         add_section_divider()
@@ -1682,8 +1703,208 @@ class RandomImageViewer(QMainWindow):
         spacer_stretch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.main_toolbar.addWidget(spacer_stretch)
 
+    def _build_floating_panels(self):
+        """Replace the top toolbars with HeavyPaint-style floating panels.
+
+        Existing tool widgets (already created and wired to their slots) are
+        reparented into five draggable, semi-transparent panels overlaid on the
+        image canvas. The original toolbars are hidden but kept alive because
+        other code references ``self.main_toolbar``.
+        """
+        self._using_floating_panels = True
+
+        # PDF / video context controls stay on a thin toolbar shown on demand.
+        # Detach them from the main toolbar so hiding it does not hide them.
+        # (They are re-shown via their own show()/hide() call sites.)
+
+        # Group tool widgets into panels by attribute name. Only widgets that
+        # exist are added, so this is resilient to future changes.
+        groups = [
+            ("FILE / NAV", [
+                'open_btn', 'delete_file_btn', 'save_btn',
+                'prev_btn', 'next_btn', 'sort_order_button',
+                'timer_button', 'timer_spin', 'circle_timer',
+            ]),
+            ("DRAW", [
+                'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn',
+                'free_draw_tool_btn', 'eraser_tool_btn', 'eraser_size_spin',
+                'undo_line_btn', 'crosshair_tool_btn', 'grid_tool_btn',
+                'clear_lines_btn', 'toggle_lines_btn', 'toggle_image_btn',
+            ]),
+            ("LINE / COLOR", [
+                'line_thickness_spin', 'line_transparency_slider',
+                'antialiasing_btn', 'pen_pressure_btn', 'line_color_btn',
+                '__quick_colors__', 'color_snap_btn', 'palette_extract_btn',
+                'palette_clear_btn',
+            ]),
+            ("EFFECTS", [
+                'grayscale_toggle_btn', 'contrast_toggle_btn', 'gamma_toggle_btn',
+                'lut_toggle_btn', 'value_filter_toggle_btn', 'value_levels_spin',
+                'color_groups_toggle_btn', 'color_groups_count_spin',
+                'color_groups_field_spin', 'edge_toggle_btn', 'edge_mode_btn',
+                'edge_sensitivity_spin',
+                'grayscale_slider', 'contrast_slider', 'gamma_slider',
+                'lut_btn', 'lut_combo', 'lut_strength_slider', 'enh_reset_btn',
+            ]),
+            ("TRANSFORM / VIEW", [
+                'rotate_btn', 'flip_h_btn', 'flip_v_btn', 'reset_zoom_btn',
+                'copy_btn', 'fullscreen_btn', 'always_on_top_btn',
+                'show_history_checkbox',
+            ]),
+        ]
+
+        self._floating_panels = []
+        self._panel_by_key = {}
+        for title, attrs in groups:
+            panel = FloatingPanel(title, self.image_label)
+            panel._persist_key = title
+            for attr in attrs:
+                if attr == '__quick_colors__':
+                    for btn in getattr(self, 'quick_color_btns', []):
+                        panel.add_tool(btn)
+                    continue
+                w = getattr(self, attr, None)
+                if w is not None:
+                    panel.add_tool(w)
+            panel.finalize()
+            panel.moved_by_user.connect(self._on_panel_moved)
+            panel.changed.connect(self._save_panel_layout)
+            self._floating_panels.append(panel)
+            self._panel_by_key[title] = panel
+
+        # Context panel (PDF page nav / video controls) — hidden until a PDF or
+        # video is loaded. The child widgets keep their existing show()/hide()
+        # call sites; an event filter refreshes this panel when they change.
+        self._context_panel = FloatingPanel("PDF / VIDEO", self.image_label)
+        self._context_panel._persist_key = "PDF / VIDEO"
+        for attr in ('_pdf_nav_widget', '_video_controls_widget'):
+            w = getattr(self, attr, None)
+            if w is not None:
+                self._context_panel.add_tool(w, show=False)
+                w.installEventFilter(self)
+        self._context_panel.hide()
+        self._floating_panels.append(self._context_panel)
+
+        # Hide the now-empty toolbars (kept alive; referenced elsewhere).
+        self.main_toolbar.hide()
+        if hasattr(self, 'slider_toolbar'):
+            self.slider_toolbar.hide()
+
+        # Reposition panels whenever the canvas resizes.
+        self.image_label.installEventFilter(self)
+
+        self._arrange_floating_panels()
+        # Defer restoring saved layout until the canvas has its real size
+        # (the window is not shown yet here, so image_label is still tiny —
+        # restoring now would clamp moved panels into a small area and overlap
+        # them). The first real resize triggers _restore_panel_layout() once.
+        self._panel_layout_restored = False
+
+    def _refresh_context_panel(self):
+        """Show/size the context panel when a PDF/video control becomes visible."""
+        panel = getattr(self, '_context_panel', None)
+        if panel is None:
+            return
+        pdf_w = getattr(self, '_pdf_nav_widget', None)
+        vid_w = getattr(self, '_video_controls_widget', None)
+        visible = bool((pdf_w is not None and pdf_w.isVisible()) or
+                       (vid_w is not None and vid_w.isVisible()))
+        if visible:
+            panel.relayout()
+            panel.show()
+            panel.raise_()
+        else:
+            panel.hide()
+        self._arrange_floating_panels()
+
+    def _on_panel_moved(self):
+        """A panel was dragged by the user — keep all panels on-screen."""
+        for p in getattr(self, '_floating_panels', []):
+            p.clamp_into_parent()
+
+    def _save_panel_layout(self):
+        """Persist per-panel width / collapsed / position across restarts."""
+        settings = getattr(self, '_settings', None)
+        if settings is None:
+            return
+        try:
+            import json
+            data = {}
+            for key, panel in getattr(self, '_panel_by_key', {}).items():
+                data[key] = panel.state()
+            ctx = getattr(self, '_context_panel', None)
+            if ctx is not None:
+                data[ctx._persist_key] = ctx.state()
+            settings.setValue("floating_panels_layout", json.dumps(data))
+        except Exception as e:
+            print(f"Could not save panel layout: {e}")
+
+    def _restore_panel_layout(self):
+        """Restore per-panel layout saved by :meth:`_save_panel_layout`."""
+        settings = getattr(self, '_settings', None)
+        if settings is None:
+            return
+        raw = settings.value("floating_panels_layout", "")
+        if not raw:
+            return
+        try:
+            import json
+            data = json.loads(raw)
+        except Exception:
+            return
+        for key, panel in getattr(self, '_panel_by_key', {}).items():
+            st = data.get(key)
+            if st:
+                panel.apply_state(st)
+        ctx = getattr(self, '_context_panel', None)
+        if ctx is not None and data.get(ctx._persist_key):
+            # Only restore width/collapsed for context panel; visibility is
+            # driven by whether a PDF/video is active.
+            st = dict(data[ctx._persist_key])
+            st['moved'] = False
+            ctx.apply_state(st)
+        # Re-pack any panels the user never moved so restored widths tile neatly.
+        self._arrange_floating_panels()
+
+    def _arrange_floating_panels(self):
+        """Pack panels left-to-right along the top edge, wrapping as needed.
+
+        Panels the user has dragged keep their position (only clamped on-screen).
+        """
+        panels = getattr(self, '_floating_panels', None)
+        if not panels:
+            return
+        canvas = self.image_label
+        avail_w = max(1, canvas.width())
+        margin = 8
+        gap = 8
+        x = margin
+        y = margin
+        row_h = 0
+        for p in panels:
+            if p.isHidden():
+                continue
+            pw = p.width()
+            ph = p.height()
+            if p.user_moved:
+                p.clamp_into_parent()
+                p.raise_()
+                continue
+            if x > margin and x + pw > avail_w - margin:
+                # wrap to next row
+                x = margin
+                y += row_h + gap
+                row_h = 0
+            p.move(x, y)
+            p.raise_()
+            x += pw + gap
+            row_h = max(row_h, ph)
+
     def _update_toolbar_layout(self, width):
         """Move sliders between main toolbar and second row based on window width"""
+        # Floating-panel UI replaces the two-row responsive toolbar entirely.
+        if getattr(self, '_using_floating_panels', False):
+            return
         should_use_two_rows = width < self.width_threshold
         
         # Only switch if the mode actually needs to change
@@ -2051,7 +2272,7 @@ class RandomImageViewer(QMainWindow):
         toolbar.addWidget(spacer4)
 
         # Reset Enhancements button — 🧹 (broom) distinguishes it from rotate ↻ / reset-zoom
-        reset_btn = QToolButton()
+        self.enh_reset_btn = reset_btn = QToolButton()
         reset_btn.setText("\U0001F9F9")  # 🧹
         reset_btn.setToolTip("Reset All Enhancements (grayscale / contrast / gamma / LUT strength)")
         reset_btn.setFixedSize(24, 24)
@@ -2241,6 +2462,10 @@ class RandomImageViewer(QMainWindow):
         if self.value_filter_enabled:
             frame_pixmap = self.apply_value_filter(frame_pixmap)
 
+        # --- Apply color groups (palette quantization) ---
+        if self.color_groups_enabled:
+            frame_pixmap = self.apply_color_groups(frame_pixmap)
+
         # --- Apply edge detection (plane changes) ---
         if self.edge_detection_enabled:
             frame_pixmap = self.apply_edge_detection(frame_pixmap)
@@ -2387,6 +2612,10 @@ class RandomImageViewer(QMainWindow):
         # --- Apply value filter (posterize) ---
         if self.value_filter_enabled:
             frame_pixmap = self.apply_value_filter(frame_pixmap)
+
+        # --- Apply color groups (palette quantization) ---
+        if self.color_groups_enabled:
+            frame_pixmap = self.apply_color_groups(frame_pixmap)
 
         # --- Apply edge detection (plane changes) ---
         if self.edge_detection_enabled:
@@ -2567,7 +2796,7 @@ class RandomImageViewer(QMainWindow):
             strokes = len(self.drawn_free_strokes) if self.drawn_free_strokes else 0
             lines_info = f"_lines_{vlines}_{hlines}_{flines}_{strokes}_{self.line_color.name()}_{self.line_thickness}"
         
-        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}-{self.line_color.name()}{lines_info}"
+        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}-{self.line_color.name()}{lines_info}"
         
         # Check enhanced cache first
         if cache_key in self.enhancement_cache:
@@ -2610,6 +2839,10 @@ class RandomImageViewer(QMainWindow):
             # Apply value filter (posterize) AFTER color enhancements / LUT
             if self.value_filter_enabled:
                 pixmap = self.apply_value_filter(pixmap)
+
+            # Apply color groups (palette quantization) AFTER tonal processing
+            if self.color_groups_enabled:
+                pixmap = self.apply_color_groups(pixmap)
 
             # Apply edge detection (plane changes) AFTER all tonal processing
             if self.edge_detection_enabled:
@@ -4070,6 +4303,195 @@ class RandomImageViewer(QMainWindow):
             print(f"apply_value_filter error: {e}")
             return pixmap
 
+    def _kmeans_palette(self, sample, k, np, iters=8):
+        """Compute ``k`` dominant colours from ``sample`` (N,3) via k-means.
+
+        Uses k-means++ seeding for stable, representative centres and a few
+        Lloyd iterations. Returns a (k,3) float32 array of palette colours.
+        """
+        n = sample.shape[0]
+        if k >= n:
+            return sample.astype(np.float32)
+        rng = np.random.default_rng(12345)
+        centers = np.empty((k, 3), np.float32)
+        centers[0] = sample[rng.integers(0, n)]
+        closest = np.sum((sample - centers[0]) ** 2, axis=1)
+        for i in range(1, k):
+            total = float(closest.sum())
+            if total <= 1e-12:
+                centers[i] = sample[rng.integers(0, n)]
+            else:
+                idx = int(rng.choice(n, p=closest / total))
+                centers[i] = sample[idx]
+            dist = np.sum((sample - centers[i]) ** 2, axis=1)
+            closest = np.minimum(closest, dist)
+        for _ in range(iters):
+            d = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            labels = np.argmin(d, axis=1)
+            moved = False
+            for j in range(k):
+                pts = sample[labels == j]
+                if pts.shape[0] > 0:
+                    nc = pts.mean(axis=0)
+                    if not np.allclose(nc, centers[j]):
+                        centers[j] = nc
+                        moved = True
+            if not moved:
+                break
+        return centers.astype(np.float32)
+
+    def _box_blur_2d(self, a, radius, np):
+        """Fast separable box blur of a 2-D float array via cumulative sums.
+
+        Edge pixels are normalised by the actual (clipped) window size, so
+        borders stay correct. O(n) regardless of ``radius``. Returns a new
+        float32 array of the same shape.
+        """
+        r = int(radius)
+        if r < 1:
+            return a
+        a = a.astype(np.float32, copy=False)
+        h, w = a.shape
+        # Horizontal pass
+        cs = np.cumsum(a, axis=1)
+        cs = np.concatenate([np.zeros((h, 1), np.float32), cs], axis=1)
+        left = np.clip(np.arange(w) - r, 0, w)
+        right = np.clip(np.arange(w) + r + 1, 0, w)
+        horiz = (cs[:, right] - cs[:, left]) / (right - left).astype(np.float32)[None, :]
+        # Vertical pass
+        cs2 = np.cumsum(horiz, axis=0)
+        cs2 = np.concatenate([np.zeros((1, w), np.float32), cs2], axis=0)
+        top = np.clip(np.arange(h) - r, 0, h)
+        bot = np.clip(np.arange(h) + r + 1, 0, h)
+        out = (cs2[bot, :] - cs2[top, :]) / (bot - top).astype(np.float32)[:, None]
+        return out
+
+    def _smooth_color_fields(self, color_img, palette_u8, radius, np):
+        """Round jagged quantised boundaries into smooth curves.
+
+        Runs a soft majority (mode) filter: each palette colour's membership
+        mask is box-blurred, then every pixel takes whichever colour wins
+        locally. This removes single-pixel stair-stepping at field edges while
+        preserving the flat colour fields. Returns a new (h,w,3) uint8 array.
+        """
+        r = max(1, int(radius))
+        h, w, _ = color_img.shape
+        best_score = None
+        best_idx = np.zeros((h, w), np.int32)
+        for k in range(palette_u8.shape[0]):
+            mask = np.all(color_img == palette_u8[k], axis=2).astype(np.float32)
+            if not mask.any():
+                continue
+            blurred = self._box_blur_2d(mask, r, np)
+            if best_score is None:
+                best_score = blurred
+                best_idx[:] = k
+            else:
+                better = blurred > best_score
+                best_idx[better] = k
+                np.maximum(best_score, blurred, out=best_score)
+        return palette_u8[best_idx]
+
+    def apply_color_groups(self, pixmap):
+        """Reduce the image to N dominant colours sampled from the image itself.
+
+        Builds a small palette via numpy k-means on a downsampled colour
+        sample, then maps every pixel to its nearest palette colour, producing
+        flat colour fields (a "colour map" of the image). ``color_groups_count``
+        sets the number of colours (2-32); ``color_groups_field`` optionally
+        pre-smooths the image to merge small regions into larger fields
+        (0 = off). Alpha is preserved. Returns ``pixmap`` unchanged if disabled
+        or numpy is unavailable.
+        """
+        try:
+            if not pixmap or pixmap.isNull() or not self.color_groups_enabled:
+                return pixmap
+            n = max(2, min(32, int(self.color_groups_count)))
+            field = max(0, min(20, int(self.color_groups_field)))
+
+            import numpy as np
+            image = pixmap.toImage()
+            if image.isNull():
+                return pixmap
+            if image.format() != QImage.Format.Format_RGBA8888:
+                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            w, h = image.width(), image.height()
+            if w < 1 or h < 1:
+                return pixmap
+            bpl = image.bytesPerLine()
+            ptr = image.constBits()
+            buf = bytes(ptr)[: bpl * h]
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+
+            rgb = arr[:, :, :3].astype(np.float32)
+            alpha = arr[:, :, 3].copy()
+
+            # Optional field-size pre-smoothing: a smooth separable box blur
+            # (not block averaging) so colour fields merge with soft, curved
+            # boundaries instead of hard pixel-art blocks. Two passes approximate
+            # a Gaussian for extra smoothness.
+            work = rgb
+            if field > 0:
+                radius = max(1, int(field))
+                work = np.empty_like(rgb)
+                for c in range(3):
+                    ch = self._box_blur_2d(rgb[:, :, c], radius, np)
+                    ch = self._box_blur_2d(ch, radius, np)
+                    work[:, :, c] = ch
+
+            # Build palette from a downsampled colour sample (speed), with cache.
+            flat = work.reshape(-1, 3)
+            cache_key = (self.current_image, n, field, w, h)
+            palette = self._color_palette_cache.get(cache_key)
+            if palette is None:
+                max_samples = 20000
+                if flat.shape[0] > max_samples:
+                    idx = np.linspace(0, flat.shape[0] - 1, max_samples).astype(np.int64)
+                    sample = flat[idx]
+                else:
+                    sample = flat
+                k = min(n, sample.shape[0])
+                palette = self._kmeans_palette(sample, k, np)
+                if len(self._color_palette_cache) > 12:
+                    self._color_palette_cache.clear()
+                self._color_palette_cache[cache_key] = palette
+
+            # Quantize to the palette and (when a field size is set) smooth the
+            # colour fields. Prefer a single GPU pass — the majority smoothing
+            # is far too slow on the CPU. Fall back to numpy when unavailable.
+            smooth_radius = max(1, field // 2) if field > 0 else 0
+            color_img = None
+            gpu = getattr(self, 'gpu_processor', None)
+            if gpu is not None:
+                gpu_res = gpu.color_groups_gpu(flat, palette, w, h, smooth_radius)
+                if gpu_res is not None:
+                    color_img = gpu_res.reshape(h, w, 3)
+
+            if color_img is None:
+                # CPU fallback: chunked nearest-colour assignment...
+                labels = np.empty(flat.shape[0], np.int64)
+                chunk = 1 << 20
+                for start in range(0, flat.shape[0], chunk):
+                    seg = flat[start:start + chunk]
+                    d = np.sum((seg[:, None, :] - palette[None, :, :]) ** 2, axis=2)
+                    labels[start:start + chunk] = np.argmin(d, axis=1)
+                color_img = np.clip(palette[labels].reshape(h, w, 3), 0, 255).astype(np.uint8)
+                # ...then round jagged boundaries into smooth curves.
+                if smooth_radius > 0:
+                    palette_u8 = np.clip(np.rint(palette), 0, 255).astype(np.uint8)
+                    color_img = self._smooth_color_fields(color_img, palette_u8, smooth_radius, np)
+
+            out = np.empty((h, w, 4), np.uint8)
+            out[:, :, :3] = color_img
+            out[:, :, 3] = alpha
+            out = np.ascontiguousarray(out)
+            qout = QImage(out.tobytes(), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            return QPixmap.fromImage(qout)
+        except Exception as e:
+            print(f"apply_color_groups error: {e}")
+            return pixmap
+
     def apply_edge_detection(self, pixmap):
         """Run Canny edge detection to reveal plane changes (art reference).
 
@@ -4466,6 +4888,21 @@ class RandomImageViewer(QMainWindow):
             self._ext_menu_open = False
 
     def eventFilter(self, obj, event):
+        # Reposition floating panels whenever the canvas is resized.
+        if getattr(self, '_using_floating_panels', False) and obj is getattr(self, 'image_label', None):
+            if event.type() == QEvent.Resize:
+                # Restore saved layout once, after the canvas has a real size.
+                if not getattr(self, '_panel_layout_restored', True) and self.image_label.width() > 100:
+                    self._panel_layout_restored = True
+                    self._restore_panel_layout()
+                else:
+                    self._arrange_floating_panels()
+        # Show/hide the context panel when a PDF/video control appears.
+        if getattr(self, '_using_floating_panels', False) and obj in (
+                getattr(self, '_pdf_nav_widget', None),
+                getattr(self, '_video_controls_widget', None)):
+            if event.type() in (QEvent.Show, QEvent.Hide):
+                QTimer.singleShot(0, self._refresh_context_panel)
         # Swallow the extension button's mouse-press (which would open
         # Qt's native hover-closing popup) and show our own menu instead.
         if getattr(obj, '_owning_toolbar', None) is not None:
@@ -4490,7 +4927,7 @@ class RandomImageViewer(QMainWindow):
         # widen the window substantially before it collapses back. This
         # prevents the second panel from flickering away while the user
         # moves the cursor toward its leftmost icons.
-        if should_use_two_rows != self.two_row_mode:
+        if not getattr(self, '_using_floating_panels', False) and should_use_two_rows != self.two_row_mode:
             enter_buffer = 40   # px below threshold to switch to two rows
             exit_buffer = 250   # px above threshold to switch back to one row
             if should_use_two_rows and current_width < (self.width_threshold - enter_buffer):
@@ -4670,13 +5107,33 @@ class RandomImageViewer(QMainWindow):
             self.sort_order_button.setToolTip("Order: Alphabetical")
             self.status.showMessage("Image order set to Alphabetical")
 
+    def _ui_chrome_visible(self):
+        """Return whether the tool UI (floating panels or toolbar) is visible."""
+        if getattr(self, '_using_floating_panels', False):
+            for p in getattr(self, '_floating_panels', []):
+                if p is getattr(self, '_context_panel', None):
+                    continue
+                if p.isVisible():
+                    return True
+            return False
+        return self.main_toolbar.isVisible()
+
     def toggle_toolbar_visibility(self, checked):
         """Toggle visibility of toolbars, status bar, and window decorations for immersive viewing."""
         if checked:
             # Show all UI elements
-            self.main_toolbar.show()
-            if self.two_row_mode:
-                self.slider_toolbar.show()
+            if getattr(self, '_using_floating_panels', False):
+                for p in getattr(self, '_floating_panels', []):
+                    if p is getattr(self, '_context_panel', None):
+                        self._refresh_context_panel()
+                    else:
+                        p.show()
+                        p.raise_()
+                self._arrange_floating_panels()
+            else:
+                self.main_toolbar.show()
+                if self.two_row_mode:
+                    self.slider_toolbar.show()
             self.status.show()
             
             # Restore original window decorations
@@ -4687,6 +5144,9 @@ class RandomImageViewer(QMainWindow):
             self.status.showMessage("UI elements restored")
         else:
             # Hide all UI elements for immersive experience
+            if getattr(self, '_using_floating_panels', False):
+                for p in getattr(self, '_floating_panels', []):
+                    p.hide()
             self.main_toolbar.hide()
             self.slider_toolbar.hide()
             
@@ -4699,7 +5159,7 @@ class RandomImageViewer(QMainWindow):
             
             # Show temporary message before hiding status bar
             self.status.showMessage("Immersive mode - Right-click to restore UI")
-            QTimer.singleShot(2000, lambda: self.status.hide() if not self.main_toolbar.isVisible() else None)  # Hide status after 2 seconds
+            QTimer.singleShot(2000, lambda: self.status.hide() if not self._ui_chrome_visible() else None)  # Hide status after 2 seconds
 
     def toggle_line_drawing(self, checked):
         self.line_drawing_mode = checked
@@ -6610,6 +7070,46 @@ class RandomImageViewer(QMainWindow):
             if self.current_image:
                 self.display_image(self.current_image)
 
+    def toggle_color_groups(self, checked):
+        """Enable/disable the Color Groups (palette quantization) effect."""
+        self.color_groups_enabled = bool(checked)
+        if hasattr(self, 'color_groups_toggle_btn') and self.color_groups_toggle_btn is not None:
+            self.color_groups_toggle_btn.blockSignals(True)
+            self.color_groups_toggle_btn.setChecked(self.color_groups_enabled)
+            self.color_groups_toggle_btn.blockSignals(False)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def update_color_groups_count(self, value):
+        """Change the number of palette colours (2-32). Does not auto-enable."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.color_groups_count = max(2, min(32, value))
+        self._color_palette_cache.clear()
+        if self.color_groups_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def update_color_groups_field(self, value):
+        """Change the field-size pre-smoothing (0-20). Does not auto-enable."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.color_groups_field = max(0, min(20, value))
+        self._color_palette_cache.clear()
+        if self.color_groups_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
     def toggle_edge_detection(self, checked):
         """Enable/disable the Canny edge-detection filter."""
         self.edge_detection_enabled = bool(checked)
@@ -6724,6 +7224,25 @@ class RandomImageViewer(QMainWindow):
             self.value_levels_spin.blockSignals(True)
             self.value_levels_spin.setValue(4)
             self.value_levels_spin.blockSignals(False)
+
+        # Reset Color Groups (palette quantization)
+        self.color_groups_enabled = False
+        self.color_groups_count = 8
+        self.color_groups_field = 0
+        if hasattr(self, '_color_palette_cache'):
+            self._color_palette_cache.clear()
+        if hasattr(self, 'color_groups_toggle_btn') and self.color_groups_toggle_btn is not None:
+            self.color_groups_toggle_btn.blockSignals(True)
+            self.color_groups_toggle_btn.setChecked(False)
+            self.color_groups_toggle_btn.blockSignals(False)
+        if hasattr(self, 'color_groups_count_spin') and self.color_groups_count_spin is not None:
+            self.color_groups_count_spin.blockSignals(True)
+            self.color_groups_count_spin.setValue(8)
+            self.color_groups_count_spin.blockSignals(False)
+        if hasattr(self, 'color_groups_field_spin') and self.color_groups_field_spin is not None:
+            self.color_groups_field_spin.blockSignals(True)
+            self.color_groups_field_spin.setValue(0)
+            self.color_groups_field_spin.blockSignals(False)
         
         # Update toggle button states (block signals to prevent loops)
         if hasattr(self, 'grayscale_toggle_btn') and self.grayscale_toggle_btn is not None:
@@ -6845,16 +7364,19 @@ class RandomImageViewer(QMainWindow):
             
             # Find the full path for this LUT name (handling subfolder structure)
             lut_file_found = None
+            # Normalise the requested name so legacy/persisted raw paths (with
+            # backslashes and/or a .cube extension) still resolve.
+            requested = os.path.splitext(lut_name)[0].replace('\\', '/')
             for lut_file in self.lut_files:
                 # Create the same display name format as in update_lut_combo
                 relative_path = os.path.relpath(lut_file, self.lut_folder)
                 display_name = os.path.splitext(relative_path)[0].replace('\\', '/')
-                
+
                 # If it's just a filename (no subfolder), show only the name
                 if '/' not in display_name:
                     display_name = os.path.basename(display_name)
-                
-                if display_name == lut_name:
+
+                if display_name == lut_name or display_name == requested:
                     lut_file_found = lut_file
                     break
             
@@ -7446,7 +7968,11 @@ class RandomImageViewer(QMainWindow):
             
         try:
             # Try GPU acceleration first for better performance
-            if (self.gpu_processor.is_available() and 
+            # The GPU kernel overwrites pixels (no alpha blend), so only use it
+            # for fully-opaque lines; semi-transparent lines fall through to the
+            # CPU painter which blends correctly.
+            if (getattr(self, 'line_transparency', 255) >= 255 and
+                self.gpu_processor.is_available() and 
                 pixmap.width() * pixmap.height() > 100000):  # Use GPU for images > 100k pixels
                 
                 print(f"Using GPU for line drawing ({pixmap.width()}x{pixmap.height()})")
@@ -7899,6 +8425,7 @@ class RandomImageViewer(QMainWindow):
         # drop the value filter or edge detection on resize/zoom. When either
         # is on, fall back to the full display path so the effect is preserved.
         if (getattr(self, 'value_filter_enabled', False) or getattr(self, 'edge_detection_enabled', False)
+                or getattr(self, 'color_groups_enabled', False)
                 or getattr(self, 'erase_strokes', None) or getattr(self, 'current_erase_stroke', None)):
             self.display_image(self.current_image)
             return
@@ -8830,7 +9357,7 @@ class RandomImageViewer(QMainWindow):
                 else:
                     self.exit_fullscreen()
             # Priority 2: Show UI if in minimal mode (UI hidden)
-            elif not self.main_toolbar.isVisible():
+            elif not self._ui_chrome_visible():
                 print("Escape pressed - restoring UI from minimal mode")
                 self.toggle_toolbar_visibility(True)  # Show UI
             else:
@@ -8848,7 +9375,7 @@ class RandomImageViewer(QMainWindow):
                 self.flip_vertical()
             elif event.key() == Qt.Key_U:
                 # Toggle UI visibility (minimal mode)
-                is_ui_visible = self.main_toolbar.isVisible()
+                is_ui_visible = self._ui_chrome_visible()
                 self.toggle_toolbar_visibility(not is_ui_visible)
             elif event.key() == Qt.Key_R:
                 # Reset all enhancements

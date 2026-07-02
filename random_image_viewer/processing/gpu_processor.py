@@ -118,6 +118,10 @@ class GPULutProcessor:
             try:
                 self._kernel_cache['apply_lut_3d'] = _cl.Kernel(self.program, 'apply_lut_3d')
                 self._kernel_cache['draw_lines_gpu'] = _cl.Kernel(self.program, 'draw_lines_gpu')
+                self._kernel_cache['assign_nearest_palette'] = _cl.Kernel(self.program, 'assign_nearest_palette')
+                self._kernel_cache['assign_nearest_label'] = _cl.Kernel(self.program, 'assign_nearest_label')
+                self._kernel_cache['labels_to_rgb'] = _cl.Kernel(self.program, 'labels_to_rgb')
+                self._kernel_cache['smooth_labels_majority'] = _cl.Kernel(self.program, 'smooth_labels_majority')
                 print("GPU kernels cached successfully")
             except Exception as e:
                 print(f"Error caching kernels: {e}")
@@ -308,6 +312,114 @@ class GPULutProcessor:
             if (draw_pixel) {
                 image[pixel_idx] = line_color;
             }
+        }
+
+        __kernel void assign_nearest_palette(
+            __global const float* pixels,   // num_pixels * 3 (RGB)
+            __global const float* palette,  // num_colors * 3 (RGB)
+            __global uchar* out,            // num_pixels * 3 (RGB)
+            const int num_pixels,
+            const int num_colors
+        ) {
+            int gid = get_global_id(0);
+            if (gid >= num_pixels) return;
+
+            float pr = pixels[gid * 3 + 0];
+            float pg = pixels[gid * 3 + 1];
+            float pb = pixels[gid * 3 + 2];
+
+            float best = 3.0e38f;
+            int best_i = 0;
+            for (int i = 0; i < num_colors; i++) {
+                float dr = pr - palette[i * 3 + 0];
+                float dg = pg - palette[i * 3 + 1];
+                float db = pb - palette[i * 3 + 2];
+                float d = dr * dr + dg * dg + db * db;
+                if (d < best) { best = d; best_i = i; }
+            }
+
+            out[gid * 3 + 0] = (uchar)(clamp(palette[best_i * 3 + 0], 0.0f, 255.0f) + 0.5f);
+            out[gid * 3 + 1] = (uchar)(clamp(palette[best_i * 3 + 1], 0.0f, 255.0f) + 0.5f);
+            out[gid * 3 + 2] = (uchar)(clamp(palette[best_i * 3 + 2], 0.0f, 255.0f) + 0.5f);
+        }
+
+        __kernel void assign_nearest_label(
+            __global const float* pixels,   // num_pixels * 3 (RGB)
+            __global const float* palette,  // num_colors * 3 (RGB)
+            __global int* labels,           // num_pixels
+            const int num_pixels,
+            const int num_colors
+        ) {
+            int gid = get_global_id(0);
+            if (gid >= num_pixels) return;
+            float pr = pixels[gid * 3 + 0];
+            float pg = pixels[gid * 3 + 1];
+            float pb = pixels[gid * 3 + 2];
+            float best = 3.0e38f;
+            int best_i = 0;
+            for (int i = 0; i < num_colors; i++) {
+                float dr = pr - palette[i * 3 + 0];
+                float dg = pg - palette[i * 3 + 1];
+                float db = pb - palette[i * 3 + 2];
+                float d = dr * dr + dg * dg + db * db;
+                if (d < best) { best = d; best_i = i; }
+            }
+            labels[gid] = best_i;
+        }
+
+        __kernel void labels_to_rgb(
+            __global const int* labels,
+            __global const float* palette,
+            __global uchar* out,
+            const int num_pixels,
+            const int num_colors
+        ) {
+            int gid = get_global_id(0);
+            if (gid >= num_pixels) return;
+            int bi = labels[gid];
+            out[gid * 3 + 0] = (uchar)(clamp(palette[bi * 3 + 0], 0.0f, 255.0f) + 0.5f);
+            out[gid * 3 + 1] = (uchar)(clamp(palette[bi * 3 + 1], 0.0f, 255.0f) + 0.5f);
+            out[gid * 3 + 2] = (uchar)(clamp(palette[bi * 3 + 2], 0.0f, 255.0f) + 0.5f);
+        }
+
+        __kernel void smooth_labels_majority(
+            __global const int* labels,
+            __global const float* palette,
+            __global uchar* out,
+            const int width,
+            const int height,
+            const int num_colors,
+            const int radius
+        ) {
+            int x = get_global_id(0);
+            int y = get_global_id(1);
+            if (x >= width || y >= height) return;
+
+            // Majority (mode) filter over a square window: pick the palette
+            // label that occurs most within radius, rounding jagged field
+            // boundaries into smooth curves. num_colors is capped at 32 by the
+            // caller, so a private count array of 64 is always safe.
+            int counts[64];
+            for (int i = 0; i < num_colors; i++) counts[i] = 0;
+
+            int x0 = max(0, x - radius);
+            int x1 = min(width - 1, x + radius);
+            int y0 = max(0, y - radius);
+            int y1 = min(height - 1, y + radius);
+            for (int ny = y0; ny <= y1; ny++) {
+                int row = ny * width;
+                for (int nx = x0; nx <= x1; nx++) {
+                    counts[labels[row + nx]]++;
+                }
+            }
+            int best = 0, bc = -1;
+            for (int i = 0; i < num_colors; i++) {
+                if (counts[i] > bc) { bc = counts[i]; best = i; }
+            }
+            int gid = y * width + x;
+            out[gid * 3 + 0] = (uchar)(clamp(palette[best * 3 + 0], 0.0f, 255.0f) + 0.5f);
+            out[gid * 3 + 1] = (uchar)(clamp(palette[best * 3 + 1], 0.0f, 255.0f) + 0.5f);
+            out[gid * 3 + 2] = (uchar)(clamp(palette[best * 3 + 2], 0.0f, 255.0f) + 0.5f);
         }
         """
 
@@ -617,6 +729,114 @@ class GPULutProcessor:
             self._initialized = True
             self._initialize_gpu()
         return self.gpu_enabled
+
+    def quantize_to_palette_gpu(self, pixels_rgb, palette):
+        """Map each pixel to its nearest palette colour on the GPU.
+
+        ``pixels_rgb`` is an (P, 3) array of RGB values (float or uint8);
+        ``palette`` is a (K, 3) array of RGB palette colours. Returns a
+        (P, 3) uint8 array holding each pixel's nearest palette colour, or
+        ``None`` if the GPU is unavailable or the call fails (the caller then
+        falls back to CPU). This is the per-pixel nearest-colour search used by
+        the Color Groups effect — massively parallel and ideal for the GPU.
+        """
+        if not self.is_available():
+            return None
+        import numpy as np
+        _cl = _constants.cl
+        try:
+            pixels = np.ascontiguousarray(pixels_rgb, dtype=np.float32).reshape(-1, 3)
+            pal = np.ascontiguousarray(palette, dtype=np.float32).reshape(-1, 3)
+            num_pixels = pixels.shape[0]
+            num_colors = pal.shape[0]
+            if num_pixels == 0 or num_colors == 0:
+                return None
+            out = np.empty((num_pixels, 3), dtype=np.uint8)
+
+            mf = _cl.mem_flags
+            pix_buf = _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pixels)
+            pal_buf = _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pal)
+            out_buf = _cl.Buffer(self.context, mf.WRITE_ONLY, out.nbytes)
+
+            kernel = self._kernel_cache.get('assign_nearest_palette')
+            if not kernel:
+                kernel = _cl.Kernel(self.program, 'assign_nearest_palette')
+                self._kernel_cache['assign_nearest_palette'] = kernel
+
+            kernel.set_args(pix_buf, pal_buf, out_buf, np.int32(num_pixels), np.int32(num_colors))
+            _cl.enqueue_nd_range_kernel(self.queue, kernel, (num_pixels,), None)
+            _cl.enqueue_copy(self.queue, out, out_buf)
+            self.queue.finish()
+            return out
+        except Exception as e:
+            print(f"GPU palette quantization failed: {e}")
+            return None
+
+    def color_groups_gpu(self, pixels_rgb, palette, width, height, smooth_radius=0):
+        """Quantize to a palette and optionally smooth colour fields — all GPU.
+
+        Runs the whole Color Groups per-pixel workload on the GPU:
+          1. ``assign_nearest_label`` — nearest palette colour per pixel (labels)
+          2a. if ``smooth_radius`` > 0: ``smooth_labels_majority`` — a majority
+              (mode) filter over a square window that rounds jagged field
+              boundaries into smooth curves (this is the previously slow CPU
+              per-colour box-blur step, now massively parallel on the GPU)
+          2b. otherwise: ``labels_to_rgb`` — straight label→colour mapping
+
+        ``pixels_rgb`` is an (H*W, 3) RGB array; ``palette`` is (K, 3) with
+        K <= 32. Returns an (H*W, 3) uint8 array, or ``None`` if the GPU is
+        unavailable/failed (caller falls back to CPU).
+        """
+        if not self.is_available():
+            return None
+        import numpy as np
+        _cl = _constants.cl
+        try:
+            pixels = np.ascontiguousarray(pixels_rgb, dtype=np.float32).reshape(-1, 3)
+            pal = np.ascontiguousarray(palette, dtype=np.float32).reshape(-1, 3)
+            num_pixels = pixels.shape[0]
+            num_colors = pal.shape[0]
+            # Private count array in the smoothing kernel is sized 64.
+            if num_pixels == 0 or num_colors == 0 or num_colors > 64:
+                return None
+            if num_pixels != width * height:
+                return None
+
+            mf = _cl.mem_flags
+            pix_buf = _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pixels)
+            pal_buf = _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pal)
+            lbl_buf = _cl.Buffer(self.context, mf.READ_WRITE, num_pixels * 4)
+            out = np.empty((num_pixels, 3), dtype=np.uint8)
+            out_buf = _cl.Buffer(self.context, mf.WRITE_ONLY, out.nbytes)
+
+            def _get(name):
+                k = self._kernel_cache.get(name)
+                if not k:
+                    k = _cl.Kernel(self.program, name)
+                    self._kernel_cache[name] = k
+                return k
+
+            # 1. Assign nearest palette label per pixel.
+            k_assign = _get('assign_nearest_label')
+            k_assign.set_args(pix_buf, pal_buf, lbl_buf, np.int32(num_pixels), np.int32(num_colors))
+            _cl.enqueue_nd_range_kernel(self.queue, k_assign, (num_pixels,), None)
+
+            if smooth_radius and smooth_radius > 0:
+                k_smooth = _get('smooth_labels_majority')
+                k_smooth.set_args(lbl_buf, pal_buf, out_buf, np.int32(width), np.int32(height),
+                                  np.int32(num_colors), np.int32(int(smooth_radius)))
+                _cl.enqueue_nd_range_kernel(self.queue, k_smooth, (width, height), None)
+            else:
+                k_map = _get('labels_to_rgb')
+                k_map.set_args(lbl_buf, pal_buf, out_buf, np.int32(num_pixels), np.int32(num_colors))
+                _cl.enqueue_nd_range_kernel(self.queue, k_map, (num_pixels,), None)
+
+            _cl.enqueue_copy(self.queue, out, out_buf)
+            self.queue.finish()
+            return out
+        except Exception as e:
+            print(f"GPU color groups failed: {e}")
+            return None
 
     def get_device_info(self):
         """Get information about the GPU device"""
