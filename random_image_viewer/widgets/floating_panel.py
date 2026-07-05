@@ -143,6 +143,17 @@ class FloatingPanel(QWidget):
         self._resize_start_w = 0
         self._content_width = None  # user/programmatic wrap width for the flow
 
+        # Corner-anchoring: a panel docked on the right/bottom half of the
+        # canvas keeps a constant pixel gap to that edge so collapsing and
+        # window resizing keep it visually pinned to its corner (instead of
+        # always anchoring to the top-left).
+        self._anchor_h = 'left'   # 'left' | 'right'
+        self._anchor_v = 'top'    # 'top' | 'bottom'
+        self._right_gap = 0       # px from panel right edge to parent right edge
+        self._bottom_gap = 0      # px from panel bottom edge to parent bottom edge
+        self._left_pos = 0        # px from parent left edge to panel left edge
+        self._top_pos = 0         # px from parent top edge to panel top edge
+
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setMouseTracking(True)
@@ -238,7 +249,9 @@ class FloatingPanel(QWidget):
             return
         self._collapsed = collapsed
         self._sync_size()
-        self.clamp_into_parent()
+        # Honour the panel's corner anchor so a right/bottom-docked panel keeps
+        # its right/bottom edge fixed instead of snapping to the top-left.
+        self.reposition_to_anchor()
         if emit:
             self.changed.emit()
 
@@ -264,6 +277,12 @@ class FloatingPanel(QWidget):
             "w": self._content_width or self._flow.natural_row_width(),
             "collapsed": self._collapsed,
             "moved": self._user_moved,
+            # Corner-anchor persistence so right/bottom-docked panels restore
+            # to their corner on any window size.
+            "anchor_h": self._anchor_h,
+            "anchor_v": self._anchor_v,
+            "right_gap": self._right_gap,
+            "bottom_gap": self._bottom_gap,
         }
 
     def apply_state(self, st):
@@ -277,14 +296,27 @@ class FloatingPanel(QWidget):
                 parent = self.parentWidget()
                 pw = parent.width() if parent is not None else 0
                 ph = parent.height() if parent is not None else 0
-                if pw and "xf" in st and "yf" in st:
-                    x = int(float(st["xf"]) * pw)
-                    y = int(float(st["yf"]) * ph)
+                if "anchor_h" in st and "anchor_v" in st:
+                    # Corner-anchored restore: keep the saved gap to the
+                    # right/bottom edge so the panel returns to its corner.
+                    self._anchor_h = st.get("anchor_h", 'left')
+                    self._anchor_v = st.get("anchor_v", 'top')
+                    self._right_gap = int(st.get("right_gap", 0))
+                    self._bottom_gap = int(st.get("bottom_gap", 0))
+                    self._left_pos = int(st.get("x", self.x()))
+                    self._top_pos = int(st.get("y", self.y()))
+                    self.reposition_to_anchor()
                 else:
-                    x = int(st.get("x", self.x()))
-                    y = int(st.get("y", self.y()))
-                self.move(x, y)
-                self.clamp_into_parent()
+                    # Legacy fractional restore (pre-anchor saved layouts).
+                    if pw and "xf" in st and "yf" in st:
+                        x = int(float(st["xf"]) * pw)
+                        y = int(float(st["yf"]) * ph)
+                    else:
+                        x = int(st.get("x", self.x()))
+                        y = int(st.get("y", self.y()))
+                    self.move(x, y)
+                    self.clamp_into_parent()
+                    self.update_anchor()
         except Exception:
             pass
 
@@ -370,6 +402,9 @@ class FloatingPanel(QWidget):
             self.moved_by_user.emit()
             changed = True
         if changed:
+            # Recompute which corner this panel is docked to after the
+            # user finishes moving/resizing it.
+            self.update_anchor()
             self.changed.emit()
             event.accept()
             return
@@ -386,4 +421,50 @@ class FloatingPanel(QWidget):
         ny = min(max(0, self.y()), max_y)
         if nx != self.x() or ny != self.y():
             self.move(nx, ny)
+
+    # ── corner anchoring ──
+    def update_anchor(self):
+        """Recompute the anchor edges and gaps from the current geometry.
+
+        Called after the user finishes dragging or resizing so a panel that
+        ended up on the right/bottom half of the canvas becomes pinned to that
+        corner (constant pixel gap), while one on the left/top half stays
+        anchored top-left.
+        """
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        pw = parent.width()
+        ph = parent.height()
+        center_x = self.x() + self.width() / 2
+        center_y = self.y() + self.height() / 2
+        self._anchor_h = 'right' if pw and center_x > pw / 2 else 'left'
+        self._anchor_v = 'bottom' if ph and center_y > ph / 2 else 'top'
+        self._left_pos = self.x()
+        self._top_pos = self.y()
+        self._right_gap = max(0, pw - (self.x() + self.width()))
+        self._bottom_gap = max(0, ph - (self.y() + self.height()))
+
+    def reposition_to_anchor(self):
+        """Move the panel so it honours its current anchor, then clamp on-screen.
+
+        For a right-anchored panel this keeps the right edge fixed (the panel
+        grows/shrinks leftward on collapse/resize); for a bottom-anchored panel
+        it keeps the bottom edge fixed.
+        """
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        pw = parent.width()
+        ph = parent.height()
+        if self._anchor_h == 'right':
+            x = pw - self.width() - self._right_gap
+        else:
+            x = self._left_pos
+        if self._anchor_v == 'bottom':
+            y = ph - self.height() - self._bottom_gap
+        else:
+            y = self._top_pos
+        self.move(int(x), int(y))
+        self.clamp_into_parent()
 

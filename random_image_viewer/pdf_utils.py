@@ -51,6 +51,11 @@ def _get_adaptive_dpi(pdf_path, page_count):
 # CPU and memory (e.g. comic-book PDFs whose native pages are already huge).
 _MAX_RENDER_LONG_EDGE = 2600
 
+# Upper bound for the on-demand high-resolution render used when the user zooms
+# into a page (see PdfDocument.render_page_qimage). Keeps text crisp at high
+# zoom without letting a single page balloon into hundreds of megapixels.
+_MAX_HIRES_LONG_EDGE = 6000
+
 
 class PdfDocument:
     """Manages a PDF opened for on-demand page rendering with a small LRU cache.
@@ -87,6 +92,11 @@ class PdfDocument:
         self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
         self._prefetch_pending = set()
 
+        # Cache for the most recent high-resolution single-page render used by
+        # the zoom-in "sharp text" path. Keyed by (page_num, target_long_edge).
+        self._hires_key = None
+        self._hires_img = None
+
     # ── public API ──────────────────────────────────────────────
 
     def render_page(self, page_num):
@@ -108,6 +118,127 @@ class PdfDocument:
             self._evict()
 
         return path
+
+    def render_page_qimage(self, page_num, target_long_edge):
+        """Render *page_num* into a crisp in-memory ``QImage`` for zoomed viewing.
+
+        Unlike :meth:`render_page` (which caches a lossy JPEG sized for the
+        fit-to-window view), this renders the page at a resolution whose longest
+        side is approximately *target_long_edge* pixels and returns a lossless
+        ``QImage``. That keeps small text sharp when the user zooms in.
+
+        A ``QImage`` (not a ``QPixmap``) is returned on purpose: ``QImage`` can
+        be safely constructed off the GUI thread, so callers may run this in a
+        background worker and convert to ``QPixmap`` on the main thread.
+
+        Returns the ``QImage`` or ``None`` on failure / invalid page.
+        """
+        if page_num < 0 or page_num >= self.page_count:
+            return None
+
+        target = max(1, int(min(target_long_edge, _MAX_HIRES_LONG_EDGE)))
+        cache_key = (page_num, target)
+        with self._lock:
+            if self._hires_key == cache_key and self._hires_img is not None:
+                return self._hires_img
+
+        import fitz
+        from PySide6.QtGui import QImage
+
+        with self._fitz_lock:
+            page = self._doc.load_page(page_num)
+            rect = page.rect
+            page_long_edge_pt = max(rect.width, rect.height)
+            if page_long_edge_pt <= 0:
+                return None
+            # Points → pixels at 72 DPI baseline; choose a zoom so the rendered
+            # long edge lands on the requested target.
+            zoom = target / page_long_edge_pt
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            # Build a QImage that owns its own copy of the samples buffer so it
+            # stays valid after the fitz pixmap is freed.
+            fmt = QImage.Format.Format_RGB888
+            img = QImage(pix.samples, pix.width, pix.height,
+                         pix.stride, fmt).copy()
+
+        with self._lock:
+            self._hires_key = cache_key
+            self._hires_img = img
+        return img
+
+    def render_spread_qimage(self, start_page, count, target_height):
+        """Render a 2/3-page spread at high resolution into a lossless ``QImage``.
+
+        Mirrors :meth:`render_spread`'s side-by-side layout (pages scaled to a
+        common height with a small black gutter) but renders each page directly
+        with fitz at *target_height* pixels tall and composites with ``QImage`` /
+        ``QPainter`` (both safe off the GUI thread). The composite width is
+        clamped to ``_MAX_HIRES_LONG_EDGE`` so wide spreads stay bounded.
+
+        Returns the composite ``QImage`` or ``None`` on failure.
+        """
+        if count <= 1:
+            return self.render_page_qimage(start_page, target_height)
+        if start_page < 0 or start_page >= self.page_count:
+            return None
+
+        target_height = max(1, int(min(target_height, _MAX_HIRES_LONG_EDGE)))
+        cache_key = ("spread", start_page, count, target_height)
+        with self._lock:
+            if self._hires_key == cache_key and self._hires_img is not None:
+                return self._hires_img
+
+        import fitz
+        from PySide6.QtGui import QImage, QPainter
+        from PySide6.QtCore import Qt
+
+        page_imgs = []
+        for offset in range(count):
+            pn = start_page + offset
+            if pn >= self.page_count:
+                break
+            with self._fitz_lock:
+                page = self._doc.load_page(pn)
+                rect = page.rect
+                if rect.height <= 0:
+                    continue
+                zoom = target_height / rect.height
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = QImage(pix.samples, pix.width, pix.height,
+                             pix.stride, QImage.Format.Format_RGB888).copy()
+            if not img.isNull():
+                page_imgs.append(img)
+
+        if not page_imgs:
+            return None
+
+        gap = 6  # px black gutter, matches render_spread
+        common_h = max(im.height() for im in page_imgs)
+        total_w = sum(im.width() for im in page_imgs) + gap * (len(page_imgs) - 1)
+
+        composite = QImage(total_w, common_h, QImage.Format.Format_RGB888)
+        composite.fill(Qt.black)
+        painter = QPainter(composite)
+        try:
+            x = 0
+            for im in page_imgs:
+                y = (common_h - im.height()) // 2
+                painter.drawImage(x, y, im)
+                x += im.width() + gap
+        finally:
+            painter.end()
+
+        # Bound the composite's long edge (width) for memory safety.
+        if composite.width() > _MAX_HIRES_LONG_EDGE:
+            composite = composite.scaledToWidth(
+                _MAX_HIRES_LONG_EDGE, Qt.SmoothTransformation)
+
+        with self._lock:
+            self._hires_key = cache_key
+            self._hires_img = composite
+        return composite
 
     def prefetch_around(self, page_num, radius=3):
         """Schedule background rendering of pages near *page_num*."""
@@ -230,6 +361,9 @@ class PdfDocument:
     def close(self):
         """Release all resources."""
         self._prefetch_pool.shutdown(wait=True, cancel_futures=True)
+        with self._lock:
+            self._hires_key = None
+            self._hires_img = None
         try:
             with self._fitz_lock:
                 self._doc.close()

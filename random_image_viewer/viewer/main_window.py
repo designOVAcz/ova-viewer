@@ -23,7 +23,7 @@ from PySide6.QtGui import (
     QPixmap, QPainter, QColor, QPen, QFont, QIcon, QColorTransform,
     QMouseEvent, QImageReader, QTransform, QAction, QShortcut, QImage, QTabletEvent, QCursor
 )
-from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QEvent, QPropertyAnimation, QEasingCurve, QThread, QPoint
+from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QEvent, QPropertyAnimation, QEasingCurve, QThread, QPoint, Signal
 from PySide6.QtWidgets import QLayout, QWidgetAction
 
 from random_image_viewer.constants import IMAGE_EXTENSIONS, MEDIA_EXTENSIONS, DOCUMENT_EXTENSIONS, PLAYLIST_EXTENSIONS
@@ -47,6 +47,39 @@ from random_image_viewer.widgets.color_snap_preview import ColorSnapPreview
 from random_image_viewer.widgets.snapped_palette_window import SnappedPaletteWindow
 from random_image_viewer.widgets.floating_panel import FloatingPanel
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
+
+
+class PdfHiresWorker(QThread):
+    """Render a single PDF page (or a 2/3-page spread) at high resolution off
+    the GUI thread.
+
+    Emits :attr:`ready` with ``(start_page, count, target, QImage)`` when done.
+    A ``QImage`` is produced (not a ``QPixmap``) because only ``QImage`` may be
+    built off the main thread; the receiver converts it to a ``QPixmap``.
+    """
+
+    ready = Signal(int, int, int, object)
+
+    def __init__(self, pdf_doc, start_page, count, target, parent=None):
+        super().__init__(parent)
+        self._pdf_doc = pdf_doc
+        self._start_page = start_page
+        self._count = count
+        self._target = target
+
+    def run(self):
+        try:
+            if self._count > 1:
+                img = self._pdf_doc.render_spread_qimage(
+                    self._start_page, self._count, self._target)
+            else:
+                img = self._pdf_doc.render_page_qimage(
+                    self._start_page, self._target)
+        except Exception as e:
+            print(f"PdfHiresWorker error: {e}")
+            img = None
+        if img is not None:
+            self.ready.emit(self._start_page, self._count, self._target, img)
 
 
 class PdfLoadingOverlay(QWidget):
@@ -917,6 +950,19 @@ class RandomImageViewer(QMainWindow):
         self._pdf_page = 0     # current 0-based page number
         self._pdf_name = ""
 
+        # PDF high-resolution zoom state: when the user zooms into a PDF page we
+        # re-render just that page (or the current 2/3-page spread) at a higher
+        # resolution (on a background thread) so small text stays sharp instead
+        # of upscaling a blurry raster. Images are untouched.
+        self._pdf_hires_page = -1      # anchor page currently loaded at hi-res (-1 = none)
+        self._pdf_hires_count = 1      # spread page-count of the current hi-res render
+        self._pdf_hires_target = 0     # target size (long edge / composite height) px
+        self._pdf_hires_thread = None  # active PdfHiresWorker, if any
+        self._pdf_hires_timer = QTimer(self)
+        self._pdf_hires_timer.setSingleShot(True)
+        self._pdf_hires_timer.setInterval(180)
+        self._pdf_hires_timer.timeout.connect(self._start_pdf_hires_render)
+
         # PDF spread (book) view: "single" | "2page" | "3page". Persisted via
         # QSettings so the user's preferred reading layout survives restarts.
         from PySide6.QtCore import QSettings
@@ -1280,11 +1326,39 @@ class RandomImageViewer(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        # The size grip reserves a bottom-right corner that nudges permanent
+        # widgets upward; disabling it lets them sit vertically centered.
+        self.status.setSizeGripEnabled(False)
 
         self.path_label = QLabel()
 
         self.statusBar().addPermanentWidget(self.path_label)
         self.path_label.linkActivated.connect(self.open_in_explorer)
+
+        # Small reset-panels button pinned to the right corner of the status
+        # bar. Snaps the floating tool panels back to their default right-side
+        # vertical stack (see _reset_panel_layout). Kept compact so it does not
+        # increase the status bar height.
+        self.panel_reset_btn = QToolButton()
+        self.panel_reset_btn.setText("⟲")
+        self.panel_reset_btn.setToolTip(
+            "Reset tool panels to default layout (Ctrl+Shift+R)")
+        self.panel_reset_btn.setFixedSize(16, 16)
+        self.panel_reset_btn.setCursor(Qt.PointingHandCursor)
+        self.panel_reset_btn.setStyleSheet(
+            "QToolButton { border: none; padding: 0px; margin: 0px;"
+            " color: #888; font-size: 12px; }"
+            "QToolButton:hover { color: #fff; }"
+        )
+        self.panel_reset_btn.clicked.connect(self._reset_panel_layout)
+        # Wrap in a container that vertically centers the button so its glyph
+        # lines up with the status-bar text instead of hugging the top edge.
+        _reset_wrap = QWidget()
+        _reset_wrap_layout = QHBoxLayout(_reset_wrap)
+        _reset_wrap_layout.setContentsMargins(0, 0, 6, 0)
+        _reset_wrap_layout.setSpacing(0)
+        _reset_wrap_layout.addWidget(self.panel_reset_btn, 0, Qt.AlignVCenter)
+        self.statusBar().addPermanentWidget(_reset_wrap)
 
         # Background folder-scan state (see _begin_scan / _on_scan_finished).
         # Drops/opens are routed through a QThread worker so the GUI stays
@@ -1345,6 +1419,10 @@ class RandomImageViewer(QMainWindow):
         # Toggle antialiasing shortcut
         self.ctrl_shift_a_shortcut = QShortcut("Ctrl+Shift+A", self)
         self.ctrl_shift_a_shortcut.activated.connect(lambda: self.toggle_line_antialiasing(not self.line_antialiasing))
+        
+        # Reset tool panels to the default right-side layout (works in fullscreen)
+        self.ctrl_shift_r_shortcut = QShortcut("Ctrl+Shift+R", self)
+        self.ctrl_shift_r_shortcut.activated.connect(self._reset_panel_layout)
         
         # 🎨 PEN PRESSURE: Test shortcut
         self.ctrl_shift_p_shortcut = QShortcut("Ctrl+Shift+P", self)
@@ -1887,7 +1965,10 @@ class RandomImageViewer(QMainWindow):
             pw = p.width()
             ph = p.height()
             if p.user_moved:
-                p.clamp_into_parent()
+                # Re-dock to the panel's corner anchor so right/bottom-docked
+                # panels keep their relative position when the canvas resizes
+                # (maximize / restore / fullscreen).
+                p.reposition_to_anchor()
                 p.raise_()
                 continue
             if x > margin and x + pw > avail_w - margin:
@@ -1899,6 +1980,43 @@ class RandomImageViewer(QMainWindow):
             p.raise_()
             x += pw + gap
             row_h = max(row_h, ph)
+
+    def _reset_panel_layout(self):
+        """Snap all tool panels into the default right-side vertical stack.
+
+        Reproduces the screenshot arrangement: panels collapsed and stacked
+        bottom-to-top against the bottom-right corner of the canvas (FILE / NAV
+        on top, DRAW at the bottom). Each panel is corner-anchored so it stays
+        docked when the window is resized, and the layout is persisted.
+        """
+        by_key = getattr(self, '_panel_by_key', None)
+        if not by_key:
+            return
+        canvas = self.image_label
+        margin = 8
+        gap = 8
+        # Top-to-bottom order matching the default right-hand stack.
+        order = ["FILE / NAV", "TRANSFORM / VIEW", "LINE / COLOR", "EFFECTS", "DRAW"]
+        # Collapse panels first so heights reflect the default (closed) look.
+        panels = []
+        for key in order:
+            panel = by_key.get(key)
+            if panel is None or panel.isHidden():
+                continue
+            if not panel.collapsed:
+                panel.set_collapsed(True, emit=False)
+            panels.append(panel)
+        # Stack bottom-to-top against the bottom-right corner.
+        y = canvas.height() - margin
+        for panel in reversed(panels):
+            y -= panel.height()
+            x = max(margin, canvas.width() - margin - panel.width())
+            panel.move(int(x), int(y))
+            panel.mark_user_moved(True)
+            panel.update_anchor()
+            panel.raise_()
+            y -= gap
+        self._save_panel_layout()
 
     def _update_toolbar_layout(self, width):
         """Move sliders between main toolbar and second row based on window width"""
@@ -5024,6 +5142,54 @@ class RandomImageViewer(QMainWindow):
         self._auto_advance_active = bool(checked)
         self._reset_timer()
 
+    def _auto_advance_has_content(self):
+        """True when auto-advance has something to browse: an image playlist or
+        an open document (PDF / EPUB / CBR)."""
+        return bool(self.images
+                    or getattr(self, '_pdf_doc', None)
+                    or getattr(self, '_epub_doc', None)
+                    or getattr(self, '_cbr_doc', None))
+
+    def _auto_advance_next(self):
+        """Advance one step for the auto-advance timer.
+
+        For a standalone document (PDF / EPUB / CBR that is not part of a mixed
+        playlist) this walks to the next page/spread and loops back to the first
+        page at the end, so timed page-browsing keeps going. Otherwise it falls
+        back to the normal image navigation (random or sequential)."""
+        doc_pdf = getattr(self, '_pdf_doc', None)
+        doc_epub = getattr(self, '_epub_doc', None)
+        doc_cbr = getattr(self, '_cbr_doc', None)
+
+        if (doc_pdf or doc_epub or doc_cbr) and not self._in_playlist():
+            if doc_pdf:
+                step = self._spread_count()
+                nxt = self._pdf_page + step
+                if nxt >= doc_pdf.page_count:
+                    nxt = 0
+                self.clear_lines()
+                self._show_pdf_page(nxt)
+            elif doc_cbr:
+                step = self._spread_count()
+                nxt = self._cbr_page + step
+                if nxt >= doc_cbr.page_count:
+                    nxt = 0
+                self.clear_lines()
+                self._show_cbr_page(nxt)
+            else:  # EPUB
+                nxt = self._epub_page + 1
+                if nxt >= doc_epub.page_count:
+                    nxt = 0
+                self.clear_lines()
+                self._show_epub_page(nxt)
+            return
+
+        # Images / mixed playlist: keep the existing mode-aware behavior.
+        if self.random_mode:
+            self.show_random_image()
+        else:
+            self._manual_next_image()
+
     def set_status_path(self, image_path):
         # For Windows, convert slashes and prepend file:///
         url = os.path.abspath(image_path)
@@ -5050,7 +5216,7 @@ class RandomImageViewer(QMainWindow):
             subprocess.Popen(["xdg-open", folder])
 
     def _reset_timer(self):
-        if self._auto_advance_active and self.images:
+        if self._auto_advance_active and self._auto_advance_has_content():
             self.timer.stop()
             self.timer_remaining = self.timer_spin.value()
             self.circle_timer.set_total_time(self.timer_spin.value())
@@ -5061,7 +5227,7 @@ class RandomImageViewer(QMainWindow):
             self.circle_timer.set_remaining_time(0)
 
     def _on_timer_tick(self):
-        if not self._auto_advance_active or not self.images:
+        if not self._auto_advance_active or not self._auto_advance_has_content():
             self.timer.stop()
             self.circle_timer.set_remaining_time(0)
             return
@@ -5070,11 +5236,14 @@ class RandomImageViewer(QMainWindow):
         if not self._timer_paused:
             self.timer_remaining -= 1
             if self.timer_remaining <= 0:
-                # Use mode-aware navigation for auto-advance
-                if self.random_mode:
-                    self.show_random_image()
-                else:
-                    self._manual_next_image()
+                # Advance images or document pages (mode-aware).
+                self._auto_advance_next()
+                # Reset the countdown for the next page/image. Image paths
+                # (_manual_next_image / show_random_image) also reset this, but
+                # the document paths (_show_pdf_page etc.) do not — without this
+                # the timer would fire every tick instead of every interval.
+                self.timer_remaining = self.timer_spin.value()
+                self._update_ring()
             else:
                 self._update_ring()
         # If paused, just update the ring display
@@ -8411,6 +8580,153 @@ class RandomImageViewer(QMainWindow):
             else:
                 self.status.showMessage(f"Zoom: {new_zoom:.1f}x")
     
+    def _maybe_schedule_pdf_hires(self):
+        """Decide whether the current PDF page/spread needs a sharper re-render.
+
+        Runs for single-page and 2/3-page spread PDF views (never for images,
+        GIFs or video). At zoom ≤ 1.0 it restores the normal fit-resolution page
+        so memory stays low; when zoomed in far enough that the current base
+        pixmap would be upscaled, it (re)starts a short debounce before
+        rendering at a matching higher resolution on a background thread.
+        """
+        doc = getattr(self, '_pdf_doc', None)
+        if doc is None:
+            return
+        if self.image_label.is_animation_playing():
+            return
+
+        zoom = getattr(self.image_label, 'zoom_factor', 1.0)
+
+        # Back at (or below) 100%: drop any hi-res render and restore the normal
+        # fit-resolution base so we don't keep a big pixmap around.
+        if zoom <= 1.0:
+            if self._pdf_hires_page != -1:
+                self._restore_pdf_base_resolution()
+            return
+
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return
+
+        label = self.image_label.size()
+        # Longest side the zoomed page/spread will occupy on screen. It fits
+        # inside the label, so label long edge × zoom is a safe upper bound.
+        required = int(max(label.width(), label.height()) * zoom)
+        current_long = max(base.width(), base.height())
+        count = self._spread_count()
+
+        # Already sharp enough (current base has at least the needed pixels), or
+        # we already have a hi-res render for this exact page/spread at ≥ size.
+        if current_long >= required:
+            return
+        if (self._pdf_hires_page == self._pdf_page
+                and self._pdf_hires_count == count
+                and self._pdf_hires_target >= required):
+            return
+
+        self._pdf_hires_timer.start()
+
+    def _start_pdf_hires_render(self):
+        """Kick off the background hi-res render for the current page/spread."""
+        doc = getattr(self, '_pdf_doc', None)
+        if doc is None:
+            return
+        zoom = getattr(self.image_label, 'zoom_factor', 1.0)
+        if zoom <= 1.0:
+            return
+        # Don't stack workers; a newer one will be scheduled if still needed.
+        if self._pdf_hires_thread is not None and self._pdf_hires_thread.isRunning():
+            return
+
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return
+
+        label = self.image_label.size()
+        required = int(max(label.width(), label.height()) * zoom)
+        count = self._spread_count()
+        page = self._pdf_page
+
+        if count > 1:
+            # For spreads the long edge is the composite width; scale the whole
+            # composite by (required / current width) and pass the target HEIGHT
+            # so render_spread_qimage reproduces the same side-by-side layout.
+            base_long = max(base.width(), base.height())
+            scale = required / base_long if base_long else 1.0
+            target = max(1, int(base.height() * scale))
+        else:
+            target = required  # single page: target is the long edge
+
+        worker = PdfHiresWorker(doc, page, count, target, self)
+        worker.ready.connect(self._on_pdf_hires_ready)
+        worker.finished.connect(self._on_pdf_hires_finished)
+        self._pdf_hires_thread = worker
+        self.status.showMessage(f"Sharpening page {page + 1}…")
+        worker.start()
+
+    def _on_pdf_hires_finished(self):
+        """Clear the worker handle once the QThread has finished."""
+        self._pdf_hires_thread = None
+
+    def _on_pdf_hires_ready(self, page, count, target, qimage):
+        """Swap in the freshly rendered high-resolution page/spread (main thread)."""
+        # Ignore stale results: PDF closed, page/spread changed, or zoomed out.
+        if getattr(self, '_pdf_doc', None) is None:
+            return
+        if page != self._pdf_page or count != self._spread_count():
+            return
+        if getattr(self.image_label, 'zoom_factor', 1.0) <= 1.0:
+            return
+        if qimage is None or qimage.isNull():
+            return
+
+        pixmap = QPixmap.fromImage(qimage)
+        if pixmap.isNull():
+            return
+
+        # Replace the base pixmap for this page so display/zoom paths pick up the
+        # sharper raster, then invalidate derived caches and redraw.
+        self.pixmap_cache[self.current_image] = pixmap
+        self.original_pixmap = pixmap
+        self._pdf_hires_page = page
+        self._pdf_hires_count = count
+        self._pdf_hires_target = target
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if hasattr(self, '_lut_process_cache'):
+            self._lut_process_cache.clear()
+        self._last_processed_image = None
+        self._last_processed_has_lut = False
+        # Full redraw so any LUT/enhancements re-apply at the new resolution.
+        self.display_image(self.current_image)
+        zoom = getattr(self.image_label, 'zoom_factor', 1.0)
+        self.status.showMessage(f"Zoom: {zoom:.1f}x (sharp)")
+
+    def _restore_pdf_base_resolution(self):
+        """Drop the hi-res render and reload the normal fit-resolution page."""
+        self._pdf_hires_timer.stop()
+        self._pdf_hires_page = -1
+        self._pdf_hires_count = 1
+        self._pdf_hires_target = 0
+        doc = getattr(self, '_pdf_doc', None)
+        if doc is None:
+            return
+        path = self.current_image
+        if not path:
+            return
+        base, error = safe_load_pixmap(path)
+        if error or base is None or base.isNull():
+            return
+        self.pixmap_cache[path] = base
+        self.original_pixmap = base
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if hasattr(self, '_lut_process_cache'):
+            self._lut_process_cache.clear()
+        self._last_processed_image = None
+        self._last_processed_has_lut = False
+        self.display_image(path)
+
     def _smart_zoom_display(self):
         """OPTIMIZED zoom display - avoids GPU reprocessing during interactive zoom"""
         if not self.current_image:
@@ -8420,6 +8736,11 @@ class RandomImageViewer(QMainWindow):
         # nothing extra to do here — next frame will pick up the new zoom factor.
         if self.image_label.is_animation_playing():
             return
+
+        # PDF only: schedule a sharper re-render of the page if we've zoomed in
+        # past the current raster's resolution (no-op for images/spreads).
+        if getattr(self, '_pdf_doc', None) is not None:
+            self._maybe_schedule_pdf_hires()
 
         # The fast zoom path reuses a cached pre-posterize image, which would
         # drop the value filter or edge detection on resize/zoom. When either
@@ -10353,6 +10674,13 @@ class RandomImageViewer(QMainWindow):
         page_num = self._spread_anchor(page_num, count)
         self._pdf_page = page_num
 
+        # A different page invalidates any high-resolution render we were holding
+        # for the previous page; the base pixmap below is the fit-resolution one.
+        self._pdf_hires_timer.stop()
+        self._pdf_hires_page = -1
+        self._pdf_hires_count = 1
+        self._pdf_hires_target = 0
+
         if count > 1:
             img_path = self._pdf_doc.render_spread(page_num, count)
         else:
@@ -10391,6 +10719,10 @@ class RandomImageViewer(QMainWindow):
             self._pdf_doc.prefetch_spread_around(page_num, count)
         else:
             self._pdf_doc.prefetch_around(page_num)
+
+        # If the user was already zoomed in, sharpen the new page/spread too.
+        if getattr(self.image_label, 'zoom_factor', 1.0) > 1.0:
+            self._maybe_schedule_pdf_hires()
 
     def _go_to_image_or_page(self):
         """Ctrl+G handler: jump to PDF/EPUB/CBR page or image number."""
@@ -10452,6 +10784,16 @@ class RandomImageViewer(QMainWindow):
 
     def _close_pdf(self):
         """Close the current PDF document if one is open."""
+        # Stop any pending / running high-resolution zoom render first.
+        if hasattr(self, '_pdf_hires_timer'):
+            self._pdf_hires_timer.stop()
+        self._pdf_hires_page = -1
+        self._pdf_hires_count = 1
+        self._pdf_hires_target = 0
+        worker = getattr(self, '_pdf_hires_thread', None)
+        if worker is not None and worker.isRunning():
+            worker.wait(2000)
+        self._pdf_hires_thread = None
         if hasattr(self, '_pdf_doc') and self._pdf_doc is not None:
             self._pdf_doc.close()
             self._pdf_doc = None
