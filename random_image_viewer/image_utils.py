@@ -27,6 +27,90 @@ def is_video_file(file_path):
     return os.path.splitext(file_path)[1].lower() in VIDEO_EXTENSIONS
 
 
+_SRT_TIME_RE = re.compile(
+    r'(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})\s*-->\s*'
+    r'(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})'
+)
+_SRT_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def find_subtitle_file(video_path):
+    """Return the path to a sibling ``.srt`` with the same stem, or None.
+
+    Matches the subtitle extension case-insensitively (``.srt`` / ``.SRT``).
+    """
+    if not video_path:
+        return None
+    base = os.path.splitext(video_path)[0]
+    for ext in ('.srt', '.SRT'):
+        candidate = base + ext
+        if os.path.isfile(candidate):
+            return candidate
+    # Fall back to a case-insensitive directory scan on the stem
+    try:
+        folder = os.path.dirname(video_path) or '.'
+        stem = os.path.basename(base).lower()
+        for name in os.listdir(folder):
+            n = name.lower()
+            if n.endswith('.srt') and os.path.splitext(n)[0] == stem:
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
+
+def _srt_to_ms(h, m, s, frac):
+    frac = (frac + '000')[:3]
+    return ((int(h) * 60 + int(m)) * 60 + int(s)) * 1000 + int(frac)
+
+
+def parse_srt(path):
+    """Parse an SRT file into a sorted list of ``(start_ms, end_ms, text)``.
+
+    Robust to common encodings, stray index lines and simple ``<tag>`` markup.
+    Returns an empty list if the file cannot be read or has no cues.
+    """
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return []
+
+    text = None
+    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode('utf-8', errors='replace')
+
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    cues = []
+    for block in re.split(r'\n{2,}', text.strip()):
+        lines = block.split('\n')
+        match = None
+        t_idx = -1
+        for i, line in enumerate(lines):
+            match = _SRT_TIME_RE.search(line)
+            if match:
+                t_idx = i
+                break
+        if match is None or t_idx < 0:
+            continue
+        start = _srt_to_ms(match.group(1), match.group(2), match.group(3), match.group(4))
+        end = _srt_to_ms(match.group(5), match.group(6), match.group(7), match.group(8))
+        content = '\n'.join(lines[t_idx + 1:]).strip()
+        content = _SRT_TAG_RE.sub('', content).strip()
+        if content and end >= start:
+            cues.append((start, end, content))
+
+    cues.sort(key=lambda c: c[0])
+    return cues
+
+
 def get_image_file_size(file_path):
     """Get file size in MB for display purposes"""
     try:

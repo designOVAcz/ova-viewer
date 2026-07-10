@@ -34,7 +34,8 @@ from random_image_viewer.styles import get_adaptive_stylesheet
 from random_image_viewer.image_utils import (
     get_image_file_size, smart_load_pixmap, safe_load_pixmap,
     natural_sort_key, get_images_in_folder, get_playlist_items_in_folder,
-    emoji_icon, is_animated_gif, is_video_file, PlaylistScanner
+    emoji_icon, is_animated_gif, is_video_file, PlaylistScanner,
+    find_subtitle_file, parse_srt
 )
 from random_image_viewer.pdf_utils import is_pdf_file, PdfDocument
 from random_image_viewer.epub_utils import is_epub_file, EpubDocument
@@ -45,6 +46,7 @@ from random_image_viewer.widgets.image_label import ImageLabel
 from random_image_viewer.widgets.enhancement_widget import ResponsiveEnhancementWidget
 from random_image_viewer.widgets.color_snap_preview import ColorSnapPreview
 from random_image_viewer.widgets.snapped_palette_window import SnappedPaletteWindow
+from random_image_viewer.widgets.curves_window import CurvesWindow
 from random_image_viewer.widgets.floating_panel import FloatingPanel
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
 
@@ -1011,6 +1013,9 @@ class RandomImageViewer(QMainWindow):
         # Floating palette window (lazy-created), persistent until user hits ✕.
         self._snap_palette_window = None
         self._snap_palette_window_pos = None  # session-only memory of last drag pos
+        # Floating Curves (RGB levels) window (lazy-created).
+        self._curves_window = None
+        self._curves_window_pos = None  # session-only memory of last drag pos
         # Cached source QImage for fast sampling (rebuilt on current_image change)
         self._color_snap_src_image = None
         self._color_snap_src_path = None
@@ -1111,6 +1116,13 @@ class RandomImageViewer(QMainWindow):
         # Edge line color override. None = each mode's default (white on dark,
         # black on light, line color over image). Set by the line-color tools.
         self.edge_color = None
+        # Curves (classical RGB levels) - per-channel black/white/midtone tone curve
+        self.curves_enabled = False          # Toggle the curves effect
+        self.curves_channel = "master"       # Active channel being edited (master/r/g/b)
+        self.curves_black = {"master": 0, "r": 0, "g": 0, "b": 0}     # Black point (0-254)
+        self.curves_white = {"master": 255, "r": 255, "g": 255, "b": 255}  # White point (1-255)
+        self.curves_gamma = {"master": 0, "r": 0, "g": 0, "b": 0}     # Midtone slider (-100..100, 0=neutral)
+        self.curves_opacity = 100            # Effect opacity/strength (0-100, 100=full)
         self.rotation_angle = 0   # Rotation angle in degrees
         self.flipped_h = False    # Horizontal flip state
         self.flipped_v = False    # Vertical flip state
@@ -1136,6 +1148,14 @@ class RandomImageViewer(QMainWindow):
         self._video_playing = False
         self._video_muted = False
         self._video_volume = 50  # 0-100
+
+        # Subtitle (.srt) state for video playback
+        self._subtitles_enabled = True       # show subtitles when available
+        self._subtitle_cues = []             # list of (start_ms, end_ms, text)
+        self._subtitle_starts = []           # cached start times for bisect lookup
+        self._subtitle_path = None           # loaded .srt path (or None)
+        self._current_subtitle_text = ""     # cue text at the current position
+        self._video_last_scaled = None       # last scaled frame (pre-subtitle) for redraw
 
         self.timer_interval = 5  # seconds
         self.timer_remaining = 0
@@ -1627,6 +1647,9 @@ class RandomImageViewer(QMainWindow):
         self.edge_mode_btn.setMenu(edge_menu)
         toolbar.addWidget(self.edge_mode_btn)
         self.edge_sensitivity_spin = QSpinBox(); self.edge_sensitivity_spin.setRange(0, 100); self.edge_sensitivity_spin.setValue(self.edge_sensitivity); self.edge_sensitivity_spin.setFixedHeight(24); self.edge_sensitivity_spin.setFixedWidth(44); self.edge_sensitivity_spin.setToolTip("Edge sensitivity (0-100)"); self.edge_sensitivity_spin.valueChanged.connect(self.update_edge_sensitivity); toolbar.addWidget(self.edge_sensitivity_spin)
+        add_spacer(2)
+        # Curves (classical RGB levels): opens a dedicated floating panel
+        self.curves_btn = QToolButton(); self.curves_btn.setText("📈"); self.curves_btn.setToolTip("Curves (RGB levels): open panel with Black/White/Midtone per channel"); self.curves_btn.setCheckable(True); self.curves_btn.setFixedSize(24,24); self.curves_btn.toggled.connect(self._toggle_curves_window); toolbar.addWidget(self.curves_btn)
         add_section_divider()
 
         # ── SECTION: Navigation & Timer ──
@@ -1821,6 +1844,7 @@ class RandomImageViewer(QMainWindow):
                 'color_groups_toggle_btn', 'color_groups_count_spin',
                 'color_groups_field_spin', 'edge_toggle_btn', 'edge_mode_btn',
                 'edge_sensitivity_spin',
+                'curves_btn',
                 'grayscale_slider', 'contrast_slider', 'gamma_slider',
                 'lut_btn', 'lut_combo', 'lut_strength_slider', 'enh_reset_btn',
             ]),
@@ -2502,6 +2526,12 @@ class RandomImageViewer(QMainWindow):
         if hasattr(self, 'image_label') and self.image_label:
             self.image_label.stop_video()
         self._video_playing = False
+        # Clear subtitle state
+        self._subtitle_cues = []
+        self._subtitle_starts = []
+        self._subtitle_path = None
+        self._current_subtitle_text = ""
+        self._video_last_scaled = None
         if hasattr(self, '_video_controls_widget'):
             self._video_controls_widget.hide()
         if hasattr(self, '_video_overlay'):
@@ -2518,6 +2548,9 @@ class RandomImageViewer(QMainWindow):
 
         self.current_image = img_path
         self._video_playing = True
+
+        # Load a sibling .srt subtitle file if one exists (same base name)
+        self._load_subtitles_for(img_path)
 
         if self.image_label.start_video(img_path):
             self.update_image_info(img_path)
@@ -2576,6 +2609,10 @@ class RandomImageViewer(QMainWindow):
         if self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
             frame_pixmap = self.apply_fast_enhancements(frame_pixmap.copy())
 
+        # --- Apply curves (classical RGB levels) ---
+        if self.curves_enabled:
+            frame_pixmap = self.apply_curves(frame_pixmap)
+
         # --- Apply value filter (posterize) ---
         if self.value_filter_enabled:
             frame_pixmap = self.apply_value_filter(frame_pixmap)
@@ -2598,7 +2635,14 @@ class RandomImageViewer(QMainWindow):
         # --- Scale / zoom / pan ---
         final = self._scale_pixmap(frame_pixmap, self.current_image)
         final = self._apply_fixed_overlays_to_pixmap(final)
-        self.image_label.setPixmap(final)
+        # Keep a subtitle-free copy so toggling/seeking can redraw instantly
+        self._video_last_scaled = final
+        # Refresh the active cue from the player's exact position (frame-accurate)
+        if self._subtitle_cues:
+            player = getattr(self.image_label, '_media_player', None)
+            if player is not None:
+                self._current_subtitle_text = self._lookup_subtitle(player.position())
+        self.image_label.setPixmap(self._draw_subtitle_on(final))
 
     # ── Video toolbar signal handlers ─────────────────────────────
 
@@ -2616,6 +2660,110 @@ class RandomImageViewer(QMainWindow):
             self._video_time_label.setText(self._format_video_time(position_ms))
         if hasattr(self, '_video_overlay'):
             self._video_overlay.update_position(position_ms)
+        # Keep subtitles in sync while paused / seeking (playback redraws per frame)
+        if self._subtitle_cues:
+            new_text = self._lookup_subtitle(position_ms)
+            if new_text != self._current_subtitle_text:
+                self._current_subtitle_text = new_text
+                if not self.image_label.is_video_playing():
+                    self._redraw_video_subtitle()
+
+    # ── Subtitles (.srt) ──────────────────────────────────────────
+
+    def _load_subtitles_for(self, video_path):
+        """Load a sibling ``.srt`` (same base name) for ``video_path`` if present."""
+        self._subtitle_cues = []
+        self._subtitle_starts = []
+        self._subtitle_path = None
+        self._current_subtitle_text = ""
+        try:
+            srt_path = find_subtitle_file(video_path)
+            if srt_path:
+                cues = parse_srt(srt_path)
+                if cues:
+                    self._subtitle_cues = cues
+                    self._subtitle_starts = [c[0] for c in cues]
+                    self._subtitle_path = srt_path
+                    self.status.showMessage(
+                        f"Subtitles loaded: {os.path.basename(srt_path)}", 3000)
+        except Exception as e:
+            print(f"subtitle load error: {e}")
+
+    def _lookup_subtitle(self, pos_ms):
+        """Return the cue text active at ``pos_ms`` (empty string if none)."""
+        cues = self._subtitle_cues
+        if not cues:
+            return ""
+        import bisect
+        i = bisect.bisect_right(self._subtitle_starts, pos_ms) - 1
+        if 0 <= i < len(cues):
+            start, end, text = cues[i]
+            if start <= pos_ms <= end:
+                return text
+        return ""
+
+    def _draw_subtitle_on(self, pixmap):
+        """Return a copy of ``pixmap`` with the current subtitle drawn, or the
+        original if subtitles are hidden / there is no active cue."""
+        text = self._current_subtitle_text if self._subtitles_enabled else ""
+        if not text or pixmap is None or pixmap.isNull():
+            return pixmap
+        from PySide6.QtCore import QRect
+        result = pixmap.copy()
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        w, h = result.width(), result.height()
+
+        font = painter.font()
+        px = max(14, int(h * 0.045))
+        font.setPixelSize(px)
+        font.setBold(True)
+        painter.setFont(font)
+
+        margin = max(8, int(h * 0.03))
+        max_w = int(w * 0.9)
+        flags = Qt.AlignHCenter | Qt.AlignBottom | Qt.TextWordWrap
+        bounds = painter.boundingRect(0, 0, max_w, h, flags, text)
+        tw, th = bounds.width(), bounds.height()
+        x = (w - tw) // 2
+        y = h - margin - th
+        text_rect = QRect(x, y, tw, th)
+
+        pad = max(4, int(px * 0.3))
+        painter.fillRect(
+            QRect(x - pad, y - pad, tw + 2 * pad, th + 2 * pad),
+            QColor(0, 0, 0, 140))
+
+        # Black outline for legibility over any background
+        painter.setPen(QColor(0, 0, 0, 230))
+        for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)):
+            painter.drawText(text_rect.translated(dx, dy),
+                             Qt.AlignHCenter | Qt.TextWordWrap, text)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.TextWordWrap, text)
+        painter.end()
+        return result
+
+    def _redraw_video_subtitle(self):
+        """Redraw the last video frame with the current subtitle state applied."""
+        if not self._video_playing:
+            return
+        base = getattr(self, '_video_last_scaled', None)
+        if base is None or base.isNull():
+            return
+        self.image_label.setPixmap(self._draw_subtitle_on(base))
+
+    def has_video_subtitles(self):
+        """True if a subtitle track is loaded for the current video."""
+        return self._video_playing and bool(self._subtitle_cues)
+
+    def toggle_subtitles(self, checked=None):
+        """Show/hide subtitles. With no argument, flips the current state."""
+        if checked is None:
+            self._subtitles_enabled = not self._subtitles_enabled
+        else:
+            self._subtitles_enabled = bool(checked)
+        self._redraw_video_subtitle()
 
     def _on_video_state_changed(self, state):
         from PySide6.QtMultimedia import QMediaPlayer
@@ -2726,6 +2874,10 @@ class RandomImageViewer(QMainWindow):
         # --- Apply enhancements (grayscale / contrast / gamma) ---
         if self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
             frame_pixmap = self.apply_fast_enhancements(frame_pixmap.copy())
+
+        # --- Apply curves (classical RGB levels) ---
+        if self.curves_enabled:
+            frame_pixmap = self.apply_curves(frame_pixmap)
 
         # --- Apply value filter (posterize) ---
         if self.value_filter_enabled:
@@ -2914,7 +3066,7 @@ class RandomImageViewer(QMainWindow):
             strokes = len(self.drawn_free_strokes) if self.drawn_free_strokes else 0
             lines_info = f"_lines_{vlines}_{hlines}_{flines}_{strokes}_{self.line_color.name()}_{self.line_thickness}"
         
-        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}-{self.line_color.name()}{lines_info}"
+        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}_cv{self._curves_signature()}-{self.line_color.name()}{lines_info}"
         
         # Check enhanced cache first
         if cache_key in self.enhancement_cache:
@@ -2953,6 +3105,10 @@ class RandomImageViewer(QMainWindow):
                 pixmap = self.apply_fast_enhancements(base_pixmap.copy())
             else:
                 pixmap = base_pixmap
+
+            # Apply curves (classical RGB levels) AFTER color enhancements / LUT
+            if self.curves_enabled:
+                pixmap = self.apply_curves(pixmap)
 
             # Apply value filter (posterize) AFTER color enhancements / LUT
             if self.value_filter_enabled:
@@ -4376,6 +4532,86 @@ class RandomImageViewer(QMainWindow):
             print(f"Error scanning LUT folder: {e}")
         
         return lut_files
+
+    def _build_channel_lut(self, np, black, white, gamma_slider):
+        """Build a 256-entry uint8 levels LUT for one channel.
+
+        Classical levels: remap [black, white] -> [0, 255] then apply a midtone
+        (gamma) curve. ``gamma_slider`` is -100..100 (0 = neutral); positive
+        brightens midtones, negative darkens them.
+        """
+        black = max(0, min(254, int(black)))
+        white = max(black + 1, min(255, int(white)))
+        x = np.arange(256, dtype=np.float32)
+        t = np.clip((x - black) / float(white - black), 0.0, 1.0)
+        # Map slider to gamma exponent in [0.25, 4.0]; neutral at 1.0
+        gamma = 2.0 ** (float(gamma_slider) / 50.0)
+        t = np.power(t, 1.0 / gamma)
+        return np.clip(t * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    def apply_curves(self, pixmap):
+        """Apply the classical per-channel curves (levels) effect.
+
+        Builds a 256-entry LUT for master + each RGB channel and applies them
+        (master first, then per-channel) via numpy. Returns a new QPixmap. If
+        the effect is disabled or numpy is unavailable, returns ``pixmap``.
+        """
+        try:
+            if not pixmap or pixmap.isNull() or not self.curves_enabled:
+                return pixmap
+
+            opacity = max(0, min(100, int(self.curves_opacity))) / 100.0
+            if opacity <= 0.0:
+                return pixmap  # fully transparent effect = original
+
+            import numpy as np
+            master = self._build_channel_lut(
+                np, self.curves_black["master"], self.curves_white["master"],
+                self.curves_gamma["master"])
+            channel_luts = []
+            for ch in ("r", "g", "b"):
+                ch_lut = self._build_channel_lut(
+                    np, self.curves_black[ch], self.curves_white[ch],
+                    self.curves_gamma[ch])
+                # Apply master first, then the channel curve
+                channel_luts.append(ch_lut[master])
+
+            # Identity fast-path: nothing to do
+            identity = np.arange(256, dtype=np.uint8)
+            if all(np.array_equal(l, identity) for l in channel_luts):
+                return pixmap
+
+            image = pixmap.toImage()
+            if image.isNull():
+                return pixmap
+            if image.format() != QImage.Format.Format_RGBA8888:
+                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            w, h = image.width(), image.height()
+            bpl = image.bytesPerLine()
+            ptr = image.constBits()
+            buf = bytes(ptr)[: bpl * h]
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+
+            out = arr.copy()
+            out[:, :, 0] = channel_luts[0][arr[:, :, 0]]
+            out[:, :, 1] = channel_luts[1][arr[:, :, 1]]
+            out[:, :, 2] = channel_luts[2][arr[:, :, 2]]
+            # Alpha (index 3) left unchanged
+
+            # Blend the curve result with the original by opacity
+            if opacity < 1.0:
+                orig = arr[:, :, :3].astype(np.float32)
+                curved = out[:, :, :3].astype(np.float32)
+                blended = orig * (1.0 - opacity) + curved * opacity
+                out[:, :, :3] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+
+            out = np.ascontiguousarray(out)
+            result = QImage(out.tobytes(), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            return QPixmap.fromImage(result)
+        except Exception as e:
+            print(f"apply_curves error: {e}")
+            return pixmap
 
     def apply_value_filter(self, pixmap):
         """Posterize the image into N evenly-spaced grayscale tones (value study).
@@ -7213,6 +7449,211 @@ class RandomImageViewer(QMainWindow):
         if self.current_image:
             self.display_image(self.current_image)
 
+    def _curves_signature(self):
+        """Compact string of all curves params for cache invalidation."""
+        if not self.curves_enabled:
+            return "0"
+        parts = ["1"]
+        for ch in ("master", "r", "g", "b"):
+            parts.append(f"{self.curves_black[ch]}.{self.curves_white[ch]}.{self.curves_gamma[ch]}")
+        parts.append(f"o{self.curves_opacity}")
+        return "_".join(parts)
+
+    def _sync_curves_sliders(self):
+        """Push the active channel's stored values into the curves window."""
+        win = getattr(self, '_curves_window', None)
+        if win is not None:
+            ch = self.curves_channel
+            win.set_values(self.curves_black[ch], self.curves_white[ch],
+                           self.curves_gamma[ch])
+            win.set_opacity(self.curves_opacity)
+
+    def _refresh_curves(self):
+        """Redisplay after a curve value changes, auto-enabling the effect.
+
+        Mirrors the contrast/gamma sliders: dragging a curve slider turns the
+        effect on so the change is visible immediately. The window's Enable
+        checkbox and the toolbar button are kept in sync.
+        """
+        if not self.curves_enabled:
+            self.curves_enabled = True
+            self._sync_curves_enabled_ui()
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def _sync_curves_enabled_ui(self):
+        """Reflect ``curves_enabled`` on the window checkbox and toolbar button."""
+        win = getattr(self, '_curves_window', None)
+        if win is not None:
+            win.set_enabled_state(self.curves_enabled)
+
+    def toggle_curves(self, checked):
+        """Enable/disable the classical curves (RGB levels) effect."""
+        self.curves_enabled = bool(checked)
+        self._sync_curves_enabled_ui()
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def set_curves_channel(self, channel):
+        """Switch which channel (master/r/g/b) the curve sliders edit."""
+        if channel not in ("master", "r", "g", "b"):
+            return
+        self.curves_channel = channel
+        win = getattr(self, '_curves_window', None)
+        if win is not None:
+            win.set_channel(channel)
+        self._sync_curves_sliders()
+
+    def update_curves_black(self, value):
+        """Set the black point for the active channel (0-254)."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        value = max(0, min(254, value))
+        # Keep black below white
+        if value >= self.curves_white[self.curves_channel]:
+            value = self.curves_white[self.curves_channel] - 1
+            self._sync_curves_sliders()
+        self.curves_black[self.curves_channel] = value
+        self._refresh_curves()
+
+    def update_curves_white(self, value):
+        """Set the white point for the active channel (1-255)."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        value = max(1, min(255, value))
+        # Keep white above black
+        if value <= self.curves_black[self.curves_channel]:
+            value = self.curves_black[self.curves_channel] + 1
+            self._sync_curves_sliders()
+        self.curves_white[self.curves_channel] = value
+        self._refresh_curves()
+
+    def update_curves_gamma(self, value):
+        """Set the midtone (gamma) slider for the active channel (-100..100)."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.curves_gamma[self.curves_channel] = max(-100, min(100, value))
+        self._refresh_curves()
+
+    def update_curves_opacity(self, value):
+        """Set the curve effect opacity/strength (0-100)."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.curves_opacity = max(0, min(100, value))
+        self._refresh_curves()
+
+    def reset_curves(self):
+        """Reset all curve channels to neutral (keeps the panel open)."""
+        self.curves_black = {"master": 0, "r": 0, "g": 0, "b": 0}
+        self.curves_white = {"master": 255, "r": 255, "g": 255, "b": 255}
+        self.curves_gamma = {"master": 0, "r": 0, "g": 0, "b": 0}
+        self.curves_opacity = 100
+        self.curves_enabled = False
+        self._sync_curves_enabled_ui()
+        self._sync_curves_sliders()
+        if hasattr(self, 'curves_btn') and self.curves_btn is not None:
+            # keep the panel-open state; only the effect is reset
+            pass
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    # ───────────── Curves floating window ─────────────
+    def _ensure_curves_window(self):
+        """Lazy-create the curves window and wire its signals."""
+        if self._curves_window is None:
+            win = CurvesWindow(self)
+            win.enable_toggled.connect(self.toggle_curves)
+            win.channel_changed.connect(self.set_curves_channel)
+            win.black_changed.connect(self.update_curves_black)
+            win.white_changed.connect(self.update_curves_white)
+            win.gamma_changed.connect(self.update_curves_gamma)
+            win.opacity_changed.connect(self.update_curves_opacity)
+            win.reset_requested.connect(self.reset_curves)
+            win.closed.connect(self._on_curves_window_closed)
+            self._curves_window = win
+            # Push current state into the freshly created window
+            win.set_channel(self.curves_channel)
+            win.set_enabled_state(self.curves_enabled)
+            self._sync_curves_sliders()
+        return self._curves_window
+
+    def _toggle_curves_window(self, checked):
+        """Show/hide the curves window from the toolbar 📈 button."""
+        if checked:
+            self._show_curves_window()
+        else:
+            self._hide_curves_window()
+
+    def _show_curves_window(self):
+        """Show the floating curves panel near the 📈 button on first open."""
+        win = self._ensure_curves_window()
+        win.set_channel(self.curves_channel)
+        win.set_enabled_state(self.curves_enabled)
+        self._sync_curves_sliders()
+        if win.isVisible():
+            win.raise_()
+            return
+        target = self._curves_window_pos
+        if target is None:
+            btn = getattr(self, 'curves_btn', None)
+            if btn is not None:
+                try:
+                    from PySide6.QtCore import QPoint
+                    target = btn.mapToGlobal(btn.rect().bottomLeft()) + QPoint(0, 4)
+                except Exception:
+                    target = None
+        if target is not None:
+            try:
+                from PySide6.QtGui import QGuiApplication
+                scr = QGuiApplication.screenAt(target) or QGuiApplication.primaryScreen()
+                geom = scr.availableGeometry()
+                w = win.sizeHint().width() or win.width() or 280
+                h = win.sizeHint().height() or win.height() or 180
+                x = max(geom.left(), min(target.x(), geom.right() - w))
+                y = max(geom.top(), min(target.y(), geom.bottom() - h))
+                win.move(x, y)
+            except Exception:
+                win.move(target)
+        win.show()
+        win.raise_()
+
+    def _hide_curves_window(self):
+        """Hide the curves panel; remember its position."""
+        win = getattr(self, '_curves_window', None)
+        if win is not None and win.isVisible():
+            try:
+                self._curves_window_pos = win.pos()
+            except Exception:
+                pass
+            win.hide()
+
+    def _on_curves_window_closed(self):
+        """Handle the window's ✕ button: remember pos and un-check toolbar button."""
+        win = getattr(self, '_curves_window', None)
+        if win is not None:
+            try:
+                self._curves_window_pos = win.pos()
+            except Exception:
+                pass
+        if hasattr(self, 'curves_btn') and self.curves_btn is not None:
+            self.curves_btn.blockSignals(True)
+            self.curves_btn.setChecked(False)
+            self.curves_btn.blockSignals(False)
+
     def toggle_value_filter(self, checked):
         """Enable/disable the posterize value filter."""
         self.value_filter_enabled = bool(checked)
@@ -7412,7 +7853,20 @@ class RandomImageViewer(QMainWindow):
             self.color_groups_field_spin.blockSignals(True)
             self.color_groups_field_spin.setValue(0)
             self.color_groups_field_spin.blockSignals(False)
-        
+
+        # Reset Curves (classical RGB levels)
+        self.curves_enabled = False
+        self.curves_channel = "master"
+        self.curves_black = {"master": 0, "r": 0, "g": 0, "b": 0}
+        self.curves_white = {"master": 255, "r": 255, "g": 255, "b": 255}
+        self.curves_gamma = {"master": 0, "r": 0, "g": 0, "b": 0}
+        self.curves_opacity = 100
+        win = getattr(self, '_curves_window', None)
+        if win is not None:
+            win.set_channel("master")
+            win.set_enabled_state(False)
+        self._sync_curves_sliders()
+
         # Update toggle button states (block signals to prevent loops)
         if hasattr(self, 'grayscale_toggle_btn') and self.grayscale_toggle_btn is not None:
             self.grayscale_toggle_btn.blockSignals(True)
@@ -8747,6 +9201,7 @@ class RandomImageViewer(QMainWindow):
         # is on, fall back to the full display path so the effect is preserved.
         if (getattr(self, 'value_filter_enabled', False) or getattr(self, 'edge_detection_enabled', False)
                 or getattr(self, 'color_groups_enabled', False)
+                or getattr(self, 'curves_enabled', False)
                 or getattr(self, 'erase_strokes', None) or getattr(self, 'current_erase_stroke', None)):
             self.display_image(self.current_image)
             return

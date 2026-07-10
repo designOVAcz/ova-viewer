@@ -1034,6 +1034,17 @@ class ImageLabel(QLabel):
         goto_action.triggered.connect(self.parent_viewer._go_to_image_or_page)
         menu.addAction(goto_action)
 
+        # --- Subtitles (only when a video with a loaded .srt is playing) ---
+        if (hasattr(self.parent_viewer, 'has_video_subtitles') and
+                self.parent_viewer.has_video_subtitles()):
+            menu.addSeparator()
+            subtitle_action = QAction("Show Subtitles", self)
+            subtitle_action.setCheckable(True)
+            subtitle_action.setChecked(
+                getattr(self.parent_viewer, '_subtitles_enabled', True))
+            subtitle_action.toggled.connect(self.parent_viewer.toggle_subtitles)
+            menu.addAction(subtitle_action)
+
         # --- PDF View submenu (only when a PDF is open) ---
         if getattr(self.parent_viewer, '_pdf_doc', None) is not None:
             menu.addSeparator()
