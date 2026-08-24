@@ -35,7 +35,7 @@ from random_image_viewer.image_utils import (
     get_image_file_size, smart_load_pixmap, safe_load_pixmap,
     natural_sort_key, get_images_in_folder, get_playlist_items_in_folder,
     emoji_icon, is_animated_gif, is_video_file, PlaylistScanner,
-    find_subtitle_file, parse_srt
+    find_subtitle_file, parse_srt, load_thumbnail_pixmap
 )
 from random_image_viewer.pdf_utils import is_pdf_file, PdfDocument
 from random_image_viewer.epub_utils import is_epub_file, EpubDocument
@@ -170,8 +170,9 @@ class PdfLoadingOverlay(QWidget):
 class VideoControlsOverlay(QWidget):
     """Floating translucent video controls panel that appears on mouse hover.
 
-    Sits at the bottom of the image label, auto-hides after a few seconds
-    of inactivity — classic video-player behaviour.
+    Sits at the top of the image label (kept clear of bottom-anchored
+    subtitles, which it would otherwise visually collide with), auto-hides
+    after a few seconds of inactivity — classic video-player behaviour.
     """
 
     HIDE_DELAY_MS = 2500
@@ -354,12 +355,11 @@ class VideoControlsOverlay(QWidget):
     def _reposition(self):
         if self._parent_label:
             pw = self._parent_label.width()
-            ph = self._parent_label.height()
             w = pw - 2 * self.PANEL_MARGIN
             if w < 200:
                 w = pw
             x = (pw - w) // 2
-            y = ph - self.PANEL_HEIGHT - 10
+            y = 10
             self.setGeometry(x, y, w, self.PANEL_HEIGHT)
 
     def _fade_in(self):
@@ -1109,6 +1109,12 @@ class RandomImageViewer(QMainWindow):
         self.color_groups_count = 8        # Number of palette colors (2-32)
         self.color_groups_field = 0        # Field-size pre-smoothing to merge regions (0=off, 0-20)
         self._color_palette_cache = {}     # Cache computed palettes keyed by image+params
+        # Object Groups (cryptomatte-style) - segment into regions, flatten each
+        # to its own local colour (spatial separation, unlike Color Groups)
+        self.object_groups_enabled = False   # Toggle the per-object flattening
+        self.object_groups_detail = 45       # Region granularity (0-100, higher=more objects)
+        self.object_groups_min_size = 12     # Minimum region size (0-100, higher=fewer specks)
+        self.object_groups_mode = "local"    # local | id | local_edges
         # Edge detection (Canny "plane change" filter)
         self.edge_detection_enabled = False  # Toggle Canny edge detection
         self.edge_mode = "white_on_black"    # white_on_black | black_on_white | overlay
@@ -1629,6 +1635,27 @@ class RandomImageViewer(QMainWindow):
         self.color_groups_count_spin = QSpinBox(); self.color_groups_count_spin.setRange(2, 32); self.color_groups_count_spin.setValue(self.color_groups_count); self.color_groups_count_spin.setFixedHeight(24); self.color_groups_count_spin.setFixedWidth(44); self.color_groups_count_spin.setToolTip("Color Groups: number of colors (2-32)"); self.color_groups_count_spin.valueChanged.connect(self.update_color_groups_count); toolbar.addWidget(self.color_groups_count_spin)
         self.color_groups_field_spin = QSpinBox(); self.color_groups_field_spin.setRange(0, 20); self.color_groups_field_spin.setValue(self.color_groups_field); self.color_groups_field_spin.setFixedHeight(24); self.color_groups_field_spin.setFixedWidth(44); self.color_groups_field_spin.setToolTip("Color Groups: field size (0=off, higher=larger merged color fields)"); self.color_groups_field_spin.valueChanged.connect(self.update_color_groups_field); toolbar.addWidget(self.color_groups_field_spin)
         add_spacer(2)
+        # Object Groups (cryptomatte-style): toggle + look menu + detail/min-size
+        self.object_groups_toggle_btn = QToolButton(); self.object_groups_toggle_btn.setText("🧩"); self.object_groups_toggle_btn.setToolTip("Toggle Object Groups (cryptomatte-style: split into objects, flatten each to its own local color)"); self.object_groups_toggle_btn.setCheckable(True); self.object_groups_toggle_btn.setChecked(self.object_groups_enabled); self.object_groups_toggle_btn.setFixedSize(24,24); self.object_groups_toggle_btn.toggled.connect(self.toggle_object_groups); toolbar.addWidget(self.object_groups_toggle_btn)
+        from PySide6.QtWidgets import QMenu as _QMenuObj
+        from PySide6.QtGui import QAction as _QActionObj
+        self.object_groups_mode_btn = QToolButton(); self.object_groups_mode_btn.setText("◧"); self.object_groups_mode_btn.setToolTip("Object Groups look: local object colors / cryptomatte ID colors / colors + outlines"); self.object_groups_mode_btn.setFixedSize(24,24); self.object_groups_mode_btn.setPopupMode(QToolButton.InstantPopup)
+        obj_menu = _QMenuObj(self.object_groups_mode_btn)
+        self._object_groups_mode_actions = {}
+        for mode_key, label in (("local", "Local object colors"),
+                                ("local_edges", "Local colors + outlines"),
+                                ("id", "Cryptomatte ID colors")):
+            act = _QActionObj(label, self)
+            act.setCheckable(True)
+            act.setChecked(self.object_groups_mode == mode_key)
+            act.triggered.connect(lambda _checked=False, m=mode_key: self.set_object_groups_mode(m))
+            obj_menu.addAction(act)
+            self._object_groups_mode_actions[mode_key] = act
+        self.object_groups_mode_btn.setMenu(obj_menu)
+        toolbar.addWidget(self.object_groups_mode_btn)
+        self.object_groups_detail_spin = QSpinBox(); self.object_groups_detail_spin.setRange(0, 100); self.object_groups_detail_spin.setValue(self.object_groups_detail); self.object_groups_detail_spin.setFixedHeight(24); self.object_groups_detail_spin.setFixedWidth(44); self.object_groups_detail_spin.setToolTip("Object Groups: detail (0-100, higher = more separate objects)"); self.object_groups_detail_spin.valueChanged.connect(self.update_object_groups_detail); toolbar.addWidget(self.object_groups_detail_spin)
+        self.object_groups_min_spin = QSpinBox(); self.object_groups_min_spin.setRange(0, 100); self.object_groups_min_spin.setValue(self.object_groups_min_size); self.object_groups_min_spin.setFixedHeight(24); self.object_groups_min_spin.setFixedWidth(44); self.object_groups_min_spin.setToolTip("Object Groups: minimum object size (0 = keep specks, higher = merge small regions into bigger objects)"); self.object_groups_min_spin.valueChanged.connect(self.update_object_groups_min_size); toolbar.addWidget(self.object_groups_min_spin)
+        add_spacer(2)
         self.edge_toggle_btn = QToolButton(); self.edge_toggle_btn.setText("📐"); self.edge_toggle_btn.setToolTip("Toggle Edge Detection (plane changes)"); self.edge_toggle_btn.setCheckable(True); self.edge_toggle_btn.setChecked(self.edge_detection_enabled); self.edge_toggle_btn.setFixedSize(24,24); self.edge_toggle_btn.toggled.connect(self.toggle_edge_detection); toolbar.addWidget(self.edge_toggle_btn)
         from PySide6.QtWidgets import QMenu as _QMenuEdge
         from PySide6.QtGui import QAction as _QActionEdge
@@ -1842,7 +1869,10 @@ class RandomImageViewer(QMainWindow):
                 'grayscale_toggle_btn', 'contrast_toggle_btn', 'gamma_toggle_btn',
                 'lut_toggle_btn', 'value_filter_toggle_btn', 'value_levels_spin',
                 'color_groups_toggle_btn', 'color_groups_count_spin',
-                'color_groups_field_spin', 'edge_toggle_btn', 'edge_mode_btn',
+                'color_groups_field_spin',
+                'object_groups_toggle_btn', 'object_groups_mode_btn',
+                'object_groups_detail_spin', 'object_groups_min_spin',
+                'edge_toggle_btn', 'edge_mode_btn',
                 'edge_sensitivity_spin',
                 'curves_btn',
                 'grayscale_slider', 'contrast_slider', 'gamma_slider',
@@ -2621,6 +2651,10 @@ class RandomImageViewer(QMainWindow):
         if self.color_groups_enabled:
             frame_pixmap = self.apply_color_groups(frame_pixmap)
 
+        # --- Apply object groups (cryptomatte-style per-object flattening) ---
+        if self.object_groups_enabled:
+            frame_pixmap = self.apply_object_groups(frame_pixmap)
+
         # --- Apply edge detection (plane changes) ---
         if self.edge_detection_enabled:
             frame_pixmap = self.apply_edge_detection(frame_pixmap)
@@ -2806,6 +2840,8 @@ class RandomImageViewer(QMainWindow):
     def _video_shortcut_play_pause(self):
         if self._video_playing:
             self.image_label.video_toggle_play_pause()
+        elif self.image_label.is_animation_active():
+            self.image_label.gif_toggle_play_pause()
 
     def _video_shortcut_mute(self):
         if self._video_playing:
@@ -2852,6 +2888,17 @@ class RandomImageViewer(QMainWindow):
             self.display_image(img_path)
             self._gif_static_fallback = False
 
+    def _redraw_paused_gif_frame(self):
+        """Re-run the current (frozen) GIF frame through the display pipeline.
+
+        While paused, QMovie no longer emits frameChanged, so enhancement,
+        LUT, zoom, and resize changes need to be applied manually here to
+        still take effect on screen.
+        """
+        movie = self.image_label._current_movie
+        if movie is not None:
+            self._on_gif_frame_changed(movie.currentFrameNumber())
+
     def _on_gif_frame_changed(self, _frame_number):
         """Called by QMovie on every frame change.
         
@@ -2886,6 +2933,10 @@ class RandomImageViewer(QMainWindow):
         # --- Apply color groups (palette quantization) ---
         if self.color_groups_enabled:
             frame_pixmap = self.apply_color_groups(frame_pixmap)
+
+        # --- Apply object groups (cryptomatte-style per-object flattening) ---
+        if self.object_groups_enabled:
+            frame_pixmap = self.apply_object_groups(frame_pixmap)
 
         # --- Apply edge detection (plane changes) ---
         if self.edge_detection_enabled:
@@ -3042,8 +3093,14 @@ class RandomImageViewer(QMainWindow):
 
         # Animated GIFs: redirect to animated display with full enhancement support
         if is_animated_gif(img_path) and not getattr(self, '_gif_static_fallback', False):
-            # If already playing this GIF, the frame callback handles enhancements live
-            if self.image_label.is_animation_playing() and self.current_image == img_path:
+            # Already displaying this GIF (playing or paused) — don't restart it,
+            # which would silently un-pause it.
+            if self.image_label.is_animation_active() and self.current_image == img_path:
+                # If playing, the next frame callback picks up enhancement/zoom
+                # changes live. If paused, there is no next frame, so redraw the
+                # frozen frame now so those changes still take effect.
+                if self.image_label.is_animation_paused():
+                    self._redraw_paused_gif_frame()
                 return
             self._display_animated_gif(img_path)
             return
@@ -3066,7 +3123,7 @@ class RandomImageViewer(QMainWindow):
             strokes = len(self.drawn_free_strokes) if self.drawn_free_strokes else 0
             lines_info = f"_lines_{vlines}_{hlines}_{flines}_{strokes}_{self.line_color.name()}_{self.line_thickness}"
         
-        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}_cv{self._curves_signature()}-{self.line_color.name()}{lines_info}"
+        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}_o{int(self.object_groups_enabled)}-{self.object_groups_mode}-{self.object_groups_detail}-{self.object_groups_min_size}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}_cv{self._curves_signature()}-{self.line_color.name()}{lines_info}"
         
         # Check enhanced cache first
         if cache_key in self.enhancement_cache:
@@ -3117,6 +3174,10 @@ class RandomImageViewer(QMainWindow):
             # Apply color groups (palette quantization) AFTER tonal processing
             if self.color_groups_enabled:
                 pixmap = self.apply_color_groups(pixmap)
+
+            # Apply object groups (per-object flattening) AFTER colour reduction
+            if self.object_groups_enabled:
+                pixmap = self.apply_object_groups(pixmap)
 
             # Apply edge detection (plane changes) AFTER all tonal processing
             if self.edge_detection_enabled:
@@ -4846,6 +4907,334 @@ class RandomImageViewer(QMainWindow):
             print(f"apply_color_groups error: {e}")
             return pixmap
 
+    # Segmentation runs on a downscaled copy for speed; labels are upsampled
+    # back to full resolution before the per-object colours are measured.
+    _OBJECT_SEG_MAX_DIM = 900
+
+    # Seed palette size for the first quantization pass. Only needs to be fine
+    # enough that real object boundaries survive it — the neighbour merge below
+    # is what actually decides where one object ends and the next begins.
+    _OBJECT_SEED_COLORS = 24
+
+    def _seed_regions(self, small_rgb, cv2, np):
+        """Split ``small_rgb`` into connected patches of near-identical colour.
+
+        Quantizes to a small k-means palette (via a 32³ colour-cube lookup, so
+        the per-pixel step is a table index rather than a distance search), then
+        runs connected components per palette colour. Two objects sharing a
+        colour therefore land in different patches — the cryptomatte-style
+        spatial separation that Color Groups can't make. Returns an (h,w) int32
+        label image with ids ``1..n`` and the patch count.
+        """
+        h, w = small_rgb.shape[:2]
+        flat = small_rgb.reshape(-1, 3).astype(np.float32)
+        max_samples = 20000
+        if flat.shape[0] > max_samples:
+            idx = np.linspace(0, flat.shape[0] - 1, max_samples).astype(np.int64)
+            sample = np.ascontiguousarray(flat[idx])
+        else:
+            sample = flat
+        k = int(min(self._OBJECT_SEED_COLORS, sample.shape[0]))
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 8, 1.0)
+        # Fixed seed: k-means++ is randomised, and an unseeded run would give a
+        # slightly different segmentation every time the image is re-rendered.
+        cv2.setRNGSeed(12345)
+        _, _, centers = cv2.kmeans(sample, k, None, criteria, 1, cv2.KMEANS_PP_CENTERS)
+
+        # Nearest palette colour for every cell of a 5-bit RGB cube, then one
+        # fancy-index to label the image.
+        grid = np.arange(32, dtype=np.float32) * 8.0 + 4.0
+        cube = np.stack(np.meshgrid(grid, grid, grid, indexing='ij'), axis=-1).reshape(-1, 3)
+        cube_lut = np.argmin(((cube[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2), axis=1)
+        codes = (((small_rgb[:, :, 0] >> 3).astype(np.int32) << 10)
+                 | ((small_rgb[:, :, 1] >> 3).astype(np.int32) << 5)
+                 | (small_rgb[:, :, 2] >> 3).astype(np.int32))
+        quantized = cube_lut[codes]
+
+        quantized = quantized.astype(np.uint8)
+        labels = np.zeros((h, w), np.int32)
+        offset = 0
+        for i in range(k):
+            # cv2.compare gives the 0/255 mask connectedComponents wants without
+            # a Python-level boolean pass over the image.
+            mask = cv2.compare(quantized, i, cv2.CMP_EQ)
+            n_comp, comp = cv2.connectedComponents(mask, connectivity=4)
+            if n_comp <= 1:
+                continue
+            # Masked add writes only this colour's pixels, leaving the rest.
+            cv2.add(labels, comp + offset, dst=labels, mask=mask)
+            offset += n_comp - 1
+        return labels, offset
+
+    def _merge_similar_neighbors(self, labels, count, source, tol, np):
+        """Agglomerate touching patches whose colours are close (< ``tol``).
+
+        This is what turns quantization patches back into objects: a shaded
+        surface arrives as a stack of thin bands, and merging neighbours by
+        colour distance walks along it until a real edge stops the chain, while
+        a genuinely different object beside it stays separate. Merges are taken
+        cheapest-first and re-checked against the running cluster mean, so one
+        object never swallows the frame. Returns a densely relabelled map and
+        the new count.
+        """
+        flat = labels.ravel()
+        sizes = np.bincount(flat, minlength=count + 1).astype(np.float64)
+        sums = np.empty((count + 1, 3), np.float64)
+        for c in range(3):
+            sums[:, c] = np.bincount(flat, weights=source[:, :, c].ravel().astype(np.float64),
+                                     minlength=count + 1)
+        means = sums / np.maximum(sizes, 1.0)[:, None]
+
+        # Unique unordered pairs of 4-neighbour-adjacent labels.
+        left = np.concatenate([labels[:, :-1].ravel(), labels[:-1, :].ravel()])
+        right = np.concatenate([labels[:, 1:].ravel(), labels[1:, :].ravel()])
+        differing = left != right
+        left, right = left[differing], right[differing]
+        if left.size == 0:
+            return labels, count
+        lo = np.minimum(left, right).astype(np.int64)
+        hi = np.maximum(left, right).astype(np.int64)
+        stride = np.int64(count + 1)
+        pairs = np.unique(lo * stride + hi)
+        pa = (pairs // stride).astype(np.int32)
+        pb = (pairs % stride).astype(np.int32)
+
+        dist = np.sqrt(((means[pa] - means[pb]) ** 2).sum(axis=1))
+        # Only pairs already within tolerance can ever merge; ordering the rest
+        # of the work cheapest-first keeps the agglomeration stable.
+        candidates = np.flatnonzero(dist <= tol)
+        order = candidates[np.argsort(dist[candidates], kind='stable')]
+
+        # Plain Python lists for the union-find: this loop runs once per
+        # candidate pair (tens of thousands at high detail) and scalar list
+        # access is several times cheaper than indexing numpy arrays.
+        parent = list(range(count + 1))
+        area = sizes.tolist()
+        acc = [sums[:, 0].tolist(), sums[:, 1].tolist(), sums[:, 2].tolist()]
+        avg = [means[:, 0].tolist(), means[:, 1].tolist(), means[:, 2].tolist()]
+        pa_l, pb_l = pa.tolist(), pb.tolist()
+        tol_sq = float(tol) * float(tol)
+
+        def find(node):
+            root = node
+            while parent[root] != root:
+                root = parent[root]
+            while parent[node] != root:
+                parent[node], node = root, parent[node]
+            return root
+
+        for i in order.tolist():
+            ra, rb = find(pa_l[i]), find(pb_l[i])
+            if ra == rb:
+                continue
+            dr = avg[0][ra] - avg[0][rb]
+            dg = avg[1][ra] - avg[1][rb]
+            db = avg[2][ra] - avg[2][rb]
+            if dr * dr + dg * dg + db * db > tol_sq:
+                continue
+            if area[ra] < area[rb]:
+                ra, rb = rb, ra
+            parent[rb] = ra
+            total = area[ra] + area[rb]
+            area[ra] = total
+            inv = 1.0 / total if total else 0.0
+            for c in range(3):
+                acc[c][ra] += acc[c][rb]
+                avg[c][ra] = acc[c][ra] * inv
+
+        # Resolve every label to its root by pointer jumping (log-depth, and
+        # each step is one vectorised gather instead of count Python calls).
+        roots = np.asarray(parent, dtype=np.int32)
+        while True:
+            jumped = roots[roots]
+            if np.array_equal(jumped, roots):
+                break
+            roots = jumped
+        unique_roots, dense = np.unique(roots, return_inverse=True)
+        return dense.astype(np.int32)[labels], int(unique_roots.size) - 1
+
+    def _merge_small_objects(self, labels, count, guide_rgb, min_area, cv2, np):
+        """Drop regions below ``min_area`` and grow the survivors over them.
+
+        The kept regions become watershed markers, so the reclaimed pixels are
+        handed to whichever neighbour the image's own edges point at rather
+        than to the nearest label by distance. Returns a relabelled int32 map.
+        """
+        counts = np.bincount(labels.ravel(), minlength=count + 1)
+        keep = counts >= min_area
+        keep[0] = False
+        if not keep.any():
+            # Everything is below the threshold — keep the biggest handful so
+            # the watershed still has markers to grow from.
+            biggest = np.argsort(counts[1:])[::-1][:8] + 1
+            keep[biggest] = True
+        kept_ids = np.flatnonzero(keep)
+        if kept_ids.size == count:
+            return labels
+        remap = np.zeros(count + 1, np.int32)
+        remap[kept_ids] = np.arange(1, kept_ids.size + 1, dtype=np.int32)
+        markers = np.ascontiguousarray(remap[labels])
+        cv2.watershed(cv2.cvtColor(guide_rgb, cv2.COLOR_RGB2BGR), markers)
+        # watershed leaves -1 on the ridges it found; hand those pixels to a
+        # neighbouring region so no unassigned seams remain.
+        if (markers <= 0).any():
+            m = markers.astype(np.float32)
+            m[m < 0] = 0
+            kernel = np.ones((3, 3), np.uint8)
+            for _ in range(3):
+                if not (m <= 0).any():
+                    break
+                grown = cv2.dilate(m, kernel)
+                m = np.where(m <= 0, grown, m)
+            markers = np.maximum(m, 0).astype(np.int32)
+        return markers
+
+    def _segment_objects(self, rgb, cv2, np):
+        """Split ``rgb`` into per-object regions (the cryptomatte-style pass).
+
+        Flattens surface texture, cuts the frame into connected same-colour
+        patches, merges neighbouring patches that belong to the same object,
+        then absorbs anything smaller than the requested minimum. Returns a
+        full-resolution int32 label map.
+        """
+        h, w = rgb.shape[:2]
+        detail = max(0, min(100, int(self.object_groups_detail)))
+        min_size = max(0, min(100, int(self.object_groups_min_size)))
+
+        scale = min(1.0, self._OBJECT_SEG_MAX_DIM / float(max(h, w)))
+        if scale < 1.0:
+            sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            small = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+        else:
+            sw, sh, small = w, h, rgb
+
+        # Flatten texture/noise but keep object silhouettes crisp: two cheap
+        # bilateral passes approximate the mean-shift look at a fraction of the
+        # cost. Low detail smooths harder, so fine surface variation stops
+        # spawning objects of its own.
+        sigma_color = float(np.interp(detail, [0, 100], [90.0, 25.0]))
+        smooth = cv2.bilateralFilter(small, 9, sigma_color, 9)
+        smooth = np.ascontiguousarray(cv2.bilateralFilter(smooth, 9, sigma_color, 9))
+
+        labels, count = self._seed_regions(smooth, cv2, np)
+        if count < 1:
+            return np.zeros((h, w), np.int32)
+
+        # Detail -> how far apart two touching areas must be to stay separate
+        # objects. High detail = tight tolerance = more, smaller objects.
+        tol = float(np.interp(detail, [0, 100], [72.0, 6.0]))
+        labels, count = self._merge_similar_neighbors(labels, count, smooth, tol, np)
+
+        # Minimum object size as a fraction of the frame (0 keeps every speck).
+        min_area = int((sw * sh) * ((min_size / 100.0) ** 2) * 0.05)
+        if min_area > 1 and count > 1:
+            labels = self._merge_small_objects(labels, count, smooth, min_area, cv2, np)
+
+        if scale < 1.0:
+            labels = cv2.resize(labels.astype(np.float32), (w, h),
+                                interpolation=cv2.INTER_NEAREST).astype(np.int32)
+        return labels
+
+    def _object_id_palette(self, count, cv2, np):
+        """Deterministic, well-separated ID colours (the cryptomatte look)."""
+        ids = np.arange(count, dtype=np.float32)
+        hue = np.mod(ids * 0.61803398875, 1.0) * 179.0  # golden-ratio hue spacing
+        hsv = np.stack([
+            hue.astype(np.uint8),
+            np.full(count, 190, np.uint8),
+            np.full(count, 235, np.uint8),
+        ], axis=1).reshape(1, count, 3)
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).reshape(count, 3)
+
+    def apply_object_groups(self, pixmap):
+        """Simplify the image object by object, cryptomatte style.
+
+        Where Color Groups collapses the whole image onto one global palette,
+        this segments it spatially first: every region gets its own id, so two
+        objects that happen to share a colour stay separate. Each region is then
+        filled flat with the mean of its *own* pixels, keeping local object
+        colour. ``object_groups_mode`` picks the look:
+
+          - local: each object flat-filled with its own average colour
+          - local_edges: the same, plus region outlines in the line colour
+          - id: random-but-stable ID colours (a literal cryptomatte matte)
+
+        ``object_groups_detail`` sets how finely the image is split and
+        ``object_groups_min_size`` merges regions below that size into their
+        neighbours. Alpha is preserved. Returns ``pixmap`` unchanged if
+        disabled, on error, or if OpenCV is missing.
+        """
+        try:
+            if not pixmap or pixmap.isNull() or not self.object_groups_enabled:
+                return pixmap
+
+            try:
+                import cv2
+            except ImportError:
+                # Graceful fallback: disable and inform the user once
+                self.object_groups_enabled = False
+                if getattr(self, 'object_groups_toggle_btn', None) is not None:
+                    self.object_groups_toggle_btn.blockSignals(True)
+                    self.object_groups_toggle_btn.setChecked(False)
+                    self.object_groups_toggle_btn.blockSignals(False)
+                self.statusBar().showMessage(
+                    "Object Groups requires opencv-python (pip install opencv-python)", 5000)
+                return pixmap
+
+            import numpy as np
+            image = pixmap.toImage()
+            if image.isNull():
+                return pixmap
+            if image.format() != QImage.Format.Format_RGBA8888:
+                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            w, h = image.width(), image.height()
+            if w < 2 or h < 2:
+                return pixmap
+            bpl = image.bytesPerLine()
+            ptr = image.constBits()
+            buf = bytes(ptr)[: bpl * h]
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+            rgb = np.ascontiguousarray(arr[:, :, :3])
+            alpha = arr[:, :, 3].copy()
+
+            labels = self._segment_objects(rgb, cv2, np)
+            flat_labels = labels.ravel()
+            count = int(flat_labels.max()) + 1
+
+            mode = self.object_groups_mode
+            if mode == "id":
+                lut = self._object_id_palette(count, cv2, np)
+            else:
+                # Per-region mean of the original pixels — the "local colour".
+                sizes = np.bincount(flat_labels, minlength=count).astype(np.float32)
+                sizes[sizes == 0] = 1.0
+                means = np.empty((count, 3), np.float32)
+                for c in range(3):
+                    means[:, c] = np.bincount(
+                        flat_labels, weights=rgb[:, :, c].ravel().astype(np.float32),
+                        minlength=count) / sizes
+                lut = np.clip(np.rint(means), 0, 255).astype(np.uint8)
+
+            out_rgb = lut[labels]
+
+            if mode == "local_edges":
+                boundary = np.zeros((h, w), bool)
+                boundary[:, 1:] |= labels[:, 1:] != labels[:, :-1]
+                boundary[1:, :] |= labels[1:, :] != labels[:-1, :]
+                lc = self.edge_color if self.edge_color is not None else self.line_color
+                out_rgb[boundary] = (lc.red(), lc.green(), lc.blue())
+
+            out = np.empty((h, w, 4), np.uint8)
+            out[:, :, :3] = out_rgb
+            out[:, :, 3] = alpha
+            out = np.ascontiguousarray(out)
+            qout = QImage(out.tobytes(), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            return QPixmap.fromImage(qout)
+        except Exception as e:
+            print(f"apply_object_groups error: {e}")
+            return pixmap
+
     def apply_edge_detection(self, pixmap):
         """Run Canny edge detection to reveal plane changes (art reference).
 
@@ -5294,7 +5683,7 @@ class RandomImageViewer(QMainWindow):
             # If an animated GIF is playing, update the QMovie source size
             # so frames are rendered at an appropriate resolution.
             # The frame callback (_on_gif_frame_changed) handles the rest.
-            if self.image_label.is_animation_playing():
+            if self.image_label.is_animation_active():
                 from PySide6.QtGui import QImageReader
                 reader = QImageReader(self.current_image)
                 gif_size = reader.size()
@@ -5302,6 +5691,8 @@ class RandomImageViewer(QMainWindow):
                     label_size = self.image_label.size()
                     scaled = gif_size.scaled(label_size, Qt.KeepAspectRatio)
                     self.image_label.update_animation_size(scaled)
+                    if self.image_label.is_animation_paused():
+                        self._redraw_paused_gif_frame()
                 return
             # Use smart zoom display to preserve LUT caching during resize
             self._smart_zoom_display()
@@ -5327,14 +5718,9 @@ class RandomImageViewer(QMainWindow):
         if self.show_history_checkbox.isChecked() and self.history_list.isVisible():
             try:
                 # Use faster thumbnail loading for large collections
-                reader = QImageReader(img_path)
-                if reader.canRead():
-                    # Scale down during read for much faster thumbnail creation
-                    reader.setScaledSize(QSize(40, 40))
-                    thumb_image = reader.read()
-                    if not thumb_image.isNull():
-                        thumb = QPixmap.fromImage(thumb_image)
-                        item.setIcon(thumb)
+                thumb = load_thumbnail_pixmap(img_path, 40)
+                if thumb:
+                    item.setIcon(thumb)
             except Exception:
                 # Skip thumbnail on error to avoid slowdown
                 pass
@@ -7720,6 +8106,55 @@ class RandomImageViewer(QMainWindow):
             if self.current_image:
                 self.display_image(self.current_image)
 
+    def _refresh_object_groups(self):
+        """Re-render only when the object-group effect is actually on."""
+        if self.object_groups_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def toggle_object_groups(self, checked):
+        """Enable/disable the Object Groups (cryptomatte-style) effect."""
+        self.object_groups_enabled = bool(checked)
+        if getattr(self, 'object_groups_toggle_btn', None) is not None:
+            self.object_groups_toggle_btn.blockSignals(True)
+            self.object_groups_toggle_btn.setChecked(self.object_groups_enabled)
+            self.object_groups_toggle_btn.blockSignals(False)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def set_object_groups_mode(self, mode):
+        """Set the Object Groups look (local/local_edges/id)."""
+        if mode not in ("local", "local_edges", "id"):
+            return
+        self.object_groups_mode = mode
+        for key, act in getattr(self, '_object_groups_mode_actions', {}).items():
+            act.blockSignals(True)
+            act.setChecked(key == mode)
+            act.blockSignals(False)
+        self._refresh_object_groups()
+
+    def update_object_groups_detail(self, value):
+        """Change the object detail level (0-100). Does not auto-enable."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.object_groups_detail = max(0, min(100, value))
+        self._refresh_object_groups()
+
+    def update_object_groups_min_size(self, value):
+        """Change the minimum object size (0-100). Does not auto-enable."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.object_groups_min_size = max(0, min(100, value))
+        self._refresh_object_groups()
+
     def toggle_edge_detection(self, checked):
         """Enable/disable the Canny edge-detection filter."""
         self.edge_detection_enabled = bool(checked)
@@ -7853,6 +8288,28 @@ class RandomImageViewer(QMainWindow):
             self.color_groups_field_spin.blockSignals(True)
             self.color_groups_field_spin.setValue(0)
             self.color_groups_field_spin.blockSignals(False)
+
+        # Reset Object Groups (cryptomatte-style per-object flattening)
+        self.object_groups_enabled = False
+        self.object_groups_detail = 45
+        self.object_groups_min_size = 12
+        self.object_groups_mode = "local"
+        for key, act in getattr(self, '_object_groups_mode_actions', {}).items():
+            act.blockSignals(True)
+            act.setChecked(key == "local")
+            act.blockSignals(False)
+        if getattr(self, 'object_groups_toggle_btn', None) is not None:
+            self.object_groups_toggle_btn.blockSignals(True)
+            self.object_groups_toggle_btn.setChecked(False)
+            self.object_groups_toggle_btn.blockSignals(False)
+        if getattr(self, 'object_groups_detail_spin', None) is not None:
+            self.object_groups_detail_spin.blockSignals(True)
+            self.object_groups_detail_spin.setValue(45)
+            self.object_groups_detail_spin.blockSignals(False)
+        if getattr(self, 'object_groups_min_spin', None) is not None:
+            self.object_groups_min_spin.blockSignals(True)
+            self.object_groups_min_spin.setValue(12)
+            self.object_groups_min_spin.blockSignals(False)
 
         # Reset Curves (classical RGB levels)
         self.curves_enabled = False
@@ -9189,6 +9646,9 @@ class RandomImageViewer(QMainWindow):
         # For animated GIFs the frame callback already handles zoom via _scale_pixmap;
         # nothing extra to do here — next frame will pick up the new zoom factor.
         if self.image_label.is_animation_playing():
+            return
+        if self.image_label.is_animation_paused():
+            self._redraw_paused_gif_frame()
             return
 
         # PDF only: schedule a sharper re-render of the page if we've zoomed in

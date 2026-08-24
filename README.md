@@ -10,6 +10,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added live free-line preview while placing 2-click line annotations.
 - Added posterize/value-filter controls for reducing images to N grayscale tones.
 - Added Canny-based edge detection with OpenCV support and adjustable sensitivity.
+- Added Object Groups — a cryptomatte-style pass that splits the image into objects and flattens each to its own local color.
 
 ## Features
 
@@ -37,6 +38,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🎨 **Floating palette panel** — resizable, draggable, persists across tool switches; swatches organized by extraction session
 - 🎞️ **CUBE LUT support** with GPU-accelerated (OpenCL) processing and adjustable strength
 - ◑ **Posterize/value filter** — reduce images to 2-10 grayscale tones for value studies
+- 🎨 **Color Groups** — reduce the whole image to N flat colors sampled from itself
+- 🧩 **Object Groups** — cryptomatte-style: segments the image into objects and flattens each to its *own* local color, so two objects sharing a color stay separate. Local colors, local colors + outlines, or random ID colors; adjustable detail and minimum object size
 - 📐 **Edge detection** with Canny filtering and multiple display modes
 - Grayscale, contrast, and gamma sliders with per-effect toggles
 

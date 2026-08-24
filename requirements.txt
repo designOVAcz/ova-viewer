@@ -2,3 +2,4 @@ PySide6>=6.0
 PyMuPDF>=1.20
 rarfile>=4
 opencv-python>=4.5
+Pillow>=9.0

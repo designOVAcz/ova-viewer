@@ -197,13 +197,27 @@ class ImageLabel(QLabel):
         return original_x, original_y
 
     def update_animation_size(self, scaled_size):
-        """Update the scaled size of the running animation (e.g. on resize)"""
-        if self._current_movie is not None and self._current_movie.state() == QMovie.Running:
+        """Update the scaled size of the running/paused animation (e.g. on resize)"""
+        if self._current_movie is not None and self._current_movie.state() in (QMovie.Running, QMovie.Paused):
             self._current_movie.setScaledSize(scaled_size)
 
     def is_animation_playing(self):
         """Return True if an animated GIF is currently playing"""
         return self._current_movie is not None and self._current_movie.state() == QMovie.Running
+
+    def is_animation_active(self):
+        """Return True if an animated GIF is currently loaded (playing or paused)"""
+        return self._current_movie is not None
+
+    def is_animation_paused(self):
+        """Return True if the loaded animated GIF is paused"""
+        return self._current_movie is not None and self._current_movie.state() == QMovie.Paused
+
+    def gif_toggle_play_pause(self):
+        """Toggle play/pause state of the currently loaded animated GIF"""
+        if self._current_movie is None:
+            return
+        self._current_movie.setPaused(self._current_movie.state() == QMovie.Running)
 
     # ── Video playback ──────────────────────────────────────────────
 
@@ -1033,6 +1047,15 @@ class ImageLabel(QLabel):
         goto_action = QAction("Go to Image…  (Ctrl+G)", self)
         goto_action.triggered.connect(self.parent_viewer._go_to_image_or_page)
         menu.addAction(goto_action)
+
+        # --- GIF pause/resume (only when an animated GIF is loaded) ---
+        if self.is_animation_active():
+            menu.addSeparator()
+            paused = self.is_animation_paused()
+            gif_pause_action = QAction("Resume GIF" if paused else "Pause GIF", self)
+            gif_pause_action.setShortcut("Space")
+            gif_pause_action.triggered.connect(self.gif_toggle_play_pause)
+            menu.addAction(gif_pause_action)
 
         # --- Subtitles (only when a video with a loaded .srt is playing) ---
         if (hasattr(self.parent_viewer, 'has_video_subtitles') and

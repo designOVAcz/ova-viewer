@@ -3,7 +3,7 @@ import re
 import time
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPixmap, QPainter, QFont, QIcon, QImageReader
+from PySide6.QtGui import QPixmap, QPainter, QFont, QIcon, QImageReader, QImage
 from PySide6.QtCore import Qt, QSize, QObject, Signal
 
 from random_image_viewer.constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS, PLAYLIST_EXTENSIONS
@@ -121,6 +121,48 @@ def get_image_file_size(file_path):
         return 0
 
 
+def _load_pixmap_via_pillow(file_path, max_dimension=None):
+    """Fallback loader for image formats QImageReader can't decode (e.g.
+    JPEG 2000 / .jp2, .j2k), using Pillow's openjpeg codec instead."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, "Cannot read image format"
+    try:
+        with Image.open(file_path) as pil_img:
+            pil_img = pil_img.convert('RGBA')
+            if max_dimension:
+                w, h = pil_img.size
+                if w > max_dimension or h > max_dimension:
+                    scale = max_dimension / max(w, h)
+                    pil_img = pil_img.resize(
+                        (max(1, round(w * scale)), max(1, round(h * scale))),
+                        Image.LANCZOS)
+            data = pil_img.tobytes('raw', 'RGBA')
+            qimage = QImage(data, pil_img.width, pil_img.height, QImage.Format_RGBA8888).copy()
+        if qimage.isNull():
+            return None, "Failed to load image"
+        return QPixmap.fromImage(qimage), None
+    except Exception as e:
+        return None, f"Error loading image: {str(e)}"
+
+
+def load_thumbnail_pixmap(file_path, size=40):
+    """Load a small square-fit thumbnail pixmap, with a Pillow fallback for
+    formats QImageReader can't decode (e.g. .jp2). Returns None on failure."""
+    try:
+        reader = QImageReader(file_path)
+        if reader.canRead():
+            reader.setScaledSize(QSize(size, size))
+            thumb_image = reader.read()
+            if not thumb_image.isNull():
+                return QPixmap.fromImage(thumb_image)
+    except Exception:
+        pass
+    pixmap, _ = _load_pixmap_via_pillow(file_path, size)
+    return pixmap
+
+
 def smart_load_pixmap(file_path, max_dimension=2048):
     """Load pixmap with smart downscaling for better performance"""
     try:
@@ -130,7 +172,8 @@ def smart_load_pixmap(file_path, max_dimension=2048):
         # Use QImageReader for better control over loading
         reader = QImageReader(file_path)
         if not reader.canRead():
-            return None, f"Cannot read image format"
+            # Qt has no plugin for this format (e.g. JPEG 2000) — try Pillow.
+            return _load_pixmap_via_pillow(file_path, max_dimension)
 
         # Get original size without loading the full image
         original_size = reader.size()
