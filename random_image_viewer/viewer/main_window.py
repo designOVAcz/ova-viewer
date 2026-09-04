@@ -47,6 +47,7 @@ from random_image_viewer.widgets.enhancement_widget import ResponsiveEnhancement
 from random_image_viewer.widgets.color_snap_preview import ColorSnapPreview
 from random_image_viewer.widgets.snapped_palette_window import SnappedPaletteWindow
 from random_image_viewer.widgets.curves_window import CurvesWindow
+from random_image_viewer.widgets.type_filter_window import TypeFilterWindow
 from random_image_viewer.widgets.floating_panel import FloatingPanel
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
 
@@ -941,7 +942,11 @@ class RandomImageViewer(QMainWindow):
         self.setAcceptDrops(True)
         
         self.folder = None
-        self.images = []
+        self.images = []            # Browsing list AFTER the file-type filter
+        self._all_items = []        # Every scanned item, before filtering
+        self._hidden_types = set()  # Extensions hidden via the File Types panel
+        self._type_filter_window = None
+        self._type_filter_window_pos = None  # session-only memory of last drag pos
         self.history = []
         self.current_image = None
         self.current_index = -1
@@ -1150,9 +1155,16 @@ class RandomImageViewer(QMainWindow):
         # GPU acceleration - initialized lazily on first use to avoid 30s startup delay
         self.gpu_processor = GPULutProcessor()
 
+        # Autoplay-on-end: advance to the next item when a video or animated
+        # GIF finishes, so clips play back to back. Off by default.
+        self.autoplay_next_enabled = False
+        self._autoplay_advancing = False   # re-entrancy guard while switching
+        self._gif_prev_frame = -1          # last GIF frame seen (loop detection)
+        self._gif_started_at = 0.0         # monotonic time the GIF pass began
+
         # Video playback state
         self._video_playing = False
-        self._video_muted = False
+        self._video_muted = True   # Videos start silent; unmuting sticks for the session
         self._video_volume = 50  # 0-100
 
         # Subtitle (.srt) state for video playback
@@ -1686,11 +1698,17 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.sort_order_button = QToolButton(); self.sort_order_button.setCheckable(True); self.sort_order_button.setChecked(True); self.sort_order_button.setText("🔀"); self.sort_order_button.setToolTip("Toggle Random/Alphabetical Order"); self.sort_order_button.setFixedSize(24,24); self.sort_order_button.toggled.connect(self.toggle_sort_order); toolbar.addWidget(self.sort_order_button)
         add_spacer(2)
+        # File Types palette: per-extension checkboxes that filter what you browse
+        self.type_filter_btn = QToolButton(); self.type_filter_btn.setText("🗂"); self.type_filter_btn.setToolTip("File Types: show only the file types you check (e.g. only MP4 or GIF)"); self.type_filter_btn.setCheckable(True); self.type_filter_btn.setFixedSize(24,24); self.type_filter_btn.toggled.connect(self._toggle_type_filter_window); toolbar.addWidget(self.type_filter_btn)
+        add_spacer(2)
         self.timer_button = QToolButton(); self.timer_button.setCheckable(True); self.timer_button.setText("⚡"); self.timer_button.setToolTip("Toggle Auto Advance"); self.timer_button.setFixedSize(24,24); self.timer_button.toggled.connect(self.toggle_timer); toolbar.addWidget(self.timer_button)
         add_spacer(2)
         self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(44); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
         add_spacer(2)
         self.circle_timer = CircularCountdown(self.timer_spin.value()); self.circle_timer.set_parent_viewer(self); toolbar.addWidget(self.circle_timer)
+        add_spacer(2)
+        # Autoplay next: when a video / animated GIF ends, move to the next item
+        self.autoplay_next_btn = QToolButton(); self.autoplay_next_btn.setText("⏭"); self.autoplay_next_btn.setToolTip("Autoplay next: when a video or animated GIF finishes, advance to the next item"); self.autoplay_next_btn.setCheckable(True); self.autoplay_next_btn.setChecked(self.autoplay_next_enabled); self.autoplay_next_btn.setFixedSize(24,24); self.autoplay_next_btn.toggled.connect(self.toggle_autoplay_next); toolbar.addWidget(self.autoplay_next_btn)
         add_section_divider()
 
         # ── PDF page navigation (hidden until a PDF is loaded) ──
@@ -1784,8 +1802,8 @@ class RandomImageViewer(QMainWindow):
         vc_layout.addWidget(self._video_total_label)
 
         self._video_mute_btn = QToolButton()
-        self._video_mute_btn.setText("🔊")
-        self._video_mute_btn.setToolTip("Mute")
+        self._video_mute_btn.setText("🔇" if self._video_muted else "🔊")
+        self._video_mute_btn.setToolTip("Unmute" if self._video_muted else "Mute")
         self._video_mute_btn.setFixedSize(24, 24)
         self._video_mute_btn.clicked.connect(self._toggle_video_mute)
         vc_layout.addWidget(self._video_mute_btn)
@@ -1850,8 +1868,8 @@ class RandomImageViewer(QMainWindow):
         groups = [
             ("FILE / NAV", [
                 'open_btn', 'delete_file_btn', 'save_btn',
-                'prev_btn', 'next_btn', 'sort_order_button',
-                'timer_button', 'timer_spin', 'circle_timer',
+                'prev_btn', 'next_btn', 'sort_order_button', 'type_filter_btn',
+                'timer_button', 'timer_spin', 'circle_timer', 'autoplay_next_btn',
             ]),
             ("DRAW", [
                 'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn',
@@ -2454,8 +2472,13 @@ class RandomImageViewer(QMainWindow):
 
     def _update_title(self):
         count = len(self.images)
+        total = len(self._all_items)
         folder_name = os.path.basename(self.folder) if self.folder else ""
-        self.setWindowTitle(f"Ova Viewer - {folder_name} ({count} images found)")
+        if total and count != total:
+            self.setWindowTitle(
+                f"Ova Viewer - {folder_name} ({count} of {total} files shown)")
+        else:
+            self.setWindowTitle(f"Ova Viewer - {folder_name} ({count} images found)")
 
     def update_image_info(self, img_path=None):
         if img_path is None or not os.path.exists(img_path):
@@ -2592,6 +2615,7 @@ class RandomImageViewer(QMainWindow):
                     player.durationChanged.connect(self._on_video_duration_changed)
                     player.positionChanged.connect(self._on_video_position_changed)
                     player.playbackStateChanged.connect(self._on_video_state_changed)
+                    player.mediaStatusChanged.connect(self._on_video_media_status)
                 except RuntimeError:
                     pass
                 self._video_controls_widget.show()
@@ -2799,6 +2823,104 @@ class RandomImageViewer(QMainWindow):
             self._subtitles_enabled = bool(checked)
         self._redraw_video_subtitle()
 
+    # ── Autoplay next (advance when a video / GIF ends) ────────────────
+
+    # A very short looping GIF would otherwise flash past; keep it on screen at
+    # least this long before its completed loop counts as "ended".
+    _GIF_MIN_DWELL_S = 1.5
+
+    def toggle_autoplay_next(self, checked):
+        """Enable/disable advancing when a video or animated GIF ends."""
+        self.autoplay_next_enabled = bool(checked)
+        btn = getattr(self, "autoplay_next_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(self.autoplay_next_enabled)
+            btn.blockSignals(False)
+        self._reset_gif_loop_tracking()
+        if self.autoplay_next_enabled:
+            self.status.showMessage(
+                "Autoplay next: on — videos and GIFs advance when they finish.")
+        else:
+            self.status.showMessage("Autoplay next: off.")
+
+    def _reset_gif_loop_tracking(self):
+        """Start GIF loop detection over for a freshly started animation."""
+        self._gif_prev_frame = -1
+        self._gif_started_at = time.monotonic()
+
+    def _on_video_media_status(self, status):
+        """Slot: QMediaPlayer status changed. EndOfMedia means the clip ended.
+
+        EndOfMedia is used rather than a Stopped playback state because
+        stopping happens on manual stop and on teardown too, which must not
+        trigger an advance.
+        """
+        from PySide6.QtMultimedia import QMediaPlayer
+        if status != QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        if not self.autoplay_next_enabled:
+            return
+        self._autoplay_advance()
+
+    def _check_gif_loop_complete(self, movie, frame_number):
+        """Advance when an animated GIF completes a full pass.
+
+        Most GIFs declare an infinite loop count, so QMovie never emits
+        finished(). A wrap of the frame counter back towards the start is the
+        reliable end-of-pass signal for both finite and infinite loops.
+        """
+        previous = self._gif_prev_frame
+        self._gif_prev_frame = frame_number
+        if previous < 0 or frame_number >= previous:
+            return
+        # Single-frame files are not really animations; leave them alone.
+        if movie.frameCount() == 1:
+            return
+        if time.monotonic() - self._gif_started_at < self._GIF_MIN_DWELL_S:
+            # Too quick to be watchable — let it keep looping and re-check on
+            # the next pass.
+            self._gif_prev_frame = -1
+            return
+        self._autoplay_advance()
+
+    def _autoplay_advance(self):
+        """Move to the next playlist item because the current media ended."""
+        if self._autoplay_advancing:
+            return
+        if not self.images:
+            return
+        self._autoplay_advancing = True
+        try:
+            self._reset_gif_loop_tracking()
+            self._auto_advance_next()
+        finally:
+            self._autoplay_advancing = False
+
+    def _media_holds_auto_advance(self):
+        """True while playing media should hold the auto-advance countdown.
+
+        With autoplay-on-end enabled, a running video or GIF decides when to
+        move on, so the timer must not cut it off mid-clip.
+        """
+        if not self.autoplay_next_enabled:
+            return False
+        label = getattr(self, "image_label", None)
+        if label is None:
+            return False
+        if label.is_animation_playing():
+            return True
+        if not self._video_playing:
+            return False
+        player = getattr(label, "_media_player", None)
+        if player is None:
+            return False
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+            return player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        except Exception:
+            return False
+
     def _on_video_state_changed(self, state):
         from PySide6.QtMultimedia import QMediaPlayer
         if hasattr(self, '_video_play_btn'):
@@ -2878,6 +3000,7 @@ class RandomImageViewer(QMainWindow):
         self.current_image = img_path
 
         if self.image_label.start_animation(img_path, scaled):
+            self._reset_gif_loop_tracking()
             self.update_image_info(img_path)
             self.set_status_path(img_path)
         else:
@@ -2909,6 +3032,9 @@ class RandomImageViewer(QMainWindow):
         movie = self.image_label._current_movie
         if movie is None:
             return
+
+        if self.autoplay_next_enabled:
+            self._check_gif_loop_complete(movie, _frame_number)
 
         frame_pixmap = movie.currentPixmap()
         if frame_pixmap.isNull():
@@ -5854,6 +5980,12 @@ class RandomImageViewer(QMainWindow):
             self.circle_timer.set_remaining_time(0)
             return
         
+        # A video / GIF that will advance itself keeps the countdown parked,
+        # so a short interval can't cut a long clip short.
+        if self._media_holds_auto_advance():
+            self._update_ring()
+            return
+
         # Don't decrease timer if paused
         if not self._timer_paused:
             self.timer_remaining -= 1
@@ -10794,6 +10926,12 @@ class RandomImageViewer(QMainWindow):
         # Remove from playlist list
         if idx >= 0:
             images.pop(idx)
+        try:
+            all_idx = self._all_items.index(file_path)
+        except ValueError:
+            all_idx = -1
+        if all_idx >= 0:
+            self._all_items.pop(all_idx)
 
         # Clean from history
         self.history = [p for p in self.history if p != file_path]
@@ -10807,8 +10945,12 @@ class RandomImageViewer(QMainWindow):
             # Restore to playlist and report failure
             if idx >= 0:
                 images.insert(idx, file_path)
+            if all_idx >= 0:
+                self._all_items.insert(all_idx, file_path)
             self.statusBar().showMessage(f"Failed to move to Recycle Bin: {file_name}", 4000)
             return
+
+        self._refresh_type_filter_panel()
 
         self.statusBar().showMessage(f"Moved to Recycle Bin: {file_name}", 3000)
         self.current_image = None
@@ -11087,7 +11229,10 @@ class RandomImageViewer(QMainWindow):
             # Load the parent folder so navigation works
             parent_folder = os.path.dirname(file_path)
             self.folder = parent_folder
-            self.images = get_images_in_folder(parent_folder)
+            # Opening a file explicitly is a request to see it, so make sure its
+            # own type is visible rather than filtering the thing just opened.
+            self._hidden_types.discard(ext)
+            self._set_playlist_items(get_images_in_folder(parent_folder))
             self.history.clear()
             self.history_list.clear()
             self.history_list.repaint()
@@ -11116,6 +11261,174 @@ class RandomImageViewer(QMainWindow):
             return self._load_playlist([file_path], source=source)
 
         return False
+
+    # ── File-type filter (File Types palette) ──────────────────────────
+
+    @staticmethod
+    def _item_type(path):
+        """Lowercase extension used as the filter key (".mp4", ".gif", …)."""
+        return os.path.splitext(path or "")[1].lower()
+
+    def _playlist_type_counts(self):
+        """Map every extension in the unfiltered playlist to its file count."""
+        counts = {}
+        for path in self._all_items:
+            ext = self._item_type(path)
+            if ext:
+                counts[ext] = counts.get(ext, 0) + 1
+        return counts
+
+    def _rebuild_filtered_items(self):
+        """Recompute self.images from self._all_items and the hidden-type set.
+
+        Every navigation path (random, sequential, prev/next, go-to-number,
+        delete) already reads self.images, so applying a filter is just a
+        matter of installing a narrower list here.
+        """
+        if self._hidden_types:
+            hidden = self._hidden_types
+            self.images = [path for path in self._all_items
+                           if self._item_type(path) not in hidden]
+        else:
+            self.images = list(self._all_items)
+
+    def _set_playlist_items(self, items):
+        """Install a freshly scanned playlist and apply the current filter.
+
+        Callers load their first item from self.images afterwards, so this
+        deliberately does not navigate on its own.
+        """
+        self._all_items = list(items)
+        # Forget hidden types the new playlist has none of, so a folder can
+        # never carry an invisible filter for files it does not contain.
+        self._hidden_types &= set(self._playlist_type_counts())
+        self._rebuild_filtered_items()
+        self._refresh_type_filter_panel()
+
+    def _apply_type_filter(self):
+        """React to a filter change: narrow the list, then re-anchor the view."""
+        previous = self.current_image
+        self._rebuild_filtered_items()
+        self._refresh_type_filter_panel()
+        self._update_title()
+
+        if not self._all_items:
+            return
+        if not self.images:
+            # Everything is hidden. Leave the current item on screen rather
+            # than blanking the window, and say why browsing stopped.
+            self.status.showMessage(
+                "All file types are hidden — check a type to browse again.")
+            return
+        if previous is not None and previous in self.images:
+            self._show_filter_status()
+            return
+
+        # The item on screen no longer passes the filter, so move to one that
+        # does, honouring the current random/sequential mode.
+        if self.random_mode:
+            self.show_random_image()
+        else:
+            self._load_playlist_item(self.images[0])
+        self._show_filter_status()
+
+    def _show_filter_status(self):
+        """Report the active filter in the status bar."""
+        total = len(self._all_items)
+        shown = len(self.images)
+        if shown == total:
+            self.status.showMessage(f"Showing all {total:,} files.")
+        else:
+            kinds = ", ".join(sorted(
+                ext.lstrip(".").upper() for ext in self._playlist_type_counts()
+                if ext not in self._hidden_types))
+            self.status.showMessage(
+                f"Showing {shown:,} of {total:,} files ({kinds or 'none'}).")
+
+    def _refresh_type_filter_panel(self):
+        """Push the current type counts / checked state into the panel."""
+        win = getattr(self, "_type_filter_window", None)
+        if win is None:
+            return
+        win.set_types(self._playlist_type_counts(), self._hidden_types)
+        win.set_summary(len(self.images), len(self._all_items))
+
+    def _on_hidden_types_changed(self, hidden):
+        """Slot: the panel's checkboxes changed."""
+        self._hidden_types = {str(ext).lower() for ext in hidden}
+        self._apply_type_filter()
+
+    def _ensure_type_filter_window(self):
+        """Lazy-create the File Types panel and wire its signals."""
+        if self._type_filter_window is None:
+            win = TypeFilterWindow(self)
+            win.types_changed.connect(self._on_hidden_types_changed)
+            win.closed.connect(self._on_type_filter_window_closed)
+            self._type_filter_window = win
+            self._refresh_type_filter_panel()
+        return self._type_filter_window
+
+    def _toggle_type_filter_window(self, checked):
+        """Show/hide the File Types panel from the toolbar button."""
+        if checked:
+            self._show_type_filter_window()
+        else:
+            self._hide_type_filter_window()
+
+    def _show_type_filter_window(self):
+        """Show the panel near its toolbar button on first open."""
+        win = self._ensure_type_filter_window()
+        self._refresh_type_filter_panel()
+        if win.isVisible():
+            win.raise_()
+            return
+        target = self._type_filter_window_pos
+        if target is None:
+            btn = getattr(self, "type_filter_btn", None)
+            if btn is not None:
+                try:
+                    from PySide6.QtCore import QPoint
+                    target = btn.mapToGlobal(btn.rect().bottomLeft()) + QPoint(0, 4)
+                except Exception:
+                    target = None
+        if target is not None:
+            try:
+                from PySide6.QtGui import QGuiApplication
+                scr = QGuiApplication.screenAt(target) or QGuiApplication.primaryScreen()
+                geom = scr.availableGeometry()
+                w = win.sizeHint().width() or win.width() or 200
+                h = win.sizeHint().height() or win.height() or 220
+                x = max(geom.left(), min(target.x(), geom.right() - w))
+                y = max(geom.top(), min(target.y(), geom.bottom() - h))
+                win.move(x, y)
+            except Exception:
+                win.move(target)
+        win.show()
+        win.raise_()
+
+    def _hide_type_filter_window(self):
+        """Hide the panel; remember its position."""
+        win = getattr(self, "_type_filter_window", None)
+        if win is not None and win.isVisible():
+            try:
+                self._type_filter_window_pos = win.pos()
+            except Exception:
+                pass
+            win.hide()
+
+    def _on_type_filter_window_closed(self):
+        """Handle the panel's close button: remember pos, un-check the toolbar."""
+        win = getattr(self, "_type_filter_window", None)
+        if win is not None:
+            try:
+                self._type_filter_window_pos = win.pos()
+            except Exception:
+                pass
+        btn = getattr(self, "type_filter_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
 
     # ── Mixed playlist (folder / multi-drop with images + docs) ─────────
 
@@ -11251,7 +11564,7 @@ class RandomImageViewer(QMainWindow):
             return False
 
         self.folder = first_folder
-        self.images = items
+        self._set_playlist_items(items)
         self.history.clear()
         self.history_list.clear()
         self.history_list.repaint()
@@ -11260,15 +11573,27 @@ class RandomImageViewer(QMainWindow):
         self.update_image_info()
         self._update_title()
 
+        if not self.images:
+            # The scan found files, but every type in it is unchecked.
+            msg = (f"Loaded {len(items):,} items ({source}), but all their file "
+                   "types are hidden — check a type in the File Types panel.")
+            self.image_label.setText("All file types are hidden.")
+            self.status.showMessage(msg)
+            return True
+
         if self.random_mode:
             self.show_random_image()
         else:
             self._load_playlist_item(self.images[0])
 
         self._reset_timer()
-        self.status.showMessage(
-            f"Loaded {len(items):,} items ({source})."
-        )
+        if len(self.images) == len(items):
+            self.status.showMessage(f"Loaded {len(items):,} items ({source}).")
+        else:
+            self.status.showMessage(
+                f"Loaded {len(items):,} items ({source}) — showing "
+                f"{len(self.images):,} after the file-type filter."
+            )
         return True
 
     def _load_playlist_item(self, path, jump_to_last_page=False, update_history=True):
@@ -11448,7 +11773,7 @@ class RandomImageViewer(QMainWindow):
         if not from_playlist:
             # Reset viewer state (standalone document mode)
             self.folder = None
-            self.images = []
+            self._set_playlist_items([])
             self.history.clear()
             self.history_list.clear()
             self.history_list.repaint()
@@ -11751,7 +12076,7 @@ class RandomImageViewer(QMainWindow):
         if not from_playlist:
             # Reset viewer state (standalone document mode)
             self.folder = None
-            self.images = []
+            self._set_playlist_items([])
             self.history.clear()
             self.history_list.clear()
             self.history_list.repaint()
@@ -11863,7 +12188,7 @@ class RandomImageViewer(QMainWindow):
         if not from_playlist:
             # Reset viewer state (standalone document mode)
             self.folder = None
-            self.images = []
+            self._set_playlist_items([])
             self.history.clear()
             self.history_list.clear()
             self.history_list.repaint()

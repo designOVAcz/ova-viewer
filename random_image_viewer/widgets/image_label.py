@@ -238,6 +238,10 @@ class ImageLabel(QLabel):
         player.setVideoOutput(sink)
         player.setAudioOutput(audio)
         audio.setVolume(0.5)
+        # Set the mute state before play() so a video can never blurt out a
+        # frame of sound before the viewer re-applies its stored state below.
+        # Default is muted; whatever the user chose this session wins.
+        audio.setMuted(bool(getattr(self.parent_viewer, '_video_muted', True)))
 
         # Connect frame signal to parent viewer
         if self.parent_viewer and hasattr(self.parent_viewer, '_on_video_frame_changed'):

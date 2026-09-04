@@ -11,6 +11,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added posterize/value-filter controls for reducing images to N grayscale tones.
 - Added Canny-based edge detection with OpenCV support and adjustable sensitivity.
 - Added Object Groups — a cryptomatte-style pass that splits the image into objects and flattens each to its own local color.
+- Added a File Types palette that filters browsing to the file types you check (e.g. only MP4 or GIF).
+- Added autoplay-next so videos and animated GIFs advance to the following item when they finish.
 
 ## Features
 
@@ -21,8 +23,10 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🔄 Rotate, flip horizontal/vertical
 - 🖥️ Fullscreen (F11) and minimal/frameless mode
 - 🕒 Auto-advance timer with circular countdown overlay
+- ⏭ **Autoplay next** — when a video or animated GIF finishes, move on to the next item automatically (holds the auto-advance countdown so a long clip is never cut short)
 - ⏮️ History navigation (back/forward through viewed images)
 - 🔀 Random or alphabetical sorting
+- 🗂 **File Types palette** — lists every file type found in the loaded folder with a checkbox and file count; uncheck a type to skip it while browsing (all types shown by default)
 
 **Annotation**
 - 📏 Vertical, horizontal, and free-angle line tools
