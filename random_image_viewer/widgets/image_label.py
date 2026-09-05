@@ -20,6 +20,11 @@ class ImageLabel(QLabel):
         self._video_sink = None
         self._audio_output = None
         self._video_last_frame_time = 0  # for frame throttling
+        # External ("dub") soundtrack: a sibling audio file played in place of
+        # the video's own track. See _start_dub_audio().
+        self._dub_player = None
+        self._dub_audio_output = None
+        self._dub_path = None
 
         # PEN PRESSURE: Start with tablet tracking disabled to allow normal UI interaction
         # It will be enabled only when free draw mode is active
@@ -253,9 +258,109 @@ class ImageLabel(QLabel):
         self._audio_output = audio
         self._video_last_frame_time = 0
 
+        # Swap in a sibling audio file as the soundtrack, if enabled and present
+        self._start_dub_audio(file_path, player, audio)
+
         player.setSource(QUrl.fromLocalFile(file_path))
         player.play()
         return True
+
+    # Re-seek the dub only past this much drift: smaller offsets are inaudible
+    # and every correction is an audible click.
+    _DUB_SYNC_TOLERANCE_MS = 300
+
+    def _start_dub_audio(self, video_path, player, video_audio):
+        """Play a sibling audio file instead of the video's own track.
+
+        Looks for a file with the same stem (``clip.mp4`` -> ``clip.mp3``) and,
+        when found, silences the video's audio and drives a second, audio-only
+        QMediaPlayer alongside it. The two are held together by mirroring
+        play/pause/stop and by correcting drift on the video's position signal,
+        so scrubbing and stepping stay in sync the way VLC's external audio
+        track does. No-ops unless the viewer has the feature enabled.
+        """
+        viewer = self.parent_viewer
+        if not getattr(viewer, 'dub_audio_enabled', False):
+            return
+        try:
+            from random_image_viewer.image_utils import find_dub_audio_file
+            dub_path = find_dub_audio_file(video_path)
+        except Exception:
+            return
+        if not dub_path:
+            return
+
+        from PySide6.QtCore import QUrl
+        dub_player = QMediaPlayer(self)
+        dub_audio = QAudioOutput(self)
+        dub_player.setAudioOutput(dub_audio)
+        dub_audio.setVolume(video_audio.volume())
+        dub_audio.setMuted(video_audio.isMuted())
+        # The file's own track would double up with the dub — silence it for
+        # as long as the dub is attached.
+        video_audio.setMuted(True)
+        dub_player.setSource(QUrl.fromLocalFile(dub_path))
+
+        self._dub_player = dub_player
+        self._dub_audio_output = dub_audio
+        self._dub_path = dub_path
+        player.positionChanged.connect(self._sync_dub_position)
+        player.playbackStateChanged.connect(self._sync_dub_state)
+        dub_player.play()
+
+    def has_dub_audio(self):
+        """True while an external audio track is driving this video."""
+        return self._dub_player is not None
+
+    def dub_audio_path(self):
+        """Path of the attached external audio track, or None."""
+        return self._dub_path
+
+    def _sync_dub_position(self, position_ms):
+        """Hold the dub track to the video's clock (drift, seeks, steps)."""
+        dub = self._dub_player
+        if dub is None:
+            return
+        duration = dub.duration()
+        if duration > 0 and position_ms > duration:
+            # Dub is shorter than the picture: fall silent rather than seek
+            # past its end and have it wrap.
+            if dub.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                dub.pause()
+            return
+        if abs(dub.position() - int(position_ms)) <= self._DUB_SYNC_TOLERANCE_MS:
+            return
+        dub.setPosition(int(position_ms))
+        if (self._media_player is not None
+                and self._media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                and dub.playbackState() != QMediaPlayer.PlaybackState.PlayingState):
+            dub.play()
+
+    def _sync_dub_state(self, state):
+        """Mirror the video's play/pause/stop onto the dub track."""
+        dub = self._dub_player
+        if dub is None:
+            return
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            dub.play()
+        elif state == QMediaPlayer.PlaybackState.PausedState:
+            dub.pause()
+        else:
+            dub.stop()
+
+    def _stop_dub_audio(self):
+        """Tear down the external audio track, if any."""
+        if self._dub_player is None:
+            self._dub_path = None
+            return
+        self._dub_player.stop()
+        self._dub_player.setAudioOutput(None)
+        self._dub_player.deleteLater()
+        if self._dub_audio_output is not None:
+            self._dub_audio_output.deleteLater()
+        self._dub_player = None
+        self._dub_audio_output = None
+        self._dub_path = None
 
     def stop_video(self):
         """Stop and clean up any running video playback"""
@@ -266,6 +371,14 @@ class ImageLabel(QLabel):
                     self._video_sink.videoFrameChanged.disconnect()
             except RuntimeError:
                 pass
+            if self._dub_player is not None:
+                for signal, slot in ((self._media_player.positionChanged, self._sync_dub_position),
+                                     (self._media_player.playbackStateChanged, self._sync_dub_state)):
+                    try:
+                        signal.disconnect(slot)
+                    except (RuntimeError, TypeError):
+                        pass
+            self._stop_dub_audio()
             self._media_player.setVideoOutput(None)
             self._media_player.setAudioOutput(None)
             self._media_player.deleteLater()
@@ -293,14 +406,24 @@ class ImageLabel(QLabel):
     def video_seek(self, position_ms):
         if self._media_player is not None:
             self._media_player.setPosition(int(position_ms))
+        # Mirror the seek straight onto the dub instead of waiting for the
+        # drift check, so scrubbing lands both tracks together.
+        if self._dub_player is not None:
+            self._dub_player.setPosition(int(position_ms))
 
     def video_set_volume(self, value):
-        """Set volume 0-100 int → 0.0-1.0 float"""
-        if self._audio_output is not None:
-            self._audio_output.setVolume(value / 100.0)
+        """Set volume 0-100 int → 0.0-1.0 float (the dub track when one is on)"""
+        output = self._dub_audio_output or self._audio_output
+        if output is not None:
+            output.setVolume(value / 100.0)
 
     def video_set_muted(self, muted):
-        if self._audio_output is not None:
+        if self._dub_audio_output is not None:
+            self._dub_audio_output.setMuted(muted)
+            # The file's own track stays silent for as long as the dub plays.
+            if self._audio_output is not None:
+                self._audio_output.setMuted(True)
+        elif self._audio_output is not None:
             self._audio_output.setMuted(muted)
 
     def event(self, event):

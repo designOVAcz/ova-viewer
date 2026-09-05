@@ -59,6 +59,40 @@ def find_subtitle_file(video_path):
     return None
 
 
+# Sibling soundtrack formats, most likely first. A dub is normally an .mp3,
+# but matching the other common containers costs one stat call each.
+DUB_AUDIO_EXTENSIONS = ('.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus')
+
+
+def find_dub_audio_file(video_path):
+    """Return a sibling audio file with the same stem as *video_path*, or None.
+
+    ``clip.mp4`` picks up ``clip.mp3`` — the VLC-style external audio track.
+    Windows filesystems are case-insensitive, so :func:`os.path.isfile` already
+    matches any spelling there; elsewhere fall back to a single directory scan.
+    Kept deliberately cheap: this runs for every video that opens while the
+    feature is on.
+    """
+    if not video_path:
+        return None
+    base = os.path.splitext(video_path)[0]
+    for ext in DUB_AUDIO_EXTENSIONS:
+        if os.path.isfile(base + ext):
+            return base + ext
+    if os.name == 'nt':
+        return None
+    try:
+        folder = os.path.dirname(video_path) or '.'
+        stem = os.path.basename(base).lower()
+        for name in sorted(os.listdir(folder)):
+            root, ext = os.path.splitext(name.lower())
+            if root == stem and ext in DUB_AUDIO_EXTENSIONS:
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
+
 def _srt_to_ms(h, m, s, frac):
     frac = (frac + '000')[:3]
     return ((int(h) * 60 + int(m)) * 60 + int(s)) * 1000 + int(frac)

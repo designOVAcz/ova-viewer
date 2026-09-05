@@ -13,6 +13,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added Object Groups — a cryptomatte-style pass that splits the image into objects and flattens each to its own local color.
 - Added a File Types palette that filters browsing to the file types you check (e.g. only MP4 or GIF).
 - Added autoplay-next so videos and animated GIFs advance to the following item when they finish.
+- Added dub audio: play a sibling audio file (clip.mp4 → clip.mp3) in place of a video's own soundtrack, kept in sync while seeking.
 
 ## Features
 
@@ -24,6 +25,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🖥️ Fullscreen (F11) and minimal/frameless mode
 - 🕒 Auto-advance timer with circular countdown overlay
 - ⏭ **Autoplay next** — when a video or animated GIF finishes, move on to the next item automatically (holds the auto-advance countdown so a long clip is never cut short)
+- 🎵 **Dub audio** — if an audio file sits beside a video with the same name (`clip.mp4` → `clip.mp3`), play it instead of the video's own track, held in sync through seeking, stepping and pause. Off by default; toggled from the video controls
 - ⏮️ History navigation (back/forward through viewed images)
 - 🔀 Random or alphabetical sorting
 - 🗂 **File Types palette** — lists every file type found in the loaded folder with a checkbox and file count; uncheck a type to skip it while browsing (all types shown by default)

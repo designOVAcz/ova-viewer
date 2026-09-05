@@ -35,7 +35,7 @@ from random_image_viewer.image_utils import (
     get_image_file_size, smart_load_pixmap, safe_load_pixmap,
     natural_sort_key, get_images_in_folder, get_playlist_items_in_folder,
     emoji_icon, is_animated_gif, is_video_file, PlaylistScanner,
-    find_subtitle_file, parse_srt, load_thumbnail_pixmap
+    find_subtitle_file, find_dub_audio_file, parse_srt, load_thumbnail_pixmap
 )
 from random_image_viewer.pdf_utils import is_pdf_file, PdfDocument
 from random_image_viewer.epub_utils import is_epub_file, EpubDocument
@@ -233,6 +233,11 @@ class VideoControlsOverlay(QWidget):
                 background: rgba(255,255,255,40);
                 border-radius: 4px;
             }
+            QToolButton:checked {
+                background: rgba(100, 180, 255, 170);
+                border-radius: 4px;
+            }
+            QToolButton:disabled { color: #777; }
             QSlider::groove:horizontal {
                 height: 6px;
                 background: rgba(255,255,255,50);
@@ -275,6 +280,35 @@ class VideoControlsOverlay(QWidget):
 
         ctrl_row.addStretch()
 
+        # Autoplay next / dub audio also live on the main toolbar, but that is
+        # hidden in minimal and panel layouts — mirror them here so they are
+        # reachable whenever a video is on screen.
+        self._autoplay_btn = QToolButton()
+        self._autoplay_btn.setText("\u23ed")
+        self._autoplay_btn.setCheckable(True)
+        self._autoplay_btn.setToolTip(
+            "Autoplay next: advance when this video or GIF finishes")
+        self._autoplay_btn.setFixedSize(28, 28)
+        self._autoplay_btn.clicked.connect(self._on_autoplay_toggle)
+        ctrl_row.addWidget(self._autoplay_btn)
+
+        self._subs_btn = QToolButton()
+        self._subs_btn.setText("\U0001f4ac")
+        self._subs_btn.setCheckable(True)
+        self._subs_btn.setFixedSize(28, 28)
+        self._subs_btn.clicked.connect(self._on_subs_toggle)
+        ctrl_row.addWidget(self._subs_btn)
+
+        self._dub_btn = QToolButton()
+        self._dub_btn.setText("\U0001f3b5")
+        self._dub_btn.setCheckable(True)
+        self._dub_btn.setToolTip(
+            "Dub audio: play a sibling audio file with the same name "
+            "(clip.mp4 \u2192 clip.mp3) instead of the video's own track")
+        self._dub_btn.setFixedSize(28, 28)
+        self._dub_btn.clicked.connect(self._on_dub_toggle)
+        ctrl_row.addWidget(self._dub_btn)
+
         self._mute_btn = QToolButton()
         self._mute_btn.setText("\U0001f50a")
         self._mute_btn.setFixedSize(28, 28)
@@ -306,6 +340,13 @@ class VideoControlsOverlay(QWidget):
         self._volume_slider.setValue(volume)
         self._volume_slider.blockSignals(False)
         self._mute_btn.setText("\U0001f507" if muted else "\U0001f50a")
+        if self._viewer is not None:
+            self.update_autoplay_state(getattr(self._viewer, 'autoplay_next_enabled', False))
+            self.update_dub_state(getattr(self._viewer, 'dub_audio_enabled', False))
+            self.update_subtitle_state(
+                bool(getattr(self._viewer, '_subtitle_cues', None)),
+                getattr(self._viewer, '_subtitles_enabled', True),
+                os.path.basename(getattr(self._viewer, '_subtitle_path', '') or '') or None)
         self._play_btn.setText("\u23f8")
         self._time_label.setText("0:00 / 0:00")
         self._seek_slider.setRange(0, 0)
@@ -339,6 +380,49 @@ class VideoControlsOverlay(QWidget):
     def update_mute_state(self, muted):
         self._is_muted = muted
         self._mute_btn.setText("\U0001f507" if muted else "\U0001f50a")
+
+    def update_autoplay_state(self, enabled):
+        """Mirror the toolbar's autoplay-next toggle."""
+        self._autoplay_btn.blockSignals(True)
+        self._autoplay_btn.setChecked(bool(enabled))
+        self._autoplay_btn.blockSignals(False)
+
+    def update_subtitle_state(self, available, enabled, name=None):
+        """Mirror subtitle availability and on/off state.
+
+        A video with no sibling .srt greys the button out rather than hiding
+        it, so the control does not jump around between clips.
+        """
+        self._subs_btn.setEnabled(bool(available))
+        self._subs_btn.blockSignals(True)
+        self._subs_btn.setChecked(bool(available) and bool(enabled))
+        self._subs_btn.blockSignals(False)
+        if not available:
+            self._subs_btn.setToolTip("Subtitles: no matching .srt beside this video")
+        elif enabled:
+            self._subs_btn.setToolTip(
+                f"Subtitles: showing {name} (click to hide)" if name
+                else "Subtitles: on (click to hide)")
+        else:
+            self._subs_btn.setToolTip(
+                f"Subtitles: {name} hidden (click to show)" if name
+                else "Subtitles: off (click to show)")
+
+    def update_dub_state(self, enabled, detail=None):
+        """Mirror the toolbar's dub-audio toggle; *detail* names the track."""
+        self._dub_btn.blockSignals(True)
+        self._dub_btn.setChecked(bool(enabled))
+        self._dub_btn.blockSignals(False)
+        if detail:
+            self._dub_btn.setToolTip(
+                f"Dub audio: playing {detail} (click to use the video's own track)")
+        elif enabled:
+            self._dub_btn.setToolTip(
+                "Dub audio: on \u2014 no matching audio file beside this video")
+        else:
+            self._dub_btn.setToolTip(
+                "Dub audio: play a sibling audio file with the same name "
+                "(clip.mp4 \u2192 clip.mp3) instead of the video's own track")
 
     # ── internal ──────────────────────────────────────────────
     def _update_time_text(self):
@@ -394,6 +478,21 @@ class VideoControlsOverlay(QWidget):
     def _on_mute_toggle(self):
         if self._viewer:
             self._viewer._toggle_video_mute()
+        self._hide_timer.start(self.HIDE_DELAY_MS)
+
+    def _on_subs_toggle(self, checked):
+        if self._viewer:
+            self._viewer.toggle_subtitles(checked)
+        self._hide_timer.start(self.HIDE_DELAY_MS)
+
+    def _on_autoplay_toggle(self, checked):
+        if self._viewer:
+            self._viewer.toggle_autoplay_next(checked)
+        self._hide_timer.start(self.HIDE_DELAY_MS)
+
+    def _on_dub_toggle(self, checked):
+        if self._viewer:
+            self._viewer.toggle_dub_audio(checked)
         self._hide_timer.start(self.HIDE_DELAY_MS)
 
     def _on_volume(self, val):
@@ -1162,6 +1261,11 @@ class RandomImageViewer(QMainWindow):
         self._gif_prev_frame = -1          # last GIF frame seen (loop detection)
         self._gif_started_at = 0.0         # monotonic time the GIF pass began
 
+        # Dub audio: play a sibling audio file (clip.mp4 -> clip.mp3) instead
+        # of the video's own track. Off by default — it costs a sibling-file
+        # lookup per video and a second media player while one is playing.
+        self.dub_audio_enabled = False
+
         # Video playback state
         self._video_playing = False
         self._video_muted = True   # Videos start silent; unmuting sticks for the session
@@ -1816,6 +1920,18 @@ class RandomImageViewer(QMainWindow):
         self._video_volume_slider.setToolTip("Volume")
         self._video_volume_slider.valueChanged.connect(self._on_video_volume_changed)
         vc_layout.addWidget(self._video_volume_slider)
+
+        # Dub audio toggle: use a sibling audio file as the soundtrack
+        self._dub_audio_btn = QToolButton()
+        self._dub_audio_btn.setText("\U0001f3b5")
+        self._dub_audio_btn.setToolTip(
+            "Dub audio: play a sibling audio file with the same name "
+            "(clip.mp4 \u2192 clip.mp3) instead of the video's own track")
+        self._dub_audio_btn.setCheckable(True)
+        self._dub_audio_btn.setChecked(self.dub_audio_enabled)
+        self._dub_audio_btn.setFixedSize(24, 24)
+        self._dub_audio_btn.toggled.connect(self.toggle_dub_audio)
+        vc_layout.addWidget(self._dub_audio_btn)
 
         self._video_controls_widget.hide()
         toolbar.addWidget(self._video_controls_widget)
@@ -2625,6 +2741,10 @@ class RandomImageViewer(QMainWindow):
                 # Activate the floating overlay
                 if hasattr(self, '_video_overlay'):
                     self._video_overlay.activate(self._video_volume, self._video_muted)
+            # Announce a dub track last: update_image_info posts its own status
+            # message, which would otherwise bury this one.
+            if self.image_label.has_dub_audio():
+                self._on_dub_audio_started(self.image_label.dub_audio_path())
         else:
             self._video_playing = False
 
@@ -2746,6 +2866,10 @@ class RandomImageViewer(QMainWindow):
                         f"Subtitles loaded: {os.path.basename(srt_path)}", 3000)
         except Exception as e:
             print(f"subtitle load error: {e}")
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.update_subtitle_state(
+                bool(self._subtitle_cues), self._subtitles_enabled,
+                os.path.basename(self._subtitle_path or '') or None)
 
     def _lookup_subtitle(self, pos_ms):
         """Return the cue text active at ``pos_ms`` (empty string if none)."""
@@ -2821,6 +2945,10 @@ class RandomImageViewer(QMainWindow):
             self._subtitles_enabled = not self._subtitles_enabled
         else:
             self._subtitles_enabled = bool(checked)
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.update_subtitle_state(
+                bool(self._subtitle_cues), self._subtitles_enabled,
+                os.path.basename(self._subtitle_path or '') or None)
         self._redraw_video_subtitle()
 
     # ── Autoplay next (advance when a video / GIF ends) ────────────────
@@ -2838,6 +2966,8 @@ class RandomImageViewer(QMainWindow):
             btn.setChecked(self.autoplay_next_enabled)
             btn.blockSignals(False)
         self._reset_gif_loop_tracking()
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.update_autoplay_state(self.autoplay_next_enabled)
         if self.autoplay_next_enabled:
             self.status.showMessage(
                 "Autoplay next: on — videos and GIFs advance when they finish.")
@@ -2942,6 +3072,64 @@ class RandomImageViewer(QMainWindow):
         if h:
             return f"{h}:{m:02d}:{s:02d}"
         return f"{m}:{s:02d}"
+
+    # ── Dub audio (sibling soundtrack) ────────────────────────────────
+
+    def toggle_dub_audio(self, checked):
+        """Enable/disable using a sibling audio file as the soundtrack.
+
+        Takes effect on the next video, and immediately on the one playing —
+        the clip is reloaded and resumed at the same position, so switching
+        sounds like changing audio track in VLC rather than a setting that
+        only applies later.
+        """
+        self.dub_audio_enabled = bool(checked)
+        btn = getattr(self, '_dub_audio_btn', None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(self.dub_audio_enabled)
+            btn.blockSignals(False)
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.update_dub_state(self.dub_audio_enabled)
+
+        if not (self._video_playing and self.current_image):
+            self.status.showMessage(
+                "Dub audio: on — videos will use a matching .mp3 if one sits beside them."
+                if self.dub_audio_enabled else "Dub audio: off.")
+            return
+
+        # Only reload when it actually changes this video's soundtrack.
+        had_dub = self.image_label.has_dub_audio()
+        if not self.dub_audio_enabled and not had_dub:
+            self.status.showMessage("Dub audio: off.")
+            return
+        if self.dub_audio_enabled and not find_dub_audio_file(self.current_image):
+            self.status.showMessage(
+                "Dub audio: on — no matching audio file next to "
+                f"{os.path.basename(self.current_image)}.")
+            return
+
+        player = self.image_label._media_player
+        position = player.position() if player is not None else 0
+        was_paused = player is not None and not self.image_label.is_video_playing()
+        self._display_video(self.current_image)
+        if position > 0:
+            # The fresh player needs a moment to load before it can seek.
+            QTimer.singleShot(150, lambda p=position: self.image_label.video_seek(p))
+        if was_paused:
+            QTimer.singleShot(200, self.image_label.video_toggle_play_pause)
+        if not self.dub_audio_enabled:
+            self.status.showMessage("Dub audio: off — using the video's own track.")
+
+    def _on_dub_audio_started(self, dub_path):
+        """Called by the label when a dub track is attached to a video."""
+        name = os.path.basename(dub_path)
+        self.status.showMessage(f"Dub audio: playing {name} instead of the video's track")
+        btn = getattr(self, '_dub_audio_btn', None)
+        if btn is not None:
+            btn.setToolTip(f"Dub audio: playing {name} (click to use the video's own track)")
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.update_dub_state(True, detail=name)
 
     def _on_video_seek_slider_moved(self, position_ms):
         self.image_label.video_seek(position_ms)
