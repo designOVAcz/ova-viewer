@@ -13,7 +13,10 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added Object Groups — a cryptomatte-style pass that splits the image into objects and flattens each to its own local color.
 - Added a File Types palette that filters browsing to the file types you check (e.g. only MP4 or GIF).
 - Added autoplay-next so videos and animated GIFs advance to the following item when they finish.
+- Moved Value Filter, Color Groups and Object Groups into their own floating panels, each with an Opacity slider that layers the effect over the original.
 - Added dub audio: play a sibling audio file (clip.mp4 → clip.mp3) in place of a video's own soundtrack, kept in sync while seeking.
+- Videos and animated GIFs now pause while the window is minimised and pick up again on restore.
+- Edge Detection joined the panel treatment: one icon, with mode, sensitivity and line-opacity sliders in its own floating panel.
 
 ## Features
 
@@ -46,7 +49,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - ◑ **Posterize/value filter** — reduce images to 2-10 grayscale tones for value studies
 - 🎨 **Color Groups** — reduce the whole image to N flat colors sampled from itself
 - 🧩 **Object Groups** — cryptomatte-style: segments the image into objects and flattens each to its *own* local color, so two objects sharing a color stay separate. Local colors, local colors + outlines, or random ID colors; adjustable detail and minimum object size
-- 📐 **Edge detection** with Canny filtering and multiple display modes
+- 🎚️ Each of these three effects lives in its own floating panel (one toolbar icon opens it, like Curves) with an **Opacity** slider, so the effect can be layered back over the original instead of being all-or-nothing
+- 📐 **Edge detection** with Canny filtering, three looks (edges on dark, on white, or over the image), a sensitivity slider and an opacity slider that doubles as line transparency in overlay mode
 - Grayscale, contrast, and gamma sliders with per-effect toggles
 
 **Other**

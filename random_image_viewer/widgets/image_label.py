@@ -155,6 +155,38 @@ class ImageLabel(QLabel):
             original_y = original_size.height() - unrotated_y
         return original_x, original_y
 
+    def _map_label_pos_to_display(self, pos):
+        """Map a label position to pixel coords in the *displayed* image.
+
+        Unlike :meth:`_map_label_pos_to_original`, which walks back to the
+        file's own pixel grid, this lands in the coordinate space of the
+        viewer's processed pixmap — effects, rotation and flips already baked
+        in — so a sample reads the colour that is actually on screen.
+        Returns (x, y), or (None, None) when the cursor is off the image.
+        """
+        viewer = self.parent_viewer
+        pix = getattr(viewer, 'original_pixmap', None) if viewer else None
+        if pix is None or pix.isNull():
+            return None, None
+        disp_w, disp_h = pix.width(), pix.height()
+        if disp_w < 1 or disp_h < 1:
+            return None, None
+
+        label_size = self.size()
+        base_scaled = QSize(disp_w, disp_h).scaled(label_size, Qt.KeepAspectRatio)
+        zoomed_width = int(base_scaled.width() * self.zoom_factor)
+        zoomed_height = int(base_scaled.height() * self.zoom_factor)
+        if zoomed_width <= 0 or zoomed_height <= 0:
+            return None, None
+        draw_x = (label_size.width() - zoomed_width) // 2 + int(self.pan_offset_x)
+        draw_y = (label_size.height() - zoomed_height) // 2 + int(self.pan_offset_y)
+
+        rel_x = pos.x() - draw_x
+        rel_y = pos.y() - draw_y
+        if not (0 <= rel_x <= zoomed_width and 0 <= rel_y <= zoomed_height):
+            return None, None
+        return rel_x * disp_w / zoomed_width, rel_y * disp_h / zoomed_height
+
     def _map_pos_with_cache(self, pos, cache):
         """Fast label→original mapping using a precomputed geometry cache.
 
@@ -638,7 +670,7 @@ class ImageLabel(QLabel):
                 if not self._is_position_over_image(click_pos):
                     super().mousePressEvent(event)
                     return
-                ox, oy = self._map_label_pos_to_original(click_pos)
+                ox, oy = self._map_label_pos_to_display(click_pos)
                 if ox is None:
                     super().mousePressEvent(event)
                     return

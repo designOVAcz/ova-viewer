@@ -47,6 +47,7 @@ from random_image_viewer.widgets.enhancement_widget import ResponsiveEnhancement
 from random_image_viewer.widgets.color_snap_preview import ColorSnapPreview
 from random_image_viewer.widgets.snapped_palette_window import SnappedPaletteWindow
 from random_image_viewer.widgets.curves_window import CurvesWindow
+from random_image_viewer.widgets.effect_window import EffectWindow
 from random_image_viewer.widgets.type_filter_window import TypeFilterWindow
 from random_image_viewer.widgets.floating_panel import FloatingPanel
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
@@ -1122,7 +1123,7 @@ class RandomImageViewer(QMainWindow):
         self._curves_window_pos = None  # session-only memory of last drag pos
         # Cached source QImage for fast sampling (rebuilt on current_image change)
         self._color_snap_src_image = None
-        self._color_snap_src_path = None
+        self._color_snap_src_key = None
         # Debounce: only sample hover after cursor has been still for HOVER_MS
         self._color_snap_hover_ms = 350
         self._color_snap_hover_timer = QTimer(self)
@@ -1208,10 +1209,12 @@ class RandomImageViewer(QMainWindow):
         self.gamma_value = 0     # 0 = normal, -200 to +500 range
         self.value_filter_enabled = False  # Posterize to N grayscale tones (value study)
         self.value_levels = 4              # Number of value levels when posterize is enabled (2-10)
+        self.value_filter_opacity = 100    # Blend over the original (0-100, 100=full effect)
         # Color Groups (palette quantization) - flat color fields from the image's own colors
         self.color_groups_enabled = False  # Reduce image to N dominant colors (color map)
         self.color_groups_count = 8        # Number of palette colors (2-32)
         self.color_groups_field = 0        # Field-size pre-smoothing to merge regions (0=off, 0-20)
+        self.color_groups_opacity = 100    # Blend over the original (0-100, 100=full effect)
         self._color_palette_cache = {}     # Cache computed palettes keyed by image+params
         # Object Groups (cryptomatte-style) - segment into regions, flatten each
         # to its own local colour (spatial separation, unlike Color Groups)
@@ -1219,10 +1222,16 @@ class RandomImageViewer(QMainWindow):
         self.object_groups_detail = 45       # Region granularity (0-100, higher=more objects)
         self.object_groups_min_size = 12     # Minimum region size (0-100, higher=fewer specks)
         self.object_groups_mode = "local"    # local | id | local_edges
+        self.object_groups_opacity = 100     # Blend over the original (0-100, 100=full effect)
+
+        # Floating per-effect settings panels (created lazily, like Curves)
+        self._effect_windows = {}
+        self._effect_window_pos = {}
         # Edge detection (Canny "plane change" filter)
         self.edge_detection_enabled = False  # Toggle Canny edge detection
         self.edge_mode = "white_on_black"    # white_on_black | black_on_white | overlay
         self.edge_sensitivity = 50           # 0-100, drives Canny thresholds
+        self.edge_opacity = 100              # Blend over the original (0-100, 100=full effect)
         # Edge line color override. None = each mode's default (white on dark,
         # black on light, line color over image). Set by the line-color tools.
         self.edge_color = None
@@ -1265,6 +1274,11 @@ class RandomImageViewer(QMainWindow):
         # of the video's own track. Off by default — it costs a sibling-file
         # lookup per video and a second media player while one is playing.
         self.dub_audio_enabled = False
+
+        # Playback is suspended while the window sits minimised in the taskbar
+        # and picked up again on restore (see changeEvent).
+        self._was_minimized = False
+        self._paused_by_minimize = False
 
         # Video playback state
         self._video_playing = False
@@ -1743,53 +1757,15 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.lut_toggle_btn = QToolButton(); self.lut_toggle_btn.setText("🎞"); self.lut_toggle_btn.setToolTip("Toggle LUT On/Off (preserves selection)"); self.lut_toggle_btn.setCheckable(True); self.lut_toggle_btn.setFixedSize(24,24); self.lut_toggle_btn.toggled.connect(self.toggle_lut_enabled); self.lut_toggle_btn.setChecked(False); toolbar.addWidget(self.lut_toggle_btn)
         add_spacer(2)
-        self.value_filter_toggle_btn = QToolButton(); self.value_filter_toggle_btn.setText("◑"); self.value_filter_toggle_btn.setToolTip("Toggle Value Filter (posterize to N grayscale tones)"); self.value_filter_toggle_btn.setCheckable(True); self.value_filter_toggle_btn.setChecked(self.value_filter_enabled); self.value_filter_toggle_btn.setFixedSize(24,24); self.value_filter_toggle_btn.toggled.connect(self.toggle_value_filter); toolbar.addWidget(self.value_filter_toggle_btn)
-        self.value_levels_spin = QSpinBox(); self.value_levels_spin.setRange(2, 10); self.value_levels_spin.setValue(self.value_levels); self.value_levels_spin.setFixedHeight(24); self.value_levels_spin.setFixedWidth(40); self.value_levels_spin.setToolTip("Number of value levels (2-10)"); self.value_levels_spin.valueChanged.connect(self.update_value_levels); toolbar.addWidget(self.value_levels_spin)
+        # Each effect keeps a single icon here and hosts its settings (including
+        # an Opacity slider) in its own floating panel, like Curves 📈.
+        self.value_filter_btn = QToolButton(); self.value_filter_btn.setText("\u25d1"); self.value_filter_btn.setToolTip("Value Filter: posterize to N grayscale tones \u2014 click to turn it on and open its settings panel"); self.value_filter_btn.setCheckable(True); self.value_filter_btn.setFixedSize(24,24); self.value_filter_btn.toggled.connect(lambda c: self._toggle_effect_window('value_filter', c)); toolbar.addWidget(self.value_filter_btn)
         add_spacer(2)
-        # Color Groups (palette quantization) toggle + colors slider + field-size slider
-        self.color_groups_toggle_btn = QToolButton(); self.color_groups_toggle_btn.setText("🎨"); self.color_groups_toggle_btn.setToolTip("Toggle Color Groups (reduce image to N flat colors sampled from the image)"); self.color_groups_toggle_btn.setCheckable(True); self.color_groups_toggle_btn.setChecked(self.color_groups_enabled); self.color_groups_toggle_btn.setFixedSize(24,24); self.color_groups_toggle_btn.toggled.connect(self.toggle_color_groups); toolbar.addWidget(self.color_groups_toggle_btn)
-        self.color_groups_count_spin = QSpinBox(); self.color_groups_count_spin.setRange(2, 32); self.color_groups_count_spin.setValue(self.color_groups_count); self.color_groups_count_spin.setFixedHeight(24); self.color_groups_count_spin.setFixedWidth(44); self.color_groups_count_spin.setToolTip("Color Groups: number of colors (2-32)"); self.color_groups_count_spin.valueChanged.connect(self.update_color_groups_count); toolbar.addWidget(self.color_groups_count_spin)
-        self.color_groups_field_spin = QSpinBox(); self.color_groups_field_spin.setRange(0, 20); self.color_groups_field_spin.setValue(self.color_groups_field); self.color_groups_field_spin.setFixedHeight(24); self.color_groups_field_spin.setFixedWidth(44); self.color_groups_field_spin.setToolTip("Color Groups: field size (0=off, higher=larger merged color fields)"); self.color_groups_field_spin.valueChanged.connect(self.update_color_groups_field); toolbar.addWidget(self.color_groups_field_spin)
+        self.color_groups_btn = QToolButton(); self.color_groups_btn.setText("\U0001f3a8"); self.color_groups_btn.setToolTip("Color Groups: reduce the image to N flat colors \u2014 click to turn it on and open its settings panel"); self.color_groups_btn.setCheckable(True); self.color_groups_btn.setFixedSize(24,24); self.color_groups_btn.toggled.connect(lambda c: self._toggle_effect_window('color_groups', c)); toolbar.addWidget(self.color_groups_btn)
         add_spacer(2)
-        # Object Groups (cryptomatte-style): toggle + look menu + detail/min-size
-        self.object_groups_toggle_btn = QToolButton(); self.object_groups_toggle_btn.setText("🧩"); self.object_groups_toggle_btn.setToolTip("Toggle Object Groups (cryptomatte-style: split into objects, flatten each to its own local color)"); self.object_groups_toggle_btn.setCheckable(True); self.object_groups_toggle_btn.setChecked(self.object_groups_enabled); self.object_groups_toggle_btn.setFixedSize(24,24); self.object_groups_toggle_btn.toggled.connect(self.toggle_object_groups); toolbar.addWidget(self.object_groups_toggle_btn)
-        from PySide6.QtWidgets import QMenu as _QMenuObj
-        from PySide6.QtGui import QAction as _QActionObj
-        self.object_groups_mode_btn = QToolButton(); self.object_groups_mode_btn.setText("◧"); self.object_groups_mode_btn.setToolTip("Object Groups look: local object colors / cryptomatte ID colors / colors + outlines"); self.object_groups_mode_btn.setFixedSize(24,24); self.object_groups_mode_btn.setPopupMode(QToolButton.InstantPopup)
-        obj_menu = _QMenuObj(self.object_groups_mode_btn)
-        self._object_groups_mode_actions = {}
-        for mode_key, label in (("local", "Local object colors"),
-                                ("local_edges", "Local colors + outlines"),
-                                ("id", "Cryptomatte ID colors")):
-            act = _QActionObj(label, self)
-            act.setCheckable(True)
-            act.setChecked(self.object_groups_mode == mode_key)
-            act.triggered.connect(lambda _checked=False, m=mode_key: self.set_object_groups_mode(m))
-            obj_menu.addAction(act)
-            self._object_groups_mode_actions[mode_key] = act
-        self.object_groups_mode_btn.setMenu(obj_menu)
-        toolbar.addWidget(self.object_groups_mode_btn)
-        self.object_groups_detail_spin = QSpinBox(); self.object_groups_detail_spin.setRange(0, 100); self.object_groups_detail_spin.setValue(self.object_groups_detail); self.object_groups_detail_spin.setFixedHeight(24); self.object_groups_detail_spin.setFixedWidth(44); self.object_groups_detail_spin.setToolTip("Object Groups: detail (0-100, higher = more separate objects)"); self.object_groups_detail_spin.valueChanged.connect(self.update_object_groups_detail); toolbar.addWidget(self.object_groups_detail_spin)
-        self.object_groups_min_spin = QSpinBox(); self.object_groups_min_spin.setRange(0, 100); self.object_groups_min_spin.setValue(self.object_groups_min_size); self.object_groups_min_spin.setFixedHeight(24); self.object_groups_min_spin.setFixedWidth(44); self.object_groups_min_spin.setToolTip("Object Groups: minimum object size (0 = keep specks, higher = merge small regions into bigger objects)"); self.object_groups_min_spin.valueChanged.connect(self.update_object_groups_min_size); toolbar.addWidget(self.object_groups_min_spin)
+        self.object_groups_btn = QToolButton(); self.object_groups_btn.setText("\U0001f9e9"); self.object_groups_btn.setToolTip("Object Groups: cryptomatte-style per-object flattening \u2014 click to turn it on and open its settings panel"); self.object_groups_btn.setCheckable(True); self.object_groups_btn.setFixedSize(24,24); self.object_groups_btn.toggled.connect(lambda c: self._toggle_effect_window('object_groups', c)); toolbar.addWidget(self.object_groups_btn)
         add_spacer(2)
-        self.edge_toggle_btn = QToolButton(); self.edge_toggle_btn.setText("📐"); self.edge_toggle_btn.setToolTip("Toggle Edge Detection (plane changes)"); self.edge_toggle_btn.setCheckable(True); self.edge_toggle_btn.setChecked(self.edge_detection_enabled); self.edge_toggle_btn.setFixedSize(24,24); self.edge_toggle_btn.toggled.connect(self.toggle_edge_detection); toolbar.addWidget(self.edge_toggle_btn)
-        from PySide6.QtWidgets import QMenu as _QMenuEdge
-        from PySide6.QtGui import QAction as _QActionEdge
-        self.edge_mode_btn = QToolButton(); self.edge_mode_btn.setText("▦"); self.edge_mode_btn.setToolTip("Edge look: white-on-black / black-on-white / overlay on image"); self.edge_mode_btn.setFixedSize(24,24); self.edge_mode_btn.setPopupMode(QToolButton.InstantPopup)
-        edge_menu = _QMenuEdge(self.edge_mode_btn)
-        self._edge_mode_actions = {}
-        for mode_key, label in (("white_on_black", "Edges on dark background"),
-                                ("black_on_white", "Edges on white background"),
-                                ("overlay", "Edges over image")):
-            act = _QActionEdge(label, self)
-            act.setCheckable(True)
-            act.setChecked(self.edge_mode == mode_key)
-            act.triggered.connect(lambda _checked=False, m=mode_key: self.set_edge_mode(m))
-            edge_menu.addAction(act)
-            self._edge_mode_actions[mode_key] = act
-        self.edge_mode_btn.setMenu(edge_menu)
-        toolbar.addWidget(self.edge_mode_btn)
-        self.edge_sensitivity_spin = QSpinBox(); self.edge_sensitivity_spin.setRange(0, 100); self.edge_sensitivity_spin.setValue(self.edge_sensitivity); self.edge_sensitivity_spin.setFixedHeight(24); self.edge_sensitivity_spin.setFixedWidth(44); self.edge_sensitivity_spin.setToolTip("Edge sensitivity (0-100)"); self.edge_sensitivity_spin.valueChanged.connect(self.update_edge_sensitivity); toolbar.addWidget(self.edge_sensitivity_spin)
+        self.edge_detection_btn = QToolButton(); self.edge_detection_btn.setText("\U0001f4d0"); self.edge_detection_btn.setToolTip("Edge Detection: reveal plane changes \u2014 click to turn it on and open its settings panel"); self.edge_detection_btn.setCheckable(True); self.edge_detection_btn.setFixedSize(24,24); self.edge_detection_btn.toggled.connect(lambda c: self._toggle_effect_window('edge_detection', c)); toolbar.addWidget(self.edge_detection_btn)
         add_spacer(2)
         # Curves (classical RGB levels): opens a dedicated floating panel
         self.curves_btn = QToolButton(); self.curves_btn.setText("📈"); self.curves_btn.setToolTip("Curves (RGB levels): open panel with Black/White/Midtone per channel"); self.curves_btn.setCheckable(True); self.curves_btn.setFixedSize(24,24); self.curves_btn.toggled.connect(self._toggle_curves_window); toolbar.addWidget(self.curves_btn)
@@ -2001,13 +1977,9 @@ class RandomImageViewer(QMainWindow):
             ]),
             ("EFFECTS", [
                 'grayscale_toggle_btn', 'contrast_toggle_btn', 'gamma_toggle_btn',
-                'lut_toggle_btn', 'value_filter_toggle_btn', 'value_levels_spin',
-                'color_groups_toggle_btn', 'color_groups_count_spin',
-                'color_groups_field_spin',
-                'object_groups_toggle_btn', 'object_groups_mode_btn',
-                'object_groups_detail_spin', 'object_groups_min_spin',
-                'edge_toggle_btn', 'edge_mode_btn',
-                'edge_sensitivity_spin',
+                'lut_toggle_btn', 'value_filter_btn',
+                'color_groups_btn', 'object_groups_btn',
+                'edge_detection_btn',
                 'curves_btn',
                 'grayscale_slider', 'contrast_slider', 'gamma_slider',
                 'lut_btn', 'lut_combo', 'lut_strength_slider', 'enh_reset_btn',
@@ -3437,7 +3409,7 @@ class RandomImageViewer(QMainWindow):
             strokes = len(self.drawn_free_strokes) if self.drawn_free_strokes else 0
             lines_info = f"_lines_{vlines}_{hlines}_{flines}_{strokes}_{self.line_color.name()}_{self.line_thickness}"
         
-        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}_o{int(self.object_groups_enabled)}-{self.object_groups_mode}-{self.object_groups_detail}-{self.object_groups_min_size}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_color.name() if self.edge_color else 'def'}_cv{self._curves_signature()}-{self.line_color.name()}{lines_info}"
+        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}-{self.value_filter_opacity}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}-{self.color_groups_opacity}_o{int(self.object_groups_enabled)}-{self.object_groups_mode}-{self.object_groups_detail}-{self.object_groups_min_size}-{self.object_groups_opacity}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_opacity}-{self.edge_color.name() if self.edge_color else 'def'}_cv{self._curves_signature()}-{self.line_color.name()}{lines_info}"
         
         # Check enhanced cache first
         if cache_key in self.enhancement_cache:
@@ -4988,6 +4960,58 @@ class RandomImageViewer(QMainWindow):
             print(f"apply_curves error: {e}")
             return pixmap
 
+    def _blend_effect(self, original, effected, opacity):
+        """Cross-fade *effected* back over *original* at *opacity* (0-100).
+
+        Lets an effect sit as a layer over the untouched image the way LUT
+        strength already works, so a value study or colour flattening can be
+        dialled back instead of being all-or-nothing. Returns *effected*
+        unchanged at 100, *original* at 0, and a blend in between.
+        """
+        try:
+            o = max(0, min(100, int(opacity)))
+            if o >= 100 or effected is original:
+                return effected
+            if o <= 0:
+                return original
+            if (not original or original.isNull()
+                    or not effected or effected.isNull()):
+                return effected
+            if original.size() != effected.size():
+                return effected
+
+            import numpy as np
+
+            def _rgba(pix):
+                img = pix.toImage()
+                if img.format() != QImage.Format.Format_RGBA8888:
+                    img = img.convertToFormat(QImage.Format.Format_RGBA8888)
+                w, h = img.width(), img.height()
+                bpl = img.bytesPerLine()
+                buf = bytes(img.constBits())[: bpl * h]
+                return np.frombuffer(buf, np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+
+            base = _rgba(original)
+            top = _rgba(effected)
+            if base.shape != top.shape:
+                return effected
+
+            a = o / 100.0
+            out = np.empty_like(top)
+            # Colour blends; alpha follows the effect so transparency survives.
+            out[:, :, :3] = np.rint(
+                base[:, :, :3].astype(np.float32) * (1.0 - a)
+                + top[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+            out[:, :, 3] = top[:, :, 3]
+            out = np.ascontiguousarray(out)
+            h, w = out.shape[:2]
+            blended = QImage(out.tobytes(), w, h, w * 4,
+                             QImage.Format.Format_RGBA8888).copy()
+            return QPixmap.fromImage(blended)
+        except Exception as e:
+            print(f"_blend_effect error: {e}")
+            return effected
+
     def apply_value_filter(self, pixmap):
         """Posterize the image into N evenly-spaced grayscale tones (value study).
 
@@ -4998,6 +5022,8 @@ class RandomImageViewer(QMainWindow):
         try:
             if not pixmap or pixmap.isNull() or not self.value_filter_enabled:
                 return pixmap
+            if int(self.value_filter_opacity) <= 0:
+                return pixmap  # fully transparent effect = original, skip the work
             n = max(2, min(10, int(self.value_levels)))
 
             import numpy as np
@@ -5027,7 +5053,8 @@ class RandomImageViewer(QMainWindow):
             # Build a Grayscale8 QImage; copy to detach from the numpy buffer
             quantized = np.ascontiguousarray(quantized)
             out = QImage(quantized.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
-            return QPixmap.fromImage(out)
+            return self._blend_effect(pixmap, QPixmap.fromImage(out),
+                                      self.value_filter_opacity)
         except Exception as e:
             print(f"apply_value_filter error: {e}")
             return pixmap
@@ -5121,6 +5148,22 @@ class RandomImageViewer(QMainWindow):
                 np.maximum(best_score, blurred, out=best_score)
         return palette_u8[best_idx]
 
+    def _upstream_tone_signature(self):
+        """Identity of every stage that alters pixels before Color Groups runs.
+
+        The colour palette is cached per image so that video and GIF frames
+        keep the same flat colours instead of flickering frame to frame. That
+        makes the key's contents load-bearing: anything that re-tones the
+        picture upstream — LUT, the grayscale/contrast/gamma sliders, curves,
+        the value filter — has to appear here, or the palette would keep being
+        reused from the pre-adjustment version of the image.
+        """
+        lut = f"{int(self.lut_enabled)}.{self.current_lut_name}.{self.lut_strength}"
+        enh = f"{self.grayscale_value}.{self.contrast_value}.{self.gamma_value}"
+        vf = (f"{int(self.value_filter_enabled)}.{self.value_levels}"
+              f".{self.value_filter_opacity}")
+        return f"{lut}|{enh}|{self._curves_signature()}|{vf}"
+
     def apply_color_groups(self, pixmap):
         """Reduce the image to N dominant colours sampled from the image itself.
 
@@ -5135,6 +5178,8 @@ class RandomImageViewer(QMainWindow):
         try:
             if not pixmap or pixmap.isNull() or not self.color_groups_enabled:
                 return pixmap
+            if int(self.color_groups_opacity) <= 0:
+                return pixmap  # fully transparent effect = original, skip the work
             n = max(2, min(32, int(self.color_groups_count)))
             field = max(0, min(20, int(self.color_groups_field)))
 
@@ -5171,7 +5216,8 @@ class RandomImageViewer(QMainWindow):
 
             # Build palette from a downsampled colour sample (speed), with cache.
             flat = work.reshape(-1, 3)
-            cache_key = (self.current_image, n, field, w, h)
+            cache_key = (self.current_image, n, field, w, h,
+                         self._upstream_tone_signature())
             palette = self._color_palette_cache.get(cache_key)
             if palette is None:
                 max_samples = 20000
@@ -5216,7 +5262,8 @@ class RandomImageViewer(QMainWindow):
             out[:, :, 3] = alpha
             out = np.ascontiguousarray(out)
             qout = QImage(out.tobytes(), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
-            return QPixmap.fromImage(qout)
+            return self._blend_effect(pixmap, QPixmap.fromImage(qout),
+                                      self.color_groups_opacity)
         except Exception as e:
             print(f"apply_color_groups error: {e}")
             return pixmap
@@ -5481,16 +5528,15 @@ class RandomImageViewer(QMainWindow):
         try:
             if not pixmap or pixmap.isNull() or not self.object_groups_enabled:
                 return pixmap
+            if int(self.object_groups_opacity) <= 0:
+                return pixmap  # fully transparent effect = original, skip the work
 
             try:
                 import cv2
             except ImportError:
                 # Graceful fallback: disable and inform the user once
                 self.object_groups_enabled = False
-                if getattr(self, 'object_groups_toggle_btn', None) is not None:
-                    self.object_groups_toggle_btn.blockSignals(True)
-                    self.object_groups_toggle_btn.setChecked(False)
-                    self.object_groups_toggle_btn.blockSignals(False)
+                self._sync_effect_window('object_groups')
                 self.statusBar().showMessage(
                     "Object Groups requires opencv-python (pip install opencv-python)", 5000)
                 return pixmap
@@ -5544,7 +5590,8 @@ class RandomImageViewer(QMainWindow):
             out[:, :, 3] = alpha
             out = np.ascontiguousarray(out)
             qout = QImage(out.tobytes(), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
-            return QPixmap.fromImage(qout)
+            return self._blend_effect(pixmap, QPixmap.fromImage(qout),
+                                      self.object_groups_opacity)
         except Exception as e:
             print(f"apply_object_groups error: {e}")
             return pixmap
@@ -5566,16 +5613,15 @@ class RandomImageViewer(QMainWindow):
         try:
             if not pixmap or pixmap.isNull() or not self.edge_detection_enabled:
                 return pixmap
+            if int(self.edge_opacity) <= 0:
+                return pixmap  # fully transparent effect = original, skip the work
 
             try:
                 import cv2
             except ImportError:
                 # Graceful fallback: disable and inform the user once
                 self.edge_detection_enabled = False
-                if hasattr(self, 'edge_toggle_btn') and self.edge_toggle_btn is not None:
-                    self.edge_toggle_btn.blockSignals(True)
-                    self.edge_toggle_btn.setChecked(False)
-                    self.edge_toggle_btn.blockSignals(False)
+                self._sync_effect_window('edge_detection')
                 self.statusBar().showMessage(
                     "Edge detection requires opencv-python (pip install opencv-python)", 5000)
                 return pixmap
@@ -5633,7 +5679,8 @@ class RandomImageViewer(QMainWindow):
             out_rgba = np.ascontiguousarray(out_rgba)
             out = QImage(out_rgba.tobytes(), w, h, w * 4,
                          QImage.Format.Format_RGBA8888).copy()
-            return QPixmap.fromImage(out)
+            return self._blend_effect(pixmap, QPixmap.fromImage(out),
+                                      self.edge_opacity)
         except Exception as e:
             print(f"apply_edge_detection error: {e}")
             return pixmap
@@ -6717,14 +6764,14 @@ class RandomImageViewer(QMainWindow):
             self._color_snap_pending_global_pos = None
             # NOTE: palette panel stays open — only the ✕ close button hides it.
 
-    def _sample_color_at(self, original_x, original_y, radius=2):
-        """Sample a (2*radius+1)² averaged color from the cached source QImage."""
+    def _sample_color_at(self, display_x, display_y, radius=2):
+        """Sample a (2*radius+1)² averaged colour from the on-screen image."""
         img = self._get_color_snap_source_image()
         if img is None:
             return None
         try:
             w, h = img.width(), img.height()
-            cx = int(round(original_x)); cy = int(round(original_y))
+            cx = int(round(display_x)); cy = int(round(display_y))
             if not (0 <= cx < w and 0 <= cy < h):
                 return None
             x0 = max(0, cx - radius); x1 = min(w - 1, cx + radius)
@@ -6742,28 +6789,31 @@ class RandomImageViewer(QMainWindow):
             return None
 
     def _get_color_snap_source_image(self):
-        """Lazy-load and cache the current image as a QImage for cheap sampling.
+        """The processed image as shown on screen, cached for cheap sampling.
 
-        Invalidates when self.current_image path changes.
+        Samples come from ``original_pixmap`` — the full-resolution pixmap
+        after LUT, curves, value filter, colour/object groups, edge detection
+        and rotation — so the eyedropper picks the colour the user can see
+        rather than the untouched file on disk. The cache is keyed on the
+        pixmap itself, so any re-render (new image, effect change, opacity
+        tweak) invalidates it automatically.
         """
-        path = self.current_image
-        if not path:
+        pix = getattr(self, 'original_pixmap', None)
+        if pix is None or pix.isNull():
+            self._color_snap_src_image = None
+            self._color_snap_src_key = None
             return None
-        if (self._color_snap_src_image is not None
-                and self._color_snap_src_path == path):
-            return self._color_snap_src_image
         try:
-            pix, err = safe_load_pixmap(path)
-            if err or pix.isNull():
-                self._color_snap_src_image = None
-                self._color_snap_src_path = None
-                return None
+            key = pix.cacheKey()
+            if (self._color_snap_src_image is not None
+                    and self._color_snap_src_key == key):
+                return self._color_snap_src_image
             self._color_snap_src_image = pix.toImage()
-            self._color_snap_src_path = path
+            self._color_snap_src_key = key
             return self._color_snap_src_image
         except Exception:
             self._color_snap_src_image = None
-            self._color_snap_src_path = None
+            self._color_snap_src_key = None
             return None
 
     def request_color_snap_hover_sample(self, label_pos, global_pos):
@@ -6790,7 +6840,7 @@ class RandomImageViewer(QMainWindow):
             return
         if not (hasattr(self, 'image_label') and self.image_label):
             return
-        ox, oy = self.image_label._map_label_pos_to_original(label_pos)
+        ox, oy = self.image_label._map_label_pos_to_display(label_pos)
         if ox is None:
             return
         color = self._sample_color_at(ox, oy)
@@ -8277,6 +8327,332 @@ class RandomImageViewer(QMainWindow):
         if self.current_image:
             self.display_image(self.current_image)
 
+    # ───────────── Effect settings panels (Value / Color / Object) ─────────────
+
+    #: Which state attribute says an effect is on, keyed by panel.
+    _EFFECT_ENABLED_ATTR = {
+        'value_filter': 'value_filter_enabled',
+        'color_groups': 'color_groups_enabled',
+        'object_groups': 'object_groups_enabled',
+        'edge_detection': 'edge_detection_enabled',
+    }
+
+    def _effect_panel_spec(self, key):
+        """Return the EffectWindow spec (title / sliders / modes) for *key*."""
+        if key == 'value_filter':
+            return dict(
+                title="\u25d1 Value Filter",
+                controls=[
+                    ("levels", "Levels", 2, 10, self.value_levels,
+                     "Number of grayscale tones (2-10)"),
+                    ("opacity", "Opacity", 0, 100, self.value_filter_opacity,
+                     "Blend the effect over the original image (0 = original)"),
+                ],
+                choices=None,
+                reset_tip="Reset the value filter to its defaults",
+            )
+        if key == 'color_groups':
+            return dict(
+                title="\U0001f3a8 Color Groups",
+                controls=[
+                    ("count", "Colors", 2, 32, self.color_groups_count,
+                     "Number of flat colors sampled from the image (2-32)"),
+                    ("field", "Field", 0, 20, self.color_groups_field,
+                     "Field size: merge small regions into larger color fields (0 = off)"),
+                    ("opacity", "Opacity", 0, 100, self.color_groups_opacity,
+                     "Blend the effect over the original image (0 = original)"),
+                ],
+                choices=None,
+                reset_tip="Reset color groups to its defaults",
+            )
+        if key == 'edge_detection':
+            return dict(
+                title="\U0001f4d0 Edge Detection",
+                controls=[
+                    ("sensitivity", "Detail", 0, 100, self.edge_sensitivity,
+                     "Edge sensitivity: higher finds more, finer edges"),
+                    ("opacity", "Opacity", 0, 100, self.edge_opacity,
+                     "Blend the result over the original image \u2014 in Over mode this "
+                     "is the line transparency"),
+                ],
+                choices=(self.edge_mode, [
+                    ("white_on_black", "Dark", "Light edges on a dark background"),
+                    ("black_on_white", "Light", "Dark edges on a white background"),
+                    ("overlay", "Over", "Edges drawn over the image itself"),
+                ]),
+                reset_tip="Reset edge detection to its defaults",
+            )
+        return dict(
+            title="\U0001f9e9 Object Groups",
+            controls=[
+                ("detail", "Detail", 0, 100, self.object_groups_detail,
+                 "How different two touching areas must be to stay separate objects"),
+                ("minsize", "Min size", 0, 100, self.object_groups_min_size,
+                 "Minimum object size (0 keeps every speck)"),
+                ("opacity", "Opacity", 0, 100, self.object_groups_opacity,
+                 "Blend the effect over the original image (0 = original)"),
+            ],
+            choices=(self.object_groups_mode, [
+                ("local", "Color", "Flatten each object to its own local color"),
+                ("local_edges", "Lines", "Local colors plus object outlines"),
+                ("id", "IDs", "Cryptomatte ID colors"),
+            ]),
+            reset_tip="Reset object groups to its defaults",
+        )
+
+    def _on_effect_enable(self, key, checked):
+        """Enable checkbox in a panel toggled."""
+        if key == 'value_filter':
+            self.toggle_value_filter(checked)
+        elif key == 'color_groups':
+            self.toggle_color_groups(checked)
+        elif key == 'edge_detection':
+            self.toggle_edge_detection(checked)
+        else:
+            self.toggle_object_groups(checked)
+
+    def _on_effect_value(self, key, control, value):
+        """A slider moved in one of the effect panels."""
+        if key == 'value_filter':
+            if control == 'levels':
+                self.update_value_levels(value)
+            elif control == 'opacity':
+                self.update_value_filter_opacity(value)
+        elif key == 'color_groups':
+            if control == 'count':
+                self.update_color_groups_count(value)
+            elif control == 'field':
+                self.update_color_groups_field(value)
+            elif control == 'opacity':
+                self.update_color_groups_opacity(value)
+        elif key == 'edge_detection':
+            if control == 'sensitivity':
+                self.update_edge_sensitivity(value)
+            elif control == 'opacity':
+                self.update_edge_opacity(value)
+        else:
+            if control == 'detail':
+                self.update_object_groups_detail(value)
+            elif control == 'minsize':
+                self.update_object_groups_min_size(value)
+            elif control == 'opacity':
+                self.update_object_groups_opacity(value)
+
+    def _on_effect_choice(self, key, mode):
+        """A segmented mode button was clicked in one of the panels."""
+        if key == 'edge_detection':
+            self.set_edge_mode(mode)
+        elif key == 'object_groups':
+            self.set_object_groups_mode(mode)
+
+    def _on_effect_reset(self, key):
+        """Reset button in a panel clicked."""
+        if key == 'value_filter':
+            self.value_levels = 4
+            self.value_filter_opacity = 100
+            self.value_filter_enabled = False
+        elif key == 'color_groups':
+            self.color_groups_count = 8
+            self.color_groups_field = 0
+            self.color_groups_opacity = 100
+            self.color_groups_enabled = False
+            self._color_palette_cache.clear()
+        elif key == 'edge_detection':
+            self.edge_sensitivity = 50
+            self.edge_opacity = 100
+            self.edge_mode = "white_on_black"
+            self.edge_detection_enabled = False
+        else:
+            self.object_groups_detail = 45
+            self.object_groups_min_size = 12
+            self.object_groups_mode = "local"
+            self.object_groups_opacity = 100
+            self.object_groups_enabled = False
+        self._sync_effect_window(key)
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def _ensure_effect_window(self, key):
+        """Lazy-create one effect panel and wire its signals."""
+        win = self._effect_windows.get(key)
+        if win is None:
+            spec = self._effect_panel_spec(key)
+            win = EffectWindow(spec["title"], spec["controls"],
+                               choices=spec["choices"],
+                               reset_tip=spec["reset_tip"], parent=self)
+            win.enable_toggled.connect(
+                lambda checked, k=key: self._on_effect_enable(k, checked))
+            win.value_changed.connect(
+                lambda ctrl, val, k=key: self._on_effect_value(k, ctrl, val))
+            # Each panel's segmented selector drives its own effect.
+            win.choice_changed.connect(
+                lambda mode, k=key: self._on_effect_choice(k, mode))
+            win.reset_requested.connect(lambda k=key: self._on_effect_reset(k))
+            win.closed.connect(lambda k=key: self._on_effect_window_closed(k))
+            self._effect_windows[key] = win
+        self._sync_effect_window(key)
+        return win
+
+    def _effect_panel_values(self, key):
+        """Current slider values for one panel, as a {control: value} map."""
+        if key == 'value_filter':
+            return {"levels": self.value_levels,
+                    "opacity": self.value_filter_opacity}
+        if key == 'color_groups':
+            return {"count": self.color_groups_count,
+                    "field": self.color_groups_field,
+                    "opacity": self.color_groups_opacity}
+        if key == 'edge_detection':
+            return {"sensitivity": self.edge_sensitivity,
+                    "opacity": self.edge_opacity}
+        return {"detail": self.object_groups_detail,
+                "minsize": self.object_groups_min_size,
+                "opacity": self.object_groups_opacity}
+
+    def _sync_effect_window(self, key):
+        """Push state into a panel and light up its toolbar icon when active.
+
+        The icon is checkable for panel visibility (like Curves), so an extra
+        ring is what tells you the effect itself is running.
+        """
+        enabled = bool(getattr(self, self._EFFECT_ENABLED_ATTR[key], False))
+        btn = getattr(self, f"{key}_btn", None)
+        if btn is not None:
+            btn.setStyleSheet(
+                "QToolButton { border: 1px solid #7aa2ff; border-radius: 4px; }"
+                if enabled else "")
+        win = self._effect_windows.get(key)
+        if win is None:
+            return
+        win.set_enabled_state(enabled)
+        win.set_values(self._effect_panel_values(key))
+        if key == 'object_groups':
+            win.set_choice(self.object_groups_mode)
+        elif key == 'edge_detection':
+            win.set_choice(self.edge_mode)
+
+    def _toggle_effect_window(self, key, checked):
+        """Toggle an effect and its settings panel together from the toolbar.
+
+        The icon is the effect's on/off switch as well as its panel button, so
+        a single click turns the effect on and opens its controls. The panel's
+        own \u2715 closes only the panel and leaves the effect running, and the
+        Enable checkbox still toggles the effect with the panel open \u2014 handy
+        for A/B while tuning.
+        """
+        enabled = bool(getattr(self, self._EFFECT_ENABLED_ATTR[key], False))
+        if checked:
+            self._show_effect_window(key)
+            if not enabled:
+                self._on_effect_enable(key, True)
+        else:
+            self._hide_effect_window(key)
+            if enabled:
+                self._on_effect_enable(key, False)
+
+    def _show_effect_window(self, key):
+        """Show one effect panel near its toolbar button on first open."""
+        win = self._ensure_effect_window(key)
+        if win.isVisible():
+            win.raise_()
+            return
+        target = self._effect_window_pos.get(key)
+        if target is None:
+            btn = getattr(self, f"{key}_btn", None)
+            if btn is not None:
+                try:
+                    target = btn.mapToGlobal(btn.rect().bottomLeft()) + QPoint(0, 4)
+                except Exception:
+                    target = None
+        if target is not None:
+            try:
+                from PySide6.QtGui import QGuiApplication
+                scr = QGuiApplication.screenAt(target) or QGuiApplication.primaryScreen()
+                geom = scr.availableGeometry()
+                w = win.sizeHint().width() or win.width() or 300
+                h = win.sizeHint().height() or win.height() or 180
+                x = max(geom.left(), min(target.x(), geom.right() - w))
+                y = max(geom.top(), min(target.y(), geom.bottom() - h))
+                win.move(x, y)
+            except Exception:
+                win.move(target)
+        win.show()
+        win.raise_()
+
+    def _hide_effect_window(self, key):
+        """Hide one effect panel; remember where it was."""
+        win = self._effect_windows.get(key)
+        if win is not None and win.isVisible():
+            try:
+                self._effect_window_pos[key] = win.pos()
+            except Exception:
+                pass
+            win.hide()
+
+    def _on_effect_window_closed(self, key):
+        """Panel ✕ clicked: remember position and un-check the toolbar icon."""
+        win = self._effect_windows.get(key)
+        if win is not None:
+            try:
+                self._effect_window_pos[key] = win.pos()
+            except Exception:
+                pass
+        btn = getattr(self, f"{key}_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+
+    def update_value_filter_opacity(self, value):
+        """Change how strongly the value filter is layered over the original."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.value_filter_opacity = max(0, min(100, value))
+        if self.value_filter_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def update_color_groups_opacity(self, value):
+        """Change how strongly color groups is layered over the original."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.color_groups_opacity = max(0, min(100, value))
+        if self.color_groups_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def update_edge_opacity(self, value):
+        """Change how strongly the edge render is layered over the original."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.edge_opacity = max(0, min(100, value))
+        if self.edge_detection_enabled:
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
+
+    def update_object_groups_opacity(self, value):
+        """Change how strongly object groups is layered over the original."""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        self.object_groups_opacity = max(0, min(100, value))
+        self._refresh_object_groups()
+
     # ───────────── Curves floating window ─────────────
     def _ensure_curves_window(self):
         """Lazy-create the curves window and wire its signals."""
@@ -8363,10 +8739,7 @@ class RandomImageViewer(QMainWindow):
     def toggle_value_filter(self, checked):
         """Enable/disable the posterize value filter."""
         self.value_filter_enabled = bool(checked)
-        if hasattr(self, 'value_filter_toggle_btn') and self.value_filter_toggle_btn is not None:
-            self.value_filter_toggle_btn.blockSignals(True)
-            self.value_filter_toggle_btn.setChecked(self.value_filter_enabled)
-            self.value_filter_toggle_btn.blockSignals(False)
+        self._sync_effect_window('value_filter')
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         if self.current_image:
@@ -8389,10 +8762,7 @@ class RandomImageViewer(QMainWindow):
     def toggle_color_groups(self, checked):
         """Enable/disable the Color Groups (palette quantization) effect."""
         self.color_groups_enabled = bool(checked)
-        if hasattr(self, 'color_groups_toggle_btn') and self.color_groups_toggle_btn is not None:
-            self.color_groups_toggle_btn.blockSignals(True)
-            self.color_groups_toggle_btn.setChecked(self.color_groups_enabled)
-            self.color_groups_toggle_btn.blockSignals(False)
+        self._sync_effect_window('color_groups')
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         if self.current_image:
@@ -8437,10 +8807,7 @@ class RandomImageViewer(QMainWindow):
     def toggle_object_groups(self, checked):
         """Enable/disable the Object Groups (cryptomatte-style) effect."""
         self.object_groups_enabled = bool(checked)
-        if getattr(self, 'object_groups_toggle_btn', None) is not None:
-            self.object_groups_toggle_btn.blockSignals(True)
-            self.object_groups_toggle_btn.setChecked(self.object_groups_enabled)
-            self.object_groups_toggle_btn.blockSignals(False)
+        self._sync_effect_window('object_groups')
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         if self.current_image:
@@ -8451,10 +8818,9 @@ class RandomImageViewer(QMainWindow):
         if mode not in ("local", "local_edges", "id"):
             return
         self.object_groups_mode = mode
-        for key, act in getattr(self, '_object_groups_mode_actions', {}).items():
-            act.blockSignals(True)
-            act.setChecked(key == mode)
-            act.blockSignals(False)
+        win = self._effect_windows.get('object_groups')
+        if win is not None:
+            win.set_choice(mode)
         self._refresh_object_groups()
 
     def update_object_groups_detail(self, value):
@@ -8478,10 +8844,7 @@ class RandomImageViewer(QMainWindow):
     def toggle_edge_detection(self, checked):
         """Enable/disable the Canny edge-detection filter."""
         self.edge_detection_enabled = bool(checked)
-        if hasattr(self, 'edge_toggle_btn') and self.edge_toggle_btn is not None:
-            self.edge_toggle_btn.blockSignals(True)
-            self.edge_toggle_btn.setChecked(self.edge_detection_enabled)
-            self.edge_toggle_btn.blockSignals(False)
+        self._sync_effect_window('edge_detection')
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         if self.current_image:
@@ -8492,11 +8855,9 @@ class RandomImageViewer(QMainWindow):
         if mode not in ("white_on_black", "black_on_white", "overlay"):
             return
         self.edge_mode = mode
-        if hasattr(self, '_edge_mode_actions'):
-            for key, act in self._edge_mode_actions.items():
-                act.blockSignals(True)
-                act.setChecked(key == mode)
-                act.blockSignals(False)
+        win = self._effect_windows.get('edge_detection')
+        if win is not None:
+            win.set_choice(mode)
         if self.edge_detection_enabled:
             self.enhancement_cache.clear()
             self.scaled_cache.clear()
@@ -8580,56 +8941,25 @@ class RandomImageViewer(QMainWindow):
         self.value_filter_enabled = False
         self.value_levels = 4
 
-        # Reset value-filter UI
-        if hasattr(self, 'value_filter_toggle_btn') and self.value_filter_toggle_btn is not None:
-            self.value_filter_toggle_btn.blockSignals(True)
-            self.value_filter_toggle_btn.setChecked(False)
-            self.value_filter_toggle_btn.blockSignals(False)
-        if hasattr(self, 'value_levels_spin') and self.value_levels_spin is not None:
-            self.value_levels_spin.blockSignals(True)
-            self.value_levels_spin.setValue(4)
-            self.value_levels_spin.blockSignals(False)
+        self.value_filter_opacity = 100
 
         # Reset Color Groups (palette quantization)
         self.color_groups_enabled = False
         self.color_groups_count = 8
         self.color_groups_field = 0
+        self.color_groups_opacity = 100
         if hasattr(self, '_color_palette_cache'):
             self._color_palette_cache.clear()
-        if hasattr(self, 'color_groups_toggle_btn') and self.color_groups_toggle_btn is not None:
-            self.color_groups_toggle_btn.blockSignals(True)
-            self.color_groups_toggle_btn.setChecked(False)
-            self.color_groups_toggle_btn.blockSignals(False)
-        if hasattr(self, 'color_groups_count_spin') and self.color_groups_count_spin is not None:
-            self.color_groups_count_spin.blockSignals(True)
-            self.color_groups_count_spin.setValue(8)
-            self.color_groups_count_spin.blockSignals(False)
-        if hasattr(self, 'color_groups_field_spin') and self.color_groups_field_spin is not None:
-            self.color_groups_field_spin.blockSignals(True)
-            self.color_groups_field_spin.setValue(0)
-            self.color_groups_field_spin.blockSignals(False)
 
         # Reset Object Groups (cryptomatte-style per-object flattening)
         self.object_groups_enabled = False
         self.object_groups_detail = 45
         self.object_groups_min_size = 12
         self.object_groups_mode = "local"
-        for key, act in getattr(self, '_object_groups_mode_actions', {}).items():
-            act.blockSignals(True)
-            act.setChecked(key == "local")
-            act.blockSignals(False)
-        if getattr(self, 'object_groups_toggle_btn', None) is not None:
-            self.object_groups_toggle_btn.blockSignals(True)
-            self.object_groups_toggle_btn.setChecked(False)
-            self.object_groups_toggle_btn.blockSignals(False)
-        if getattr(self, 'object_groups_detail_spin', None) is not None:
-            self.object_groups_detail_spin.blockSignals(True)
-            self.object_groups_detail_spin.setValue(45)
-            self.object_groups_detail_spin.blockSignals(False)
-        if getattr(self, 'object_groups_min_spin', None) is not None:
-            self.object_groups_min_spin.blockSignals(True)
-            self.object_groups_min_spin.setValue(12)
-            self.object_groups_min_spin.blockSignals(False)
+        self.object_groups_opacity = 100
+        self.edge_opacity = 100
+        for key in ('value_filter', 'color_groups', 'object_groups', 'edge_detection'):
+            self._sync_effect_window(key)
 
         # Reset Curves (classical RGB levels)
         self.curves_enabled = False
@@ -10951,6 +11281,55 @@ class RandomImageViewer(QMainWindow):
             self.exit_fullscreen()
         else:
             super().mouseDoubleClickEvent(event)
+
+    def changeEvent(self, event):
+        """Pause playing media while minimised; resume it on restore.
+
+        Minimising to the taskbar means the picture is gone, so letting a clip
+        run on is just wasted decoding (and, with a dub track, sound from a
+        window you cannot see). Only playback that was actually running is
+        resumed, so a clip you had paused yourself stays paused.
+        """
+        try:
+            if event.type() == QEvent.WindowStateChange:
+                minimized = bool(self.windowState() & Qt.WindowMinimized)
+                was = getattr(self, '_was_minimized', False)
+                if minimized and not was:
+                    self._paused_by_minimize = self._pause_media_for_minimize()
+                elif was and not minimized:
+                    if getattr(self, '_paused_by_minimize', False):
+                        self._resume_media_after_minimize()
+                    self._paused_by_minimize = False
+                self._was_minimized = minimized
+        except Exception as e:
+            print(f"changeEvent error: {e}")
+        super().changeEvent(event)
+
+    def _pause_media_for_minimize(self):
+        """Pause a running video/GIF. True if something was actually paused."""
+        label = getattr(self, 'image_label', None)
+        if label is None:
+            return False
+        # The dub track follows the video's own state signal, so pausing the
+        # picture silences the external audio with it.
+        if self._video_playing and label.is_video_playing():
+            label.video_toggle_play_pause()
+            return True
+        if label.is_animation_playing():
+            label.gif_toggle_play_pause()
+            return True
+        return False
+
+    def _resume_media_after_minimize(self):
+        """Restart whatever :meth:`_pause_media_for_minimize` paused."""
+        label = getattr(self, 'image_label', None)
+        if label is None:
+            return
+        if self._video_playing and label._media_player is not None:
+            if not label.is_video_playing():
+                label.video_toggle_play_pause()
+        elif label.is_animation_paused():
+            label.gif_toggle_play_pause()
 
     def closeEvent(self, event):
         """Handle window close event"""
