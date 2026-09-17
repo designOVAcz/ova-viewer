@@ -78,19 +78,30 @@ class FlowLayout(QLayout):
         return size
 
     def natural_row_width(self):
-        """Width needed to lay all visible items out in a single row."""
+        """Width that fits the widest group of tools on a single row.
+
+        Dividers always start a new row, so a panel split into groups only
+        needs its widest group's width, not every tool side by side (which
+        left each group's row mostly empty). Without dividers this is simply
+        all visible items on one row.
+        """
         m = self.contentsMargins()
-        w = m.left() + m.right()
+        widest = row = 0
         first = True
         for item in self._items:
             widget = item.widget()
             if widget is not None and widget.isHidden():
                 continue
+            if isinstance(widget, PanelDivider):
+                widest = max(widest, row)
+                row = 0
+                first = True
+                continue
             if not first:
-                w += self._hspacing
-            w += item.sizeHint().width()
+                row += self._hspacing
+            row += item.sizeHint().width()
             first = False
-        return w
+        return max(widest, row) + m.left() + m.right()
 
     def _do_layout(self, rect, test_only):
         m = self.contentsMargins()
@@ -102,6 +113,16 @@ class FlowLayout(QLayout):
         for item in self._items:
             w = item.widget()
             if w is not None and w.isHidden():
+                continue
+            if isinstance(w, PanelDivider):
+                if line_height:
+                    y += line_height + self._vspacing
+                if not test_only:
+                    item.setGeometry(QRect(QPoint(rect.x() + m.left(), y),
+                                           QSize(max(1, right - (rect.x() + m.left())), 1)))
+                y += 1 + self._vspacing
+                x = rect.x() + m.left()
+                line_height = 0
                 continue
             hint = item.sizeHint()
             item_w = hint.width()
@@ -119,6 +140,21 @@ class FlowLayout(QLayout):
             line_height = max(line_height, item_h)
 
         return y + line_height + m.bottom() - rect.y()
+
+
+class PanelDivider(QWidget):
+    """A full-width rule that starts a new row in the flow.
+
+    A narrow vertical tick between tools reads as a stray mark once the flow
+    wraps, so groups are separated by a rule that always spans the panel and
+    always begins a fresh row instead.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(1)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setStyleSheet("background: #5c6066;")
 
 
 class FloatingPanel(QWidget):
@@ -208,6 +244,17 @@ class FloatingPanel(QWidget):
         if show:
             widget.show()
         self._flow.addWidget(widget)
+
+    def add_separator(self):
+        """Insert a thin divider so related tools read as a group.
+
+        It flows like any other item, so it wraps along with the tools around
+        it rather than pinning the layout to a fixed shape.
+        """
+        line = PanelDivider(self._content)
+        line.show()
+        self._flow.addWidget(line)
+        return line
 
     def _apply_content_width(self, width):
         """Constrain the flow to *width* px and size the content to fit."""

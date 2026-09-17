@@ -1,7 +1,9 @@
 import sys
+import time
 
 
 def main():
+    launch_t0 = time.perf_counter()
     # ---- Stage 0: Minimal Qt to show splash ASAP ----
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt
@@ -72,5 +74,10 @@ def main():
 
     # Close both splashes
     close_splash(splash)
+
+    # Report once the event loop has drained the show/paint work, so the
+    # number reflects a genuinely interactive window rather than just the
+    # moment show() returned.
+    QTimer.singleShot(0, lambda: viewer.report_startup_ready(launch_t0))
 
     sys.exit(app.exec())

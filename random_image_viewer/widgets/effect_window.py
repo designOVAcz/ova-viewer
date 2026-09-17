@@ -12,6 +12,7 @@ new effect only needs a list of slider definitions.
 
 Signals:
     enable_toggled(bool)     — Enable checkbox changed
+    toggle_changed(str, bool)— an extra option checkbox changed: (key, state)
     value_changed(str, int)  — a slider moved: (control key, value)
     choice_changed(str)      — segmented mode selector changed
     reset_requested()        — Reset button clicked
@@ -28,6 +29,7 @@ from random_image_viewer.widgets.clickable_slider import ClickableSlider
 
 class EffectWindow(QWidget):
     enable_toggled = Signal(bool)
+    toggle_changed = Signal(str, bool)
     value_changed = Signal(str, int)
     choice_changed = Signal(str)
     reset_requested = Signal()
@@ -37,13 +39,16 @@ class EffectWindow(QWidget):
     LABEL_W = 58     # left label column width
     VALUE_W = 34     # right value column width
 
-    def __init__(self, title, controls, choices=None, reset_tip=None, parent=None):
+    def __init__(self, title, controls, choices=None, toggles=None,
+                 reset_tip=None, parent=None):
         """Build a panel for one effect.
 
         ``controls`` is a list of ``(key, label, lo, hi, default, tooltip)``
         slider definitions. ``choices`` is an optional
         ``(current, [(key, text, tooltip), ...])`` segmented selector shown
-        beside the Enable checkbox.
+        beside the Enable checkbox. ``toggles`` is an optional list of
+        ``(key, label, default, tooltip)`` checkboxes for per-effect options
+        that are on/off rather than a value.
         """
         super().__init__(
             parent,
@@ -57,6 +62,7 @@ class EffectWindow(QWidget):
         self._sliders = {}
         self._values = {}
         self._choice_btns = {}
+        self._toggle_boxes = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -144,6 +150,22 @@ class EffectWindow(QWidget):
                 self._choice_btns[current].setChecked(True)
         inner.addLayout(top_row)
 
+        if toggles:
+            opt_row = QHBoxLayout()
+            opt_row.setContentsMargins(0, 0, 0, 0)
+            opt_row.setSpacing(10)
+            for key, label, default, tip in toggles:
+                box = QCheckBox(label)
+                box.setChecked(bool(default))
+                box.setToolTip(tip)
+                box.setStyleSheet("QCheckBox { color: #d0d0d0; font-size: 9pt; }")
+                box.toggled.connect(
+                    lambda state, k=key: self.toggle_changed.emit(k, bool(state)))
+                self._toggle_boxes[key] = box
+                opt_row.addWidget(box, 0)
+            opt_row.addStretch(1)
+            inner.addLayout(opt_row)
+
         # ── Sliders (uniform widths) ──
         grid = QGridLayout()
         grid.setContentsMargins(0, 2, 0, 2)
@@ -220,6 +242,16 @@ class EffectWindow(QWidget):
             slider.setValue(v)
             slider.blockSignals(False)
             self._values[key].setText(str(slider.value()))
+
+    def set_toggles(self, states):
+        """Set option checkboxes from a ``{key: bool}`` map (no signals)."""
+        for key, state in states.items():
+            box = self._toggle_boxes.get(key)
+            if box is None:
+                continue
+            box.blockSignals(True)
+            box.setChecked(bool(state))
+            box.blockSignals(False)
 
     def set_choice(self, key):
         """Reflect the active mode selection (no signal emitted)."""

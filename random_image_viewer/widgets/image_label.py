@@ -1,5 +1,8 @@
+import time
+
 from PySide6.QtWidgets import QLabel, QApplication, QMenu
-from PySide6.QtGui import QPainter, QColor, QPen, QAction, QTabletEvent, QMovie
+from PySide6.QtGui import (QPainter, QColor, QPen, QAction, QTabletEvent, QMovie,
+                           QPolygon, QRegion)
 from PySide6.QtCore import Qt, QTimer, QSize, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink, QAudioOutput
 
@@ -19,6 +22,10 @@ class ImageLabel(QLabel):
         self._media_player = None
         self._video_sink = None
         self._audio_output = None
+        self._fill_overlay = None  # (points, colour) of a shape being dragged
+        self._fill_pending = None  # QRegion waiting for the next paced repaint
+        self._fill_last_paint = 0.0
+        self._fill_timer = None
         self._video_last_frame_time = 0  # for frame throttling
         # External ("dub") soundtrack: a sibling audio file played in place of
         # the video's own track. See _start_dub_audio().
@@ -56,6 +63,97 @@ class ImageLabel(QLabel):
         # Enable context menu
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+
+    # -- In-progress fill shape ------------------------------------------
+    #
+    # Drawn here as an overlay rather than baked into the pixmap, and
+    # repainted the way free draw is: only the pixels the shape actually
+    # changed, and at most once a frame. Mouse and tablet input arrive far
+    # faster than the screen refreshes; repainting on every event made each
+    # move pay for a full compositor flush, and the backlog read as lag.
+
+    _FILL_FRAME = 1.0 / 60.0
+
+    def set_fill_overlay(self, points, color, appended=False):
+        """Show *points* (widget coordinates) as a filled shape over the image.
+
+        ``appended`` means the caller only added one vertex to the same outline
+        (lasso): the change is then just the triangle between the first point
+        and the new last edge. Otherwise it is where the old and new shapes
+        differ, which for a resized rectangle is a couple of thin strips.
+        """
+        previous = self._fill_overlay[0] if self._fill_overlay else None
+        pts = points if appended else list(points)
+        self._fill_overlay = (pts, QColor(color)) if pts else None
+        if appended and len(pts) >= 3:
+            changed = QRegion(QPolygon([pts[0], pts[-2], pts[-1]]))
+        else:
+            old = (QRegion(QPolygon(previous)) if previous and len(previous) >= 3
+                   else QRegion())
+            new = QRegion(QPolygon(pts)) if pts and len(pts) >= 3 else QRegion()
+            changed = old.xored(new)
+        self._queue_fill_repaint(changed)
+
+    def clear_fill_overlay(self):
+        """Remove the in-progress shape, repainting straight away (release)."""
+        overlay = self._fill_overlay
+        self._fill_overlay = None
+        region = self._fill_pending if self._fill_pending is not None else QRegion()
+        self._fill_pending = None
+        if self._fill_timer is not None:
+            self._fill_timer.stop()
+        if overlay and len(overlay[0]) >= 3:
+            region = region.united(QRegion(QPolygon(overlay[0])))
+        if not region.isEmpty():
+            self.update(self._grow_region(region))
+
+    def _queue_fill_repaint(self, region):
+        """Collect *region* and repaint it now, or on the next frame tick."""
+        if region.isEmpty():
+            return
+        self._fill_pending = (region if self._fill_pending is None
+                              else self._fill_pending.united(region))
+        wait = self._FILL_FRAME - (time.monotonic() - self._fill_last_paint)
+        if wait <= 0:
+            self._flush_fill_repaint()    # a quiet moment: respond at once
+            return
+        if self._fill_timer is None:
+            self._fill_timer = QTimer(self)
+            self._fill_timer.setSingleShot(True)
+            self._fill_timer.setTimerType(Qt.PreciseTimer)
+            self._fill_timer.timeout.connect(self._flush_fill_repaint)
+        if not self._fill_timer.isActive():
+            self._fill_timer.start(max(1, int(wait * 1000) + 1))
+
+    def _flush_fill_repaint(self):
+        self._fill_last_paint = time.monotonic()
+        pending, self._fill_pending = self._fill_pending, None
+        if pending is not None and not pending.isEmpty():
+            self.update(self._grow_region(pending))
+
+    @staticmethod
+    def _grow_region(region, px=2):
+        """Pad *region* so antialiased edges get repainted too."""
+        grown = QRegion(region)
+        for dx, dy in ((px, 0), (-px, 0), (0, px), (0, -px)):
+            grown = grown.united(region.translated(dx, dy))
+        return grown
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        overlay = getattr(self, '_fill_overlay', None)
+        if not overlay or len(overlay[0]) < 3:
+            return
+        points, color = overlay
+        painter = QPainter(self)
+        painter.setClipRegion(event.region())
+        # The same colour and smoothing the committed fill gets, so letting go
+        # of the mouse changes nothing on screen.
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawPolygon(QPolygon(points))
+        painter.end()
 
     def start_animation(self, file_path, scaled_size=None):
         """Start playing an animated GIF using QMovie as a frame source.
@@ -498,13 +596,25 @@ class ImageLabel(QLabel):
             # Zoom mode: Ctrl+wheel (incl. Wacom pinch) OR right-click+wheel
             zoom_mode = (event.modifiers() & Qt.ControlModifier) or (event.buttons() & Qt.RightButton)
 
-            # When not zoomed in and not in zoom mode, use wheel for image navigation
+            # When not zoomed in and not in zoom mode, use wheel for image
+            # navigation - unless that would throw away an unsaved drawing, in
+            # which case fall through and zoom instead (see wheel_should_zoom).
             if self.zoom_factor <= 1.0 and not zoom_mode:
-                if delta_y > 0:
-                    self.parent_viewer.show_previous_image()
-                elif delta_y < 0:
-                    self.parent_viewer.show_next_image()
-                return
+                protect = False
+                try:
+                    protect = self.parent_viewer.wheel_should_zoom()
+                except AttributeError:
+                    protect = False
+                if not protect:
+                    if delta_y > 0:
+                        self.parent_viewer.show_previous_image()
+                    elif delta_y < 0:
+                        self.parent_viewer.show_next_image()
+                    return
+                try:
+                    self.parent_viewer.note_wheel_nav_blocked()
+                except AttributeError:
+                    pass
 
             # When zoomed in and NOT in zoom mode, use the wheel to PAN the image.
             # Many Windows tablet drivers (incl. Wacom) deliver a two-finger pan as
@@ -685,6 +795,7 @@ class ImageLabel(QLabel):
                                  self.parent_viewer.horizontal_line_drawing_mode or
                                  self.parent_viewer.free_line_drawing_mode or
                                  self.parent_viewer.free_draw_mode or
+                                 getattr(self.parent_viewer, 'fill_mode', None) or
                                  getattr(self.parent_viewer, 'eraser_mode', False))
 
             if not is_any_drawing_mode:
@@ -812,12 +923,26 @@ class ImageLabel(QLabel):
                     # PEN PRESSURE: Store current pressure for real-time painting
                     if self.parent_viewer and self.parent_viewer.pen_pressure_enabled:
                         self.parent_viewer._current_pressure = pressure
+                if getattr(self.parent_viewer, 'fill_mode', None):
+                    self.parent_viewer.start_fill(original_x, original_y)
                 if getattr(self.parent_viewer, 'eraser_mode', False):
                     self.parent_viewer.start_erase_stroke(original_x, original_y)
 
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # Extend a filled shape that is being dragged out. Handled before the
+        # other tools so it cannot disturb their branches, and mapped through
+        # the viewer's per-drag cache: _map_label_pos_to_original re-decodes
+        # the image file on every call, far too slow for a mouse-move path.
+        if (self.parent_viewer and getattr(self.parent_viewer, 'current_fill', None)
+                and (event.buttons() & Qt.LeftButton)):
+            ox, oy = self.parent_viewer.map_fill_input(event.position())
+            if ox is not None and oy is not None:
+                self.parent_viewer.add_fill_point(ox, oy)
+            event.accept()
+            return
+
         # Handle panning (right-button drag, or left-button/finger drag when zoomed)
         if (self.is_panning and self.last_pan_point is not None and
                 (event.buttons() & (Qt.RightButton | Qt.LeftButton))):
@@ -1164,6 +1289,13 @@ class ImageLabel(QLabel):
             self.parent_viewer.free_draw_mode and self.parent_viewer.is_drawing_free_stroke):
             print(f"Mouse release in free draw mode")
             self.parent_viewer.end_free_draw_stroke()
+            event.accept()
+            return
+
+        # Fill tools: commit the shape that was dragged out
+        if (event.button() == Qt.LeftButton and self.parent_viewer and
+                getattr(self.parent_viewer, 'current_fill', None)):
+            self.parent_viewer.end_fill()
             event.accept()
             return
 

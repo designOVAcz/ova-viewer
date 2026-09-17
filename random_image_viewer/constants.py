@@ -1,5 +1,8 @@
 import os
 
+# Bump on release. Shown (with the startup time) in the status bar corner.
+APP_VERSION = "1.0.0"
+
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.jp2', '.j2k', '.jpf', '.jpx'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv'}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS

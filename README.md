@@ -17,6 +17,9 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added dub audio: play a sibling audio file (clip.mp4 → clip.mp3) in place of a video's own soundtrack, kept in sync while seeking.
 - Videos and animated GIFs now pause while the window is minimised and pick up again on restore.
 - Edge Detection joined the panel treatment: one icon, with mode, sensitivity and line-opacity sliders in its own floating panel.
+- Added a New sketch button — a blank mid-grey canvas with the free-draw tool armed, saved with the existing Save button.
+- Added Form Lines — cross-contour line work that reads the subject’s form from its shading (contour, hatch and wrap modes).
+- Merged the LINE / COLOR panel into DRAW: one panel, a row per job (mark, fill, colour, look, fix, view). Press **I** for the colour snap eyedropper.
 
 ## Features
 
@@ -34,6 +37,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🗂 **File Types palette** — lists every file type found in the loaded folder with a checkbox and file count; uncheck a type to skip it while browsing (all types shown by default)
 
 **Annotation**
+- 📝 **New sketch** — one click opens a blank mid-grey canvas sized to the drawing area with the free-draw tool already active, for quick notes and thumbnails; save it with 💾 like any other view
 - 📏 Vertical, horizontal, and free-angle line tools
 - 🧽 Eraser tool for removing parts of line and free-draw annotations
 - ✏️ Freehand draw with pressure-sensitive thickness (pen/stylus/tablet)
@@ -42,7 +46,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Save annotated view to file
 
 **Color & Enhancement**
-- 💉 **Color Snap eyedropper** — hover to preview, click to pick a color from the image
+- 💉 **Color Snap eyedropper** (**I**) — hover to preview, click to pick a color from the image
 - 🪄 **Auto-extract palette** — extracts dominant colors into the floating palette panel
 - 🎨 **Floating palette panel** — resizable, draggable, persists across tool switches; swatches organized by extraction session
 - 🎞️ **CUBE LUT support** with GPU-accelerated (OpenCL) processing and adjustable strength
@@ -51,6 +55,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🧩 **Object Groups** — cryptomatte-style: segments the image into objects and flattens each to its *own* local color, so two objects sharing a color stay separate. Local colors, local colors + outlines, or random ID colors; adjustable detail and minimum object size
 - 🎚️ Each of these three effects lives in its own floating panel (one toolbar icon opens it, like Curves) with an **Opacity** slider, so the effect can be layered back over the original instead of being all-or-nothing
 - 📐 **Edge detection** with Canny filtering, three looks (edges on dark, on white, or over the image), a sensitivity slider and an opacity slider that doubles as line transparency in overlay mode
+- 〰️ **Form Lines** — cross-contour line work inferred from shading: **Contour** (iso-brightness lines wrapping the form like a topographic map), **Hatch** (pencil strokes flowing along the surface, denser in shadow), **Wrap** (sparse strokes drawn across the form). Density, surface-smoothing and opacity sliders; lower the opacity to draw the lines over the photo itself
 - Grayscale, contrast, and gamma sliders with per-effect toggles
 
 **Other**
@@ -78,8 +83,8 @@ python main.py
 
 1. Drag a folder into the app or click 📁 to open one
 2. Navigate with **← →** or enable the auto-advance timer (**⚡**)
-3. Annotate with the line/draw tools in the toolbar
-4. Toggle **💉** to pick colors from the image; use **🪄** to auto-extract a palette
+3. Annotate with the tools in the **DRAW** panel — brush, lines, fills, colour, eraser and view helpers all live there
+4. Toggle **💉** (or press **I**) to pick colors from the image; use **🪄** to auto-extract a palette
 5. Load a `.cube` LUT file and adjust strength with the slider
 6. Press **F11** for fullscreen, **Esc** to exit
 
