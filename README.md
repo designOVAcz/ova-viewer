@@ -20,6 +20,9 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added a New sketch button — a blank mid-grey canvas with the free-draw tool armed, saved with the existing Save button.
 - Added Form Lines — cross-contour line work that reads the subject’s form from its shading (contour, hatch and wrap modes).
 - Merged the LINE / COLOR panel into DRAW: one panel, a row per job (mark, fill, colour, look, fix, view). Press **I** for the colour snap eyedropper.
+- Added triangle fill (drag) and polygon fill (click corners, straight edges).
+- Video timeline: click anywhere to jump there, drag to scrub, and hover to preview the frame at that moment.
+- Fixed drawing on rotated pictures: at 90° / 270° clicks, brush strokes and the eraser landed away from the cursor on any non-square image.
 
 ## Features
 
@@ -32,6 +35,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🕒 Auto-advance timer with circular countdown overlay
 - ⏭ **Autoplay next** — when a video or animated GIF finishes, move on to the next item automatically (holds the auto-advance countdown so a long clip is never cut short)
 - 🎵 **Dub audio** — if an audio file sits beside a video with the same name (`clip.mp4` → `clip.mp3`), play it instead of the video's own track, held in sync through seeking, stepping and pause. Off by default; toggled from the video controls
+- ⏱ **Video timeline** — click anywhere on it to jump there, drag to scrub (including straight on from that click), and hover to see a thumbnail of the frame at that moment
 - ⏮️ History navigation (back/forward through viewed images)
 - 🔀 Random or alphabetical sorting
 - 🗂 **File Types palette** — lists every file type found in the loaded folder with a checkbox and file count; uncheck a type to skip it while browsing (all types shown by default)
@@ -39,6 +43,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 **Annotation**
 - 📝 **New sketch** — one click opens a blank mid-grey canvas sized to the drawing area with the free-draw tool already active, for quick notes and thumbnails; save it with 💾 like any other view
 - 📏 Vertical, horizontal, and free-angle line tools
+- ⬟ Fill tools: **lasso** (drag an outline), **polygon** (click corners joined by straight edges; double-click, Enter or click the first corner to fill), **rectangle**, **ellipse** and **triangle** (drag out the shape)
 - 🧽 Eraser tool for removing parts of line and free-draw annotations
 - ✏️ Freehand draw with pressure-sensitive thickness (pen/stylus/tablet)
 - 👀 Live rubber-band preview for free-angle line placement

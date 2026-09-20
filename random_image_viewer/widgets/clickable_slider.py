@@ -3,43 +3,55 @@ from PySide6.QtCore import Qt
 
 
 class ClickableSlider(QSlider):
-    """A slider that allows clicking anywhere on the track to jump to that position"""
+    """A slider that jumps to wherever you click, and keeps dragging from there.
 
-    def __init__(self, orientation=Qt.Horizontal, parent=None):
-        super().__init__(orientation, parent)
+    Qt's own behaviour is to page towards the click, which is no use for a
+    timeline or a size control. The press also starts a drag, so one gesture
+    can land roughly and then adjust: the earlier version swallowed the press
+    without starting a drag, which left the handle stuck until the next click.
+    """
+
+    def value_at(self, pos):
+        """The value the given position over this widget points at."""
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        groove = style.subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        handle = style.subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        # The handle's centre is what lands on the click, so the usable span is
+        # the groove minus one handle, measured from half a handle in.
+        if self.orientation() == Qt.Horizontal:
+            span = groove.width() - handle.width()
+            offset = pos.x() - groove.x() - handle.width() / 2.0
+            upside_down = self.invertedAppearance()
+        else:
+            span = groove.height() - handle.height()
+            offset = pos.y() - groove.y() - handle.height() / 2.0
+            upside_down = not self.invertedAppearance()   # vertical: top is the maximum
+        if span <= 0:
+            return self.value()
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), int(round(offset)), int(span), upside_down)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # Get the slider's style options
-            opt = QStyleOptionSlider()
-            self.initStyleOption(opt)
-
-            # Get the groove rect (the track area)
-            groove_rect = self.style().subControlRect(
-                QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self
-            )
-
-            if self.orientation() == Qt.Horizontal:
-                # Calculate the position as a percentage of the groove width
-                click_pos = event.position().x() - groove_rect.x()
-                groove_width = groove_rect.width()
-                if groove_width > 0:
-                    percentage = max(0.0, min(1.0, click_pos / groove_width))
-                    # Calculate the new value based on the slider's range
-                    value_range = self.maximum() - self.minimum()
-                    new_value = self.minimum() + int(percentage * value_range)
-                    self.setValue(new_value)
-                    return
-            else:  # Vertical orientation
-                click_pos = event.position().y() - groove_rect.y()
-                groove_height = groove_rect.height()
-                if groove_height > 0:
-                    # For vertical sliders, top = maximum, bottom = minimum
-                    percentage = max(0.0, min(1.0, 1.0 - (click_pos / groove_height)))
-                    value_range = self.maximum() - self.minimum()
-                    new_value = self.minimum() + int(percentage * value_range)
-                    self.setValue(new_value)
-                    return
-
-        # Fall back to default behavior for dragging
+            self.setSliderDown(True)       # so a drag can continue from this click
+            self.setSliderPosition(self.value_at(event.position()))
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown() and (event.buttons() & Qt.LeftButton):
+            self.setSliderPosition(self.value_at(event.position()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            self.setSliderPosition(self.value_at(event.position()))
+            self.setSliderDown(False)      # emits sliderReleased
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)

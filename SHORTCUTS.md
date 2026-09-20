@@ -31,9 +31,18 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Shortcut | Action |
 |---|---|
 | `I` | Colour snap (eyedropper) on / off |
-| `Ctrl+Z` | Undo the last mark |
+| `Ctrl+Z` | Undo the last mark (while placing a polygon: remove its last corner) |
 | `Ctrl+Shift+A` | Toggle antialiasing |
 | `Ctrl+Shift+P` | Test pen pressure |
+
+### Polygon fill ⬡
+
+| Input | Action |
+|---|---|
+| Click | Place a corner |
+| Double-click / `Enter` / click the first corner | Fill the polygon |
+| `Backspace` | Remove the last corner |
+| `Esc` | Cancel the polygon |
 
 ## Zoom & View
 
@@ -61,6 +70,12 @@ Flip vertical has no working shortcut: the context menu lists `Ctrl+V`, but
 | `Ctrl+R` | Reset all enhancements |
 
 ## Video & GIF Playback
+
+| Input | Action |
+|---|---|
+| Click the timeline | Jump to that moment |
+| Drag the timeline | Scrub (a drag can start from the click) |
+| Hover the timeline | Preview the frame at that moment |
 
 | Shortcut | Action |
 |---|---|

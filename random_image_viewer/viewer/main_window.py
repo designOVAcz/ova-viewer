@@ -53,6 +53,8 @@ from random_image_viewer.widgets.color_picker_popup import ColorPickerPopup
 from random_image_viewer.widgets.effect_window import EffectWindow
 from random_image_viewer.widgets.type_filter_window import TypeFilterWindow
 from random_image_viewer.widgets.floating_panel import FloatingPanel
+from random_image_viewer.widgets.video_timeline import (SeekSlider, ThumbnailPopup,
+                                                        ThumbnailWorker)
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
 
 
@@ -247,6 +249,10 @@ class VideoControlsOverlay(QWidget):
         self._viewer = None
 
         self._build_ui()
+        # Preview card for the position under the pointer (see _on_hover_time)
+        self._thumb = ThumbnailPopup(parent_label)
+        self._thumb_ms = None
+        self._thumb_x = 0
         self.hide()
         parent_label.installEventFilter(self)
 
@@ -299,10 +305,12 @@ class VideoControlsOverlay(QWidget):
         c_layout.setContentsMargins(12, 6, 12, 8)
         c_layout.setSpacing(4)
 
-        self._seek_slider = QSlider(Qt.Horizontal)
+        self._seek_slider = SeekSlider(Qt.Horizontal)
         self._seek_slider.setRange(0, 0)
         self._seek_slider.setFixedHeight(18)
         self._seek_slider.sliderMoved.connect(self._on_seek)
+        self._seek_slider.hover_time.connect(self._on_hover_time)
+        self._seek_slider.hover_left.connect(self.hide_thumbnail)
         c_layout.addWidget(self._seek_slider)
 
         ctrl_row = QHBoxLayout()
@@ -396,6 +404,7 @@ class VideoControlsOverlay(QWidget):
         self._fade_in()
 
     def deactivate(self):
+        self.hide_thumbnail()
         self._hide_timer.stop()
         self._fade_anim.stop()
         self._opacity.setOpacity(0.0)
@@ -499,11 +508,53 @@ class VideoControlsOverlay(QWidget):
         if self._seek_slider.isSliderDown() or self._volume_slider.isSliderDown():
             self._hide_timer.start(self.HIDE_DELAY_MS)
             return
+        self.hide_thumbnail()
         self._fade_anim.stop()
         self._fade_anim.setStartValue(self._opacity.opacity())
         self._fade_anim.setEndValue(0.0)
         self._fade_anim.start()
         self._visible_state = False
+
+    # ── hover preview ─────────────────────────────────────────
+    def _on_hover_time(self, ms, x):
+        """Pointer over the timeline: show that time, and the frame there."""
+        if self._duration_ms <= 0:
+            return
+        if self._thumb_ms is None or abs(ms - self._thumb_ms) >= 1000:
+            self._thumb.clear_frame()      # another second: drop the stale frame
+        self._thumb_ms = ms
+        self._thumb.set_text(self._fmt(ms))
+        self._place_thumbnail(x)
+        self._hide_timer.start(self.HIDE_DELAY_MS)   # keep the panel up while hovering
+        if self._viewer is not None:
+            self._viewer.request_video_thumbnail(ms)
+
+    def show_thumbnail(self, ms, image):
+        """A decoded frame arrived; ignore it if the pointer has moved on."""
+        if self._thumb_ms is None or abs(ms - self._thumb_ms) >= 1000:
+            return
+        self._thumb.set_frame(image)
+        self._place_thumbnail(self._thumb_x)
+
+    def hide_thumbnail(self):
+        self._thumb_ms = None
+        self._thumb.hide()
+
+    def _place_thumbnail(self, x):
+        """Centre the card on the pointer, just below the panel."""
+        self._thumb_x = x
+        label = self._parent_label
+        if label is None:
+            return
+        pos = self._seek_slider.mapTo(label, QPoint(int(x), 0))
+        w, h = self._thumb.width(), self._thumb.height()
+        left = max(4, min(pos.x() - w // 2, max(4, label.width() - w - 4)))
+        top = self.y() + self.height() + 6
+        if top + h > label.height():        # no room below: sit above the panel
+            top = max(4, self.y() - h - 6)
+        self._thumb.move(int(left), int(top))
+        self._thumb.show()
+        self._thumb.raise_()
 
     def _on_seek(self, pos):
         if self._viewer:
@@ -1121,8 +1172,9 @@ class RandomImageViewer(QMainWindow):
         # Filled shapes (lasso / rectangle / ellipse), each an outline in image
         # coordinates. Painted by _paint_marks in creation order like any mark.
         self.drawn_fills = []
-        self.fill_mode = None          # None | 'lasso' | 'rect' | 'ellipse'
-        self.current_fill = None       # outline being dragged out right now
+        self.fill_mode = None          # None | 'lasso' | 'polygon' | 'rect' | 'ellipse' | 'triangle'
+        self.current_fill = None       # shape being dragged out / polygon being placed
+        self._polygon_hover_pos = None # last pointer position while placing a polygon
         self._fill_to_screen = None     # image -> widget mapping, fixed for one drag
         self._fill_input_cache = None   # widget -> image geometry for the drag
         self._fill_input_sig = None     # (image, view) that geometry was built for
@@ -1619,11 +1671,25 @@ class RandomImageViewer(QMainWindow):
         self.i_shortcut = QShortcut("I", self)
         self.i_shortcut.activated.connect(self._shortcut_color_snap)
 
+        # Finishing / trimming a polygon fill. Only enabled while one is being
+        # placed, so Enter and Backspace keep their usual meaning otherwise.
+        self._polygon_shortcuts = []
+        for key, slot in (("Return", self.finish_polygon), ("Enter", self.finish_polygon),
+                          ("Backspace", self.undo_polygon_corner)):
+            sc = QShortcut(key, self)
+            sc.activated.connect(slot)
+            sc.setEnabled(False)
+            self._polygon_shortcuts.append(sc)
+
         print("Global shortcuts set up successfully")
 
     def emergency_exit_fullscreen(self):
         """Emergency exit from fullscreen or minimal mode"""
         print("EMERGENCY: Escape shortcut activated")
+        if self._placing_polygon():
+            self.cancel_fill()
+            self.status.showMessage("Polygon cancelled")
+            return
         if self.is_fullscreen:
             self.force_exit_fullscreen()
         elif not self._ui_chrome_visible():
@@ -1682,9 +1748,13 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.lasso_fill_btn = QToolButton(); self.lasso_fill_btn.setText("⬟"); self.lasso_fill_btn.setToolTip("Lasso Fill: drag an outline, it fills with the current color on release"); self.lasso_fill_btn.setCheckable(True); self.lasso_fill_btn.setFixedSize(24,24); self.lasso_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('lasso', c)); toolbar.addWidget(self.lasso_fill_btn)
         add_spacer(2)
+        self.polygon_fill_btn = QToolButton(); self.polygon_fill_btn.setText("\u2b21"); self.polygon_fill_btn.setToolTip("Polygon Fill: click to place corners joined by straight edges \u2014 double-click, Enter or click the first corner to fill; Backspace removes the last corner, Esc cancels"); self.polygon_fill_btn.setCheckable(True); self.polygon_fill_btn.setFixedSize(24,24); self.polygon_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('polygon', c)); toolbar.addWidget(self.polygon_fill_btn)
+        add_spacer(2)
         self.rect_fill_btn = QToolButton(); self.rect_fill_btn.setText("■"); self.rect_fill_btn.setToolTip("Rectangle Fill: drag out a filled rectangle"); self.rect_fill_btn.setCheckable(True); self.rect_fill_btn.setFixedSize(24,24); self.rect_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('rect', c)); toolbar.addWidget(self.rect_fill_btn)
         add_spacer(2)
         self.ellipse_fill_btn = QToolButton(); self.ellipse_fill_btn.setText("●"); self.ellipse_fill_btn.setToolTip("Ellipse Fill: drag out a filled ellipse"); self.ellipse_fill_btn.setCheckable(True); self.ellipse_fill_btn.setFixedSize(24,24); self.ellipse_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('ellipse', c)); toolbar.addWidget(self.ellipse_fill_btn)
+        add_spacer(2)
+        self.triangle_fill_btn = QToolButton(); self.triangle_fill_btn.setText("\u25b2"); self.triangle_fill_btn.setToolTip("Triangle Fill: drag out a filled triangle \u2014 drag down for one pointing up, drag up for one pointing down"); self.triangle_fill_btn.setCheckable(True); self.triangle_fill_btn.setFixedSize(24,24); self.triangle_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('triangle', c)); toolbar.addWidget(self.triangle_fill_btn)
         add_spacer(2)
         self.free_draw_tool_btn = QToolButton(); self.free_draw_tool_btn.setText("✏"); self.free_draw_tool_btn.setToolTip("Free Draw Tool (drag to draw)"); self.free_draw_tool_btn.setCheckable(True); self.free_draw_tool_btn.setFixedSize(24,24); self.free_draw_tool_btn.toggled.connect(self.toggle_free_draw); toolbar.addWidget(self.free_draw_tool_btn)
         add_spacer(2)
@@ -1906,7 +1976,7 @@ class RandomImageViewer(QMainWindow):
         self._video_time_label.setStyleSheet("font-size: 11px; min-width: 36px;")
         vc_layout.addWidget(self._video_time_label)
 
-        self._video_seek_slider = QSlider(Qt.Horizontal)
+        self._video_seek_slider = SeekSlider(Qt.Horizontal)
         self._video_seek_slider.setRange(0, 0)
         self._video_seek_slider.setFixedHeight(20)
         self._video_seek_slider.setMinimumWidth(100)
@@ -2010,7 +2080,8 @@ class RandomImageViewer(QMainWindow):
                 'free_draw_tool_btn', 'brush_size_widget',
                 'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn',
                 '__sep__',
-                'lasso_fill_btn', 'rect_fill_btn', 'ellipse_fill_btn',
+                'lasso_fill_btn', 'polygon_fill_btn',
+                'rect_fill_btn', 'ellipse_fill_btn', 'triangle_fill_btn',
                 '__sep__',
                 'line_color_btn', '__quick_colors__', 'color_snap_btn',
                 'palette_extract_btn', 'palette_clear_btn',
@@ -2857,6 +2928,28 @@ class RandomImageViewer(QMainWindow):
             self._video_total_label.setText(self._format_video_time(duration_ms))
         if hasattr(self, '_video_overlay'):
             self._video_overlay.update_duration(duration_ms)
+
+    def request_video_thumbnail(self, ms):
+        """Ask for a preview frame of the video on screen at *ms*.
+
+        Decoding happens on ThumbnailWorker's own thread and only for the
+        newest position asked for, so hovering never holds up playback.
+        """
+        path = self.current_image
+        if not path or not getattr(self, '_video_playing', False):
+            return
+        worker = getattr(self, '_thumb_worker', None)
+        if worker is None:
+            worker = ThumbnailWorker(self)
+            worker.ready.connect(self._on_video_thumbnail_ready)
+            self._thumb_worker = worker
+        worker.request(path, ms)
+
+    def _on_video_thumbnail_ready(self, path, ms, image):
+        if path != self.current_image:
+            return          # the clip changed while this frame was decoding
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.show_thumbnail(ms, image)
 
     def _on_video_position_changed(self, position_ms):
         if hasattr(self, '_video_seek_slider') and not self._video_seek_slider.isSliderDown():
@@ -6163,14 +6256,21 @@ class RandomImageViewer(QMainWindow):
     # rotates and flips through the same mapper as every other mark.
     _ELLIPSE_SEGMENTS = 64
 
+    _FILL_BUTTONS = ('lasso_fill_btn', 'polygon_fill_btn', 'rect_fill_btn',
+                     'ellipse_fill_btn', 'triangle_fill_btn')
+
     def toggle_fill_tool(self, mode, checked):
-        """Arm one of the fill tools (lasso / rect / ellipse), or disarm it."""
+        """Arm one of the fill tools, or disarm it."""
         buttons = {
             'lasso': getattr(self, 'lasso_fill_btn', None),
+            'polygon': getattr(self, 'polygon_fill_btn', None),
             'rect': getattr(self, 'rect_fill_btn', None),
             'ellipse': getattr(self, 'ellipse_fill_btn', None),
+            'triangle': getattr(self, 'triangle_fill_btn', None),
         }
         if checked:
+            # A polygon still being placed belongs to the tool being left.
+            self.cancel_fill()
             self.fill_mode = mode
             # Fill tools are mutually exclusive with each other and with the
             # line/draw tools, same as those are with one another.
@@ -6192,18 +6292,21 @@ class RandomImageViewer(QMainWindow):
                     btn.blockSignals(False)
             self._disable_eraser_silent()
             self._disable_color_snap_silent()
-            self.status.showMessage(
-                f"{mode.capitalize()} fill: drag to lay down a filled shape")
+            if mode == 'polygon':
+                self.status.showMessage(self._POLYGON_HINT)
+            else:
+                self.status.showMessage(
+                    f"{mode.capitalize()} fill: drag to lay down a filled shape")
         elif self.fill_mode == mode:
+            self.cancel_fill()
             self.fill_mode = None
-            self.current_fill = None
         self._update_cursor_and_status()
 
     def _disable_fill_tools_silent(self):
         """Turn off any armed fill tool without emitting signals."""
+        self.cancel_fill()
         self.fill_mode = None
-        self.current_fill = None
-        for name in ('lasso_fill_btn', 'rect_fill_btn', 'ellipse_fill_btn'):
+        for name in self._FILL_BUTTONS:
             btn = getattr(self, name, None)
             if btn is not None and btn.isChecked():
                 btn.blockSignals(True)
@@ -6322,8 +6425,8 @@ class RandomImageViewer(QMainWindow):
     def add_fill_point(self, x, y):
         """Extend the shape being dragged."""
         fill = self.current_fill
-        if not fill:
-            return
+        if not fill or fill['shape'] == 'polygon':
+            return      # a polygon is placed by clicks, see polygon_click
         # Zooming or panning mid-drag invalidates the cached mapping.
         remapped = self._fill_view_signature() != self._fill_view_sig
         if remapped:
@@ -6351,12 +6454,7 @@ class RandomImageViewer(QMainWindow):
     def end_fill(self):
         """Commit the dragged shape, if it encloses anything."""
         fill = self.current_fill
-        self.current_fill = None
-        self._fill_to_screen = None
-        self._fill_view_sig = None
-        self._fill_screen_pts = []
-        self._fill_input_cache = None
-        self._fill_input_sig = None
+        self._reset_fill_progress()
         if not fill:
             self.image_label.clear_fill_overlay()
             return
@@ -6364,7 +6462,10 @@ class RandomImageViewer(QMainWindow):
         if len(points) < 3 or self._outline_area(points) < 4.0:
             # Nothing was ever painted into the picture; just drop the preview.
             self.image_label.clear_fill_overlay()
-            self.status.showMessage("Fill too small \u2014 drag out a larger shape")
+            if fill.get('shape') == 'polygon':
+                self.status.showMessage("Polygon needs at least 3 corners \u2014 nothing was filled")
+            else:
+                self.status.showMessage("Fill too small \u2014 drag out a larger shape")
             return
         record = {'shape': fill['shape'], 'points': points,
                   'color': self._fill_preview_color()}
@@ -6411,14 +6512,142 @@ class RandomImageViewer(QMainWindow):
             print(f"_commit_fill_to_view error: {e}")
             return False
 
+    def _reset_fill_progress(self):
+        """Forget the shape in progress and its per-shape caches."""
+        self.current_fill = None
+        self._fill_to_screen = None
+        self._fill_view_sig = None
+        self._fill_screen_pts = []
+        self._fill_input_cache = None
+        self._fill_input_sig = None
+        self._polygon_hover_pos = None
+        self._set_polygon_keys(False)
+
+    def cancel_fill(self):
+        """Drop a shape in progress without adding it; True if there was one."""
+        had = getattr(self, 'current_fill', None) is not None
+        self._reset_fill_progress()
+        label = getattr(self, 'image_label', None)
+        if label is not None:
+            label.clear_fill_overlay()
+        return had
+
+    # -- polygon fill: corners placed by clicking ----------------------------
+    #
+    # Unlike the drag tools a polygon lives across many clicks, so it stays in
+    # current_fill between them. A loose edge follows the pointer, and the
+    # shape is filled by a double-click, Enter, or a click back on the first
+    # corner. Backspace / Ctrl+Z take back the last corner; Esc cancels.
+
+    _POLYGON_HINT = ("Polygon fill: click to place corners \u2014 double-click, Enter or "
+                     "click the first corner to fill; Backspace removes the last corner, "
+                     "Esc cancels")
+    _POLYGON_CLOSE_PX = 8     # a click this close to the first corner closes it
+
+    def _placing_polygon(self):
+        fill = getattr(self, 'current_fill', None)
+        return bool(fill) and fill.get('shape') == 'polygon'
+
+    def _set_polygon_keys(self, enabled):
+        for shortcut in getattr(self, '_polygon_shortcuts', ()):
+            shortcut.setEnabled(enabled)
+
+    def polygon_click(self, x, y, pos):
+        """A click with the polygon tool: start, add a corner, or close.
+
+        (x, y) is the click in image coordinates, *pos* in label coordinates.
+        """
+        if not self._placing_polygon():
+            self.start_fill(x, y)
+            self._set_polygon_keys(True)
+            self._update_polygon_preview(pos)
+            self.status.showMessage(self._POLYGON_HINT)
+            return
+        self._sync_polygon_screen()
+        points = self.current_fill['points']
+        if len(points) >= 3 and self._near_first_corner(pos):
+            self.finish_polygon()
+            return
+        last = points[-1]
+        if abs(x - last[0]) < 0.5 and abs(y - last[1]) < 0.5:
+            return          # the same spot twice adds nothing
+        points.append((x, y))
+        if self._fill_to_screen is not None:
+            self._fill_screen_pts.append(self._fill_to_screen(x, y))
+        self._update_polygon_preview(pos)
+        self.status.showMessage(
+            f"Polygon fill: {len(points)} corners \u2014 double-click, Enter or "
+            "click the first corner to fill")
+
+    def polygon_hover(self, pos):
+        """Pointer moved while placing a polygon: the loose edge follows it."""
+        if self._placing_polygon():
+            self._update_polygon_preview(pos)
+
+    def _sync_polygon_screen(self):
+        """Remap the corners if the view was zoomed / panned between clicks."""
+        if self._fill_view_signature() != self._fill_view_sig:
+            self._rebuild_fill_screen()
+
+    def _near_first_corner(self, pos):
+        pts = self._fill_screen_pts
+        if not pts or pos is None:
+            return False
+        first = pts[0]
+        return (abs(pos.x() - first.x()) <= self._POLYGON_CLOSE_PX
+                and abs(pos.y() - first.y()) <= self._POLYGON_CLOSE_PX)
+
+    def _update_polygon_preview(self, pos=None):
+        if pos is not None:
+            self._polygon_hover_pos = (pos.x(), pos.y())
+        self._sync_polygon_screen()
+        if self._fill_to_screen is None:
+            return
+        pts = list(self._fill_screen_pts)
+        if self._polygon_hover_pos is not None:
+            hx, hy = self._polygon_hover_pos
+            pts.append(QPoint(int(round(hx)), int(round(hy))))
+        self.image_label.set_fill_overlay(pts, self._fill_preview_color(), open_path=True)
+
+    def finish_polygon(self):
+        """Fill the polygon placed so far (double-click, Enter, first corner)."""
+        if not self._placing_polygon():
+            return False
+        self.end_fill()
+        return True
+
+    def undo_polygon_corner(self):
+        """Take back the last corner; with none left the polygon is cancelled."""
+        if not self._placing_polygon():
+            return False
+        points = self.current_fill['points']
+        if len(points) <= 1:
+            self.cancel_fill()
+            self.status.showMessage("Polygon cancelled")
+            return True
+        points.pop()
+        self._rebuild_fill_screen()
+        self._update_polygon_preview()
+        self.status.showMessage(
+            f"Polygon fill: {len(points)} corner{'s' if len(points) != 1 else ''} "
+            "\u2014 last corner removed")
+        return True
+
     def _shape_outline(self, shape, anchor, corner):
-        """Flatten a dragged rectangle/ellipse into an outline of points."""
+        """Flatten a dragged rectangle / triangle / ellipse into an outline."""
         ax, ay = anchor
         cx_, cy_ = corner
         x0, x1 = min(ax, cx_), max(ax, cx_)
         y0, y1 = min(ay, cy_), max(ay, cy_)
         if shape == 'rect':
             return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        if shape == 'triangle':
+            # Apex on the edge the drag started from, base on the far edge:
+            # drag down for a triangle pointing up, drag up for one pointing down.
+            mid = (x0 + x1) / 2.0
+            if cy_ >= ay:
+                return [(mid, y0), (x1, y1), (x0, y1)]
+            return [(mid, y1), (x0, y0), (x1, y0)]
         import math
         rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
         mx, my = x0 + rx, y0 + ry
@@ -6641,25 +6870,15 @@ class RandomImageViewer(QMainWindow):
         return max(1.0, (self.eraser_size / 2.0) / scale)
 
     def _transform_point_to_display(self, x, y, scale_x, scale_y, draw_x, draw_y, original_size):
-        """Map an ORIGINAL-coords point to display coords using the same flip/
-        rotation/scale sequence the line renderer uses for free strokes."""
-        fx, fy = x, y
-        if self.flipped_h:
-            fx = original_size.width() - x
-        if self.flipped_v:
-            fy = original_size.height() - y
-        rot = self.rotation_angle
-        if rot == 90:
-            tx = fy; ty = original_size.width() - fx
-        elif rot == 180:
-            tx = original_size.width() - fx; ty = original_size.height() - fy
-        elif rot == 270:
-            tx = original_size.height() - fy; ty = fx
-        else:
-            tx, ty = fx, fy
-        dx = int(tx * scale_x) + draw_x
-        dy = int(ty * scale_y) + draw_y
-        return dx, dy
+        """Map an ORIGINAL-coords point to display coords.
+
+        *original_size* is the picture as displayed (already rotated), which is
+        what display_image passes. This hands off to the mark painter's mapper
+        so erase holes and overlays land exactly on the marks they belong to;
+        it used to turn the other way and mix rotated with unrotated sizes,
+        which put the holes beside the strokes on a 90/270 picture.
+        """
+        return self._mark_display_mapper(original_size, scale_x, scale_y, draw_x, draw_y)(x, y)
 
     def _draw_post_erase_overlay(self, pixmap, strokes, free_lines, scale_x, scale_y, draw_x, draw_y, original_size):
         """Draw drawings made AFTER the most recent erase onto the revealed image.
@@ -7545,9 +7764,12 @@ class RandomImageViewer(QMainWindow):
         if not geom:
             return
         sx, sy = self.current_line_start
+        shown = geom['original_size']
+        if geom.get('rotation') in (90, 270):
+            shown = QSize(shown.height(), shown.width())   # the picture as displayed
         start_dx, start_dy = self._transform_point_to_display(
             sx, sy, geom['scale_x'], geom['scale_y'],
-            geom['draw_x'], geom['draw_y'], geom['original_size'])
+            geom['draw_x'], geom['draw_y'], shown)
         end_x, end_y = self._line_preview_pending_pos
 
         preview = self._line_preview_base.copy()
@@ -7645,6 +7867,36 @@ class RandomImageViewer(QMainWindow):
             print(f"Error initializing drawing cache: {e}")
             self.is_drawing_free_stroke = False
 
+    @staticmethod
+    def _stroke_cache_to_screen(cache, x, y):
+        """Image coords -> label coords for the live brush stroke.
+
+        The same flip-then-clockwise-turn as _mark_display_mapper, kept in
+        floats, so the stroke under the pen is where it will be committed.
+        The old version flipped in screen space after turning, which only
+        matched a mirror-image error in the click maths.
+        """
+        size = cache['original_size']          # unrotated picture
+        w, h = size.width(), size.height()
+        rotation = cache['rotation']
+        if rotation in (90, 270):
+            scale_x = cache['zoomed_width'] / h
+            scale_y = cache['zoomed_height'] / w
+        else:
+            scale_x = cache['zoomed_width'] / w
+            scale_y = cache['zoomed_height'] / h
+        fx = w - x if cache['flipped_h'] else x
+        fy = h - y if cache['flipped_v'] else y
+        if rotation == 90:
+            sx, sy = (h - fy) * scale_x, fx * scale_y
+        elif rotation == 180:
+            sx, sy = (w - fx) * scale_x, (h - fy) * scale_y
+        elif rotation == 270:
+            sx, sy = fy * scale_x, (w - fx) * scale_y
+        else:
+            sx, sy = fx * scale_x, fy * scale_y
+        return sx + cache['draw_x'], sy + cache['draw_y']
+
     def add_free_draw_point(self, x, y, pressure=1.0):
         """⚡ INCREMENTAL PAINTING: Add point with ultra-fast incremental drawing"""
         if not self.is_drawing_free_stroke or not self.drawing_cache:
@@ -7658,44 +7910,7 @@ class RandomImageViewer(QMainWindow):
         label_size = cache['label_size']
         zoom_factor = cache['zoom_factor']
 
-        # Convert to screen coordinates using cached parameters
-        rotation = cache['rotation']
-        original_size = cache['original_size']
-
-        if rotation == 90 or rotation == 270:
-            scale_x = cache['zoomed_width'] / original_size.height()
-            scale_y = cache['zoomed_height'] / original_size.width()
-        else:
-            scale_x = cache['zoomed_width'] / original_size.width()
-            scale_y = cache['zoomed_height'] / original_size.height()
-
-        # Apply transformations using cached data
-        display_x = x * scale_x
-        display_y = y * scale_y
-
-        # Apply rotation (reverse transformation)
-        if rotation == 90:
-            screen_x = original_size.width() * scale_x - display_y
-            screen_y = display_x
-        elif rotation == 180:
-            screen_x = original_size.width() * scale_x - display_x
-            screen_y = original_size.height() * scale_y - display_y
-        elif rotation == 270:
-            screen_x = display_y
-            screen_y = original_size.height() * scale_y - display_x
-        else:  # 0 degrees
-            screen_x = display_x
-            screen_y = display_y
-
-        # Apply flips
-        if cache['flipped_h']:
-            screen_x = cache['zoomed_width'] - screen_x
-        if cache['flipped_v']:
-            screen_y = cache['zoomed_height'] - screen_y
-
-        # Final screen position
-        final_x = screen_x + cache['draw_x']
-        final_y = screen_y + cache['draw_y']
+        final_x, final_y = self._stroke_cache_to_screen(cache, x, y)
 
         # ⚡ INCREMENTAL PAINTING: Only paint the new segment
         if self.last_draw_point is not None:
@@ -8034,7 +8249,7 @@ class RandomImageViewer(QMainWindow):
     def clear_lines(self):
         self._wheel_nav_hint_shown = False
         self.drawn_fills.clear()
-        self.current_fill = None
+        self.cancel_fill()
         self.drawn_lines.clear()
         self.drawn_horizontal_lines.clear()
         self.drawn_free_lines.clear()
@@ -8064,6 +8279,10 @@ class RandomImageViewer(QMainWindow):
             self._clear_line_preview()
             self._update_cursor_and_status()
             self.status.showMessage("Cancelled free line")
+            return
+
+        # A polygon being placed: take back its last corner first.
+        if self.undo_polygon_corner():
             return
 
         if not self._undo_stack:
@@ -10088,17 +10307,17 @@ class RandomImageViewer(QMainWindow):
             # INSTANT FINALIZATION: Complete everything synchronously in one go
             self.status.showMessage("Finalizing LUT...")
             
-            # Apply ALL transformations immediately
-            if self.rotation_angle != 0:
-                transform = QTransform()
-                transform.rotate(self.rotation_angle)
-                processed_pixmap = processed_pixmap.transformed(transform, Qt.SmoothTransformation)
-            
+            # Apply ALL transformations immediately: flips, then rotation,
+            # in the same order as display_image
             if self.flipped_h:
                 processed_pixmap = processed_pixmap.transformed(QTransform().scale(-1, 1), Qt.SmoothTransformation)
             if self.flipped_v:
                 processed_pixmap = processed_pixmap.transformed(QTransform().scale(1, -1), Qt.SmoothTransformation)
-            
+            if self.rotation_angle != 0:
+                transform = QTransform()
+                transform.rotate(self.rotation_angle)
+                processed_pixmap = processed_pixmap.transformed(transform, Qt.SmoothTransformation)
+
             if (self.grayscale_value != 0 or self.contrast_value != 50 or self.gamma_value != 0):
                 processed_pixmap = self.apply_fast_enhancements(processed_pixmap)
             
@@ -10283,22 +10502,22 @@ class RandomImageViewer(QMainWindow):
             self.display_image(img_path)
 
     def _apply_quick_transforms(self, pixmap, quality=Qt.FastTransformation):
-        """Apply rotation and flips with specified quality for preview"""
+        """Apply flips, then rotation, with the given quality for a preview.
+
+        Flip first, like display_image. On a 90/270 picture the other order
+        mirrors it along the wrong axis, so the marks (placed for the
+        display_image order) no longer sat on what they were drawn over.
+        """
         if not pixmap or pixmap.isNull():
             return pixmap
-            
-        # Apply rotation if needed
-        if self.rotation_angle != 0:
-            transform = QTransform()
-            transform.rotate(self.rotation_angle)
-            pixmap = pixmap.transformed(transform, quality)
-        
-        # Apply flips if needed
         if self.flipped_h:
             pixmap = pixmap.transformed(QTransform().scale(-1, 1), quality)
         if self.flipped_v:
             pixmap = pixmap.transformed(QTransform().scale(1, -1), quality)
-            
+        if self.rotation_angle != 0:
+            transform = QTransform()
+            transform.rotate(self.rotation_angle)
+            pixmap = pixmap.transformed(transform, quality)
         return pixmap
 
     def _apply_full_quality_to_current_image(self):
@@ -11090,22 +11309,17 @@ class RandomImageViewer(QMainWindow):
         return f"{self.current_image}_{lut_file_path}_{self.lut_strength}{lines_key}{enhancements_key}"
     
     def _apply_cached_transforms(self, pixmap):
-        """Apply rotation and flips to cached pixmap"""
+        """Apply flips, then rotation, to a cached pixmap (as display_image does)."""
         if not pixmap or pixmap.isNull():
             return pixmap
-            
-        # Apply rotation if needed
-        if self.rotation_angle != 0:
-            transform = QTransform()
-            transform.rotate(self.rotation_angle)
-            pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
-        
-        # Apply flips if needed
         if self.flipped_h:
             pixmap = pixmap.transformed(QTransform().scale(-1, 1), Qt.SmoothTransformation)
         if self.flipped_v:
             pixmap = pixmap.transformed(QTransform().scale(1, -1), Qt.SmoothTransformation)
-            
+        if self.rotation_angle != 0:
+            transform = QTransform()
+            transform.rotate(self.rotation_angle)
+            pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
         return pixmap
 
     def flip_horizontal(self):
@@ -11342,6 +11556,9 @@ class RandomImageViewer(QMainWindow):
         self._close_pdf()
         self._close_epub()
         self._close_cbr()
+        worker = getattr(self, '_thumb_worker', None)
+        if worker is not None:
+            worker.stop()
         super().closeEvent(event)
 
     def report_startup_ready(self, launch_t0=None):
@@ -12495,7 +12712,8 @@ class RandomImageViewer(QMainWindow):
         """Enable/disable line/free-draw toolbar buttons (used in spread mode)."""
         for name in (
             "line_tool_btn", "hline_tool_btn", "free_line_tool_btn",
-            "free_draw_tool_btn", "lasso_fill_btn", "rect_fill_btn", "ellipse_fill_btn",
+            "free_draw_tool_btn", "lasso_fill_btn", "polygon_fill_btn", "rect_fill_btn", "ellipse_fill_btn",
+            "triangle_fill_btn",
             "antialiasing_btn", "pen_pressure_btn",
             "brush_size_widget", "line_transparency_slider",
             "line_color_btn", "undo_line_btn",

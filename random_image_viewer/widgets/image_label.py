@@ -74,25 +74,42 @@ class ImageLabel(QLabel):
 
     _FILL_FRAME = 1.0 / 60.0
 
-    def set_fill_overlay(self, points, color, appended=False):
+    def set_fill_overlay(self, points, color, appended=False, open_path=False):
         """Show *points* (widget coordinates) as a filled shape over the image.
 
         ``appended`` means the caller only added one vertex to the same outline
         (lasso): the change is then just the triangle between the first point
         and the new last edge. Otherwise it is where the old and new shapes
         differ, which for a resized rectangle is a couple of thin strips.
+        ``open_path`` marks a polygon still being placed: its edges and first
+        corner are outlined as well, so the repaint covers its bounding box.
         """
-        previous = self._fill_overlay[0] if self._fill_overlay else None
+        previous = self._fill_overlay
         pts = points if appended else list(points)
-        self._fill_overlay = (pts, QColor(color)) if pts else None
-        if appended and len(pts) >= 3:
+        self._fill_overlay = (pts, QColor(color), open_path) if pts else None
+        if open_path or (previous and previous[2]):
+            changed = self._outline_region(previous[0] if previous else None).united(
+                self._outline_region(pts))
+        elif appended and len(pts) >= 3:
             changed = QRegion(QPolygon([pts[0], pts[-2], pts[-1]]))
         else:
-            old = (QRegion(QPolygon(previous)) if previous and len(previous) >= 3
+            prev_pts = previous[0] if previous else None
+            old = (QRegion(QPolygon(prev_pts)) if prev_pts and len(prev_pts) >= 3
                    else QRegion())
             new = QRegion(QPolygon(pts)) if pts and len(pts) >= 3 else QRegion()
             changed = old.xored(new)
         self._queue_fill_repaint(changed)
+
+    # Radius of the ring marking a polygon's first corner (click it to close).
+    _CORNER_RING = 5
+
+    @classmethod
+    def _outline_region(cls, pts):
+        """Bounding box of an open outline, padded for its corner ring."""
+        if not pts:
+            return QRegion()
+        pad = cls._CORNER_RING + 3
+        return QRegion(QPolygon(pts).boundingRect().adjusted(-pad, -pad, pad, pad))
 
     def clear_fill_overlay(self):
         """Remove the in-progress shape, repainting straight away (release)."""
@@ -102,8 +119,12 @@ class ImageLabel(QLabel):
         self._fill_pending = None
         if self._fill_timer is not None:
             self._fill_timer.stop()
-        if overlay and len(overlay[0]) >= 3:
-            region = region.united(QRegion(QPolygon(overlay[0])))
+        if overlay:
+            pts, _colour, open_path = overlay
+            if open_path:
+                region = region.united(self._outline_region(pts))
+            elif len(pts) >= 3:
+                region = region.united(QRegion(QPolygon(pts)))
         if not region.isEmpty():
             self.update(self._grow_region(region))
 
@@ -142,17 +163,33 @@ class ImageLabel(QLabel):
     def paintEvent(self, event):
         super().paintEvent(event)
         overlay = getattr(self, '_fill_overlay', None)
-        if not overlay or len(overlay[0]) < 3:
+        if not overlay:
             return
-        points, color = overlay
+        points, color, open_path = overlay
+        if len(points) < (2 if open_path else 3):
+            return
         painter = QPainter(self)
         painter.setClipRegion(event.region())
         # The same colour and smoothing the committed fill gets, so letting go
         # of the mouse changes nothing on screen.
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(color)
-        painter.drawPolygon(QPolygon(points))
+        if len(points) >= 3:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawPolygon(QPolygon(points))
+        if open_path:
+            # A polygon being placed: its edges so far plus the loose one to
+            # the pointer, and a ring on the first corner - click it to close.
+            painter.setBrush(Qt.NoBrush)
+            edge = QColor(color)
+            edge.setAlpha(255)
+            painter.setPen(QPen(edge, 1))
+            painter.drawPolyline(QPolygon(points))
+            first = points[0]
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+            painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
         painter.end()
 
     def start_animation(self, file_path, scaled_size=None):
@@ -194,6 +231,11 @@ class ImageLabel(QLabel):
         color-snap tool samples the exact pixel the cursor points at.
         Returns (original_x, original_y) or (None, None) if cursor is outside
         the visible image content.
+
+        It must stay the exact inverse of the mark painter
+        (RandomImageViewer._mark_display_mapper): flip, then a clockwise
+        quarter turn. The same inverse is repeated in _map_pos_with_cache and
+        in the press / move handlers for speed.
         """
         if not (self.parent_viewer and self.pixmap() and not self.pixmap().isNull()
                 and self.parent_viewer.current_image):
@@ -238,11 +280,11 @@ class ImageLabel(QLabel):
         if rotation == 0:
             unrotated_x, unrotated_y = display_x, display_y
         elif rotation == 90:
-            unrotated_x, unrotated_y = display_y, original_size.width() - display_x
+            unrotated_x, unrotated_y = display_y, original_size.height() - display_x
         elif rotation == 180:
             unrotated_x, unrotated_y = original_size.width() - display_x, original_size.height() - display_y
         elif rotation == 270:
-            unrotated_x, unrotated_y = original_size.height() - display_y, display_x
+            unrotated_x, unrotated_y = original_size.width() - display_y, display_x
         else:
             unrotated_x, unrotated_y = display_x, display_y
 
@@ -316,11 +358,11 @@ class ImageLabel(QLabel):
         if rotation == 0:
             unrotated_x, unrotated_y = display_x, display_y
         elif rotation == 90:
-            unrotated_x, unrotated_y = display_y, original_size.width() - display_x
+            unrotated_x, unrotated_y = display_y, original_size.height() - display_x
         elif rotation == 180:
             unrotated_x, unrotated_y = original_size.width() - display_x, original_size.height() - display_y
         elif rotation == 270:
-            unrotated_x, unrotated_y = original_size.height() - display_y, display_x
+            unrotated_x, unrotated_y = original_size.width() - display_y, display_x
         else:
             unrotated_x, unrotated_y = display_x, display_y
 
@@ -722,6 +764,15 @@ class ImageLabel(QLabel):
             event.ignore()
 
     def mouseDoubleClickEvent(self, event):
+        # Double-click fills a polygon. The first click of the pair already
+        # placed that corner, so this must not add another.
+        viewer = self.parent_viewer
+        if (event.button() == Qt.LeftButton and viewer is not None
+                and getattr(viewer, 'fill_mode', None) == 'polygon'
+                and viewer._placing_polygon()):
+            viewer.finish_polygon()
+            event.accept()
+            return
         # Absorb middle-button double-clicks so they don't re-trigger
         # mousePressEvent (Qt's default behaviour), which would skip an image.
         if event.button() == Qt.MiddleButton:
@@ -762,6 +813,7 @@ class ImageLabel(QLabel):
             not self.parent_viewer.free_line_drawing_mode and
             not self.parent_viewer.free_draw_mode and
             not getattr(self.parent_viewer, 'eraser_mode', False) and
+            not getattr(self.parent_viewer, 'fill_mode', None) and
             not getattr(self.parent_viewer, 'color_snap_mode', False)):
 
             self.is_panning = True
@@ -889,12 +941,12 @@ class ImageLabel(QLabel):
                     unrotated_y = display_y
                 elif rotation == 90:
                     unrotated_x = display_y
-                    unrotated_y = original_size.width() - display_x
+                    unrotated_y = original_size.height() - display_x
                 elif rotation == 180:
                     unrotated_x = original_size.width() - display_x
                     unrotated_y = original_size.height() - display_y
                 elif rotation == 270:
-                    unrotated_x = original_size.height() - display_y
+                    unrotated_x = original_size.width() - display_y
                     unrotated_y = display_x
                 else:
                     unrotated_x = display_x
@@ -923,7 +975,10 @@ class ImageLabel(QLabel):
                     # PEN PRESSURE: Store current pressure for real-time painting
                     if self.parent_viewer and self.parent_viewer.pen_pressure_enabled:
                         self.parent_viewer._current_pressure = pressure
-                if getattr(self.parent_viewer, 'fill_mode', None):
+                if getattr(self.parent_viewer, 'fill_mode', None) == 'polygon':
+                    # Corners are placed click by click (see polygon_click)
+                    self.parent_viewer.polygon_click(original_x, original_y, event.position())
+                elif getattr(self.parent_viewer, 'fill_mode', None):
                     self.parent_viewer.start_fill(original_x, original_y)
                 if getattr(self.parent_viewer, 'eraser_mode', False):
                     self.parent_viewer.start_erase_stroke(original_x, original_y)
@@ -931,6 +986,14 @@ class ImageLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # A polygon being placed: the loose edge follows the pointer, whether
+        # or not a button is held (right-drag panning still falls through).
+        if self.parent_viewer and getattr(self.parent_viewer, 'fill_mode', None) == 'polygon':
+            self.parent_viewer.polygon_hover(event.position())
+            if event.buttons() & Qt.LeftButton:
+                event.accept()
+                return
+
         # Extend a filled shape that is being dragged out. Handled before the
         # other tools so it cannot disturb their branches, and mapped through
         # the viewer's per-drag cache: _map_label_pos_to_original re-decodes
@@ -1069,11 +1132,11 @@ class ImageLabel(QLabel):
                 if rotation == 0:
                     unrotated_x, unrotated_y = display_x, display_y
                 elif rotation == 90:
-                    unrotated_x, unrotated_y = display_y, original_size.width() - display_x
+                    unrotated_x, unrotated_y = display_y, original_size.height() - display_x
                 elif rotation == 180:
                     unrotated_x, unrotated_y = original_size.width() - display_x, original_size.height() - display_y
                 else: # 270
-                    unrotated_x, unrotated_y = original_size.height() - display_y, display_x
+                    unrotated_x, unrotated_y = original_size.width() - display_y, display_x
 
                 # FAST FLIP TRANSFORMATIONS: Pre-calculated
                 original_x, original_y = unrotated_x, unrotated_y
@@ -1295,7 +1358,9 @@ class ImageLabel(QLabel):
         # Fill tools: commit the shape that was dragged out
         if (event.button() == Qt.LeftButton and self.parent_viewer and
                 getattr(self.parent_viewer, 'current_fill', None)):
-            self.parent_viewer.end_fill()
+            # A polygon stays open between clicks; only drag shapes end here.
+            if self.parent_viewer.current_fill.get('shape') != 'polygon':
+                self.parent_viewer.end_fill()
             event.accept()
             return
 
