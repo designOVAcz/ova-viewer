@@ -27,7 +27,8 @@ from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QEvent, QPro
 from PySide6.QtWidgets import QLayout, QWidgetAction
 
 from random_image_viewer.constants import (IMAGE_EXTENSIONS, MEDIA_EXTENSIONS, DOCUMENT_EXTENSIONS,
-                                           PLAYLIST_EXTENSIONS, APP_VERSION)
+                                           PLAYLIST_EXTENSIONS)
+from random_image_viewer.version import get_version
 from random_image_viewer.platform_utils import (  # noqa: F401
     process_uptime_seconds,
     is_windows_dark_mode, enable_windows_dark_title_bar, setup_image_allocation_limit
@@ -1549,11 +1550,11 @@ class RandomImageViewer(QMainWindow):
 
         # Build/startup readout for developers: deliberately small and dim so
         # it reads as instrumentation rather than UI. Filled in by
-        # report_startup_ready() once the window is interactive.
-        self.startup_label = QLabel(f"v{APP_VERSION}")
+        # report_startup_ready() once the window is interactive (the version
+        # comes from git, which is too slow to ask during startup).
+        self.startup_label = QLabel()
         self.startup_label.setStyleSheet(
             "QLabel { color: #5f6368; font-size: 10px; padding-right: 8px; }")
-        self.startup_label.setToolTip(f"Ova Viewer {APP_VERSION}")
         self.statusBar().addPermanentWidget(self.startup_label)
 
         self.path_label = QLabel()
@@ -11651,9 +11652,10 @@ class RandomImageViewer(QMainWindow):
             from PySide6.QtCore import qVersion
             label = getattr(self, 'startup_label', None)
             if label is not None:
-                label.setText(f"v{APP_VERSION} \u00b7 {seconds:.2f}s")
+                version = get_version()
+                label.setText(f"v{version} \u00b7 {seconds:.2f}s")
                 label.setToolTip(
-                    f"Ova Viewer {APP_VERSION}\n"
+                    f"Ova Viewer {version}\n"
                     f"Ready in {seconds:.2f} s (from {source} to interactive)\n"
                     f"Python {sys.version.split()[0]} \u00b7 Qt {qVersion()}\n"
                     f"{'Frozen build' if getattr(sys, 'frozen', False) else 'Running from source'}")
@@ -12061,25 +12063,26 @@ class RandomImageViewer(QMainWindow):
             return
 
         local_paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
-        local_paths = [p for p in local_paths if p]
-        if not local_paths:
-            event.ignore()
-            return
-
-        has_folder = any(os.path.isdir(p) for p in local_paths)
-        if len(local_paths) == 1 and not has_folder:
-            # Single file → existing standalone behavior.
-            if self._open_local_path(local_paths[0], source="dropped"):
-                event.acceptProposedAction()
-                return
-            event.ignore()
-            return
-
-        # Multiple files, or any folder → build a mixed playlist.
-        if self._load_playlist(local_paths, source="dropped"):
+        if self.open_paths(local_paths, source="dropped"):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+    def open_paths(self, paths, source="opened"):
+        """Open files/folders given by a drop or on the command line (Explorer's
+        "Open with" / default-app launch passes the file as an argument).
+
+        A single file uses the standalone open path (its folder becomes the
+        playlist). Multiple paths, or any folder, build a mixed playlist that
+        walks images, videos, GIFs, PDFs, EPUBs, and CBR/CBZ archives.
+        Returns True if anything was opened.
+        """
+        paths = [p for p in paths if p]
+        if not paths:
+            return False
+        if len(paths) == 1 and not os.path.isdir(paths[0]):
+            return self._open_local_path(paths[0], source=source)
+        return self._load_playlist(paths, source=source)
 
     def _open_local_path(self, file_path, source="opened"):
         """Open a local file or folder (PDF, EPUB, image, video, or directory).

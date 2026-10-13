@@ -1,8 +1,5 @@
 import os
 
-# Bump on release. Shown (with the startup time) in the status bar corner.
-APP_VERSION = "1.0.0"
-
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp',
                     '.jp2', '.j2k', '.jpf', '.jpx'}
 

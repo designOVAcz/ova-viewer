@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 
@@ -82,6 +83,14 @@ def main():
     # number reflects a genuinely interactive window rather than just the
     # moment show() returned.
     QTimer.singleShot(0, lambda: viewer.report_startup_ready(launch_t0))
+
+    # Files/folders passed on the command line - this is how Explorer's
+    # "Open with" and default-app double-click hand over the file.
+    # app.arguments() has Qt's own options (-platform ...) already removed.
+    launch_paths = [os.path.abspath(a) for a in app.arguments()[1:]
+                    if os.path.exists(a)]
+    if launch_paths:
+        QTimer.singleShot(0, lambda: viewer.open_paths(launch_paths))
 
     def _startup_done():
         app.removeEventFilter(pinner)

@@ -119,6 +119,29 @@ python -m PyInstaller --noconfirm "Ova Viewer.spec"
 Output: `dist/Ova Viewer/Ova Viewer.exe` — keep the folder together (a
 one-folder build starts ~4x faster than a one-file exe).
 
+## Versioning
+
+The version comes from **git tags** — there is no version number to edit.
+Releases are annotated [SemVer](https://semver.org) tags; every commit in
+between gets a unique version automatically:
+
+| State | Version |
+|---|---|
+| exactly on tag `v1.2.0` | `1.2.0` |
+| 3 commits after it | `1.2.0+3.gabc1234` |
+| with uncommitted changes | `1.2.0+3.gabc1234.dirty` |
+
+It shows in the status bar corner and in the exe's *Properties → Details*.
+To release, tag and push (this repo has `push.followTags` on, so a plain
+`git push` also sends new tags):
+
+```bat
+git tag -a v1.2.0 -m "Ova Viewer 1.2.0"
+git push
+```
+
+Bump MAJOR for breaking changes, MINOR for new features, PATCH for fixes.
+
 ---
 
 ## Screenshot
