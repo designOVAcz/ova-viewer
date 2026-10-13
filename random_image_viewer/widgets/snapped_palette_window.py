@@ -4,7 +4,7 @@ A small frameless, draggable always-on-top window that displays swatches
 of colors picked or auto-extracted via the eyedropper. Persistent: only
 the ✕ close button hides it (tool toggles do not affect visibility).
 
-Swatches are grouped into rows. Each 🪄 auto-extract creates a new row;
+Swatches are grouped into rows. Each ✨ auto-extract creates a new row;
 💉 clicks append to the most-recent row.
 
 Signals:
@@ -102,7 +102,7 @@ class SnappedPaletteWindow(QWidget):
         inner.addWidget(self._rows_container, 1)
 
         # Empty-state placeholder
-        self._empty_label = QLabel("(no colors yet — click on the image or 🪄 extract)")
+        self._empty_label = QLabel("(no colors yet — click on the image or ✨ extract)")
         self._empty_label.setStyleSheet(
             "QLabel { color: #888; font-size: 8pt; padding: 2px 4px;"
             " background: transparent; font-style: italic; }"

@@ -1,5 +1,16 @@
-PySide6>=6.0
-PyMuPDF>=1.20
-rarfile>=4
-opencv-python>=4.5
-Pillow>=9.0
+# Runtime dependencies - Python 3.15, installed into the project's .venv:
+#   py -3.15 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+
+# Qt. Essentials + Addons (QtMultimedia lives in Addons) rather than the
+# "PySide6" meta-package, which also pulls in WebEngine and QtPdf (~400 MB)
+# that the viewer never uses. All PySide6 parts must be the same version.
+PySide6-Essentials~=6.12.0
+PySide6-Addons~=6.12.0
+
+PyMuPDF>=1.28              # PDF / EPUB rendering (import pymupdf)
+opencv-python-headless>=5.0  # edge detection, video frame grabs (no cv2 GUI needed)
+numpy>=2.5
+Pillow>=12.0
+rarfile>=4.2               # .cbr archives (also needs UnRAR/7-Zip on PATH)
+pyopencl>=2026.1           # optional: GPU (OpenCL) LUT processing; CPU fallback if absent

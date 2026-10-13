@@ -209,6 +209,10 @@ class ImageLabel(QLabel):
         # Do NOT call self.setMovie(movie) — frames are handled by the viewer
         if self.parent_viewer and hasattr(self.parent_viewer, '_on_gif_frame_changed'):
             movie.frameChanged.connect(self.parent_viewer._on_gif_frame_changed)
+        # A GIF that declares a finite loop count stops on its own; the loop
+        # toggle restarts it from here (most GIFs loop forever and never emit it).
+        if self.parent_viewer and hasattr(self.parent_viewer, '_on_gif_finished'):
+            movie.finished.connect(self.parent_viewer._on_gif_finished)
         movie.start()
         return True
 
@@ -216,10 +220,11 @@ class ImageLabel(QLabel):
         """Stop and clean up any running QMovie animation"""
         if self._current_movie is not None:
             self._current_movie.stop()
-            try:
-                self._current_movie.frameChanged.disconnect()
-            except RuntimeError:
-                pass
+            for signal in (self._current_movie.frameChanged, self._current_movie.finished):
+                try:
+                    signal.disconnect()
+                except RuntimeError:
+                    pass
             self.setMovie(None)
             self._current_movie.deleteLater()
             self._current_movie = None
@@ -582,6 +587,26 @@ class ImageLabel(QLabel):
         # drift check, so scrubbing lands both tracks together.
         if self._dub_player is not None:
             self._dub_player.setPosition(int(position_ms))
+
+    def video_restart(self):
+        """Play this video again from the start (the loop toggle)."""
+        if self._media_player is None:
+            return False
+        self._media_player.setPosition(0)
+        if self._dub_player is not None:
+            self._dub_player.setPosition(0)
+            self._dub_player.play()
+        self._media_player.play()
+        return True
+
+    def gif_restart(self):
+        """Play this animation again from its first frame (the loop toggle)."""
+        movie = self._current_movie
+        if movie is None:
+            return False
+        movie.jumpToFrame(0)
+        movie.start()
+        return True
 
     def video_set_volume(self, value):
         """Set volume 0-100 int → 0.0-1.0 float (the dub track when one is on)"""

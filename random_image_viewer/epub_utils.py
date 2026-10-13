@@ -40,7 +40,7 @@ class EpubDocument:
     CACHE_SIZE = 10
 
     def __init__(self, epub_path):
-        import fitz
+        import pymupdf as fitz
         self.epub_path = epub_path
         self._doc = fitz.open(epub_path)
         self.page_count = self._doc.page_count
@@ -102,7 +102,7 @@ class EpubDocument:
     # ── internal ────────────────────────────────────────────────
 
     def _do_render(self, page_num):
-        import fitz
+        import pymupdf as fitz
         page = self._doc.load_page(page_num)
         mat = fitz.Matrix(self._zoom, self._zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)

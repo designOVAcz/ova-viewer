@@ -36,7 +36,7 @@ from random_image_viewer.styles import get_adaptive_stylesheet
 from random_image_viewer.image_utils import (
     get_image_file_size, smart_load_pixmap, safe_load_pixmap,
     natural_sort_key, get_images_in_folder, get_playlist_items_in_folder,
-    emoji_icon, is_animated_gif, is_video_file, PlaylistScanner,
+    emoji_icon, is_animated_image, is_video_file, PlaylistScanner,
     find_subtitle_file, find_dub_audio_file, parse_srt, load_thumbnail_pixmap
 )
 from random_image_viewer.pdf_utils import is_pdf_file, PdfDocument
@@ -331,6 +331,14 @@ class VideoControlsOverlay(QWidget):
         # Autoplay next / dub audio also live on the main toolbar, but that is
         # hidden in minimal and panel layouts — mirror them here so they are
         # reachable whenever a video is on screen.
+        self._loop_btn = QToolButton()
+        self._loop_btn.setText("\U0001f501")
+        self._loop_btn.setCheckable(True)
+        self._loop_btn.setToolTip("Loop: play this video or GIF again when it ends")
+        self._loop_btn.setFixedSize(28, 28)
+        self._loop_btn.clicked.connect(self._on_loop_toggle)
+        ctrl_row.addWidget(self._loop_btn)
+
         self._autoplay_btn = QToolButton()
         self._autoplay_btn.setText("\u23ed")
         self._autoplay_btn.setCheckable(True)
@@ -390,6 +398,7 @@ class VideoControlsOverlay(QWidget):
         self._mute_btn.setText("\U0001f507" if muted else "\U0001f50a")
         if self._viewer is not None:
             self.update_autoplay_state(getattr(self._viewer, 'autoplay_next_enabled', False))
+            self.update_loop_state(getattr(self._viewer, 'loop_media_enabled', False))
             self.update_dub_state(getattr(self._viewer, 'dub_audio_enabled', False))
             self.update_subtitle_state(
                 bool(getattr(self._viewer, '_subtitle_cues', None)),
@@ -429,6 +438,12 @@ class VideoControlsOverlay(QWidget):
     def update_mute_state(self, muted):
         self._is_muted = muted
         self._mute_btn.setText("\U0001f507" if muted else "\U0001f50a")
+
+    def update_loop_state(self, enabled):
+        """Mirror the toolbar's loop toggle."""
+        self._loop_btn.blockSignals(True)
+        self._loop_btn.setChecked(bool(enabled))
+        self._loop_btn.blockSignals(False)
 
     def update_autoplay_state(self, enabled):
         """Mirror the toolbar's autoplay-next toggle."""
@@ -574,6 +589,11 @@ class VideoControlsOverlay(QWidget):
     def _on_subs_toggle(self, checked):
         if self._viewer:
             self._viewer.toggle_subtitles(checked)
+        self._hide_timer.start(self.HIDE_DELAY_MS)
+
+    def _on_loop_toggle(self, checked):
+        if self._viewer:
+            self._viewer.toggle_loop_media(checked)
         self._hide_timer.start(self.HIDE_DELAY_MS)
 
     def _on_autoplay_toggle(self, checked):
@@ -1129,8 +1149,8 @@ class RandomImageViewer(QMainWindow):
         self._color_snap_preview = None  # Lazy-created ColorSnapPreview widget
         self._color_snap_last_label_pos = None  # Sampled point in label coords (for overlay connector)
         self._color_snap_last_color = None  # Last sampled QColor (for overlay connector)
-        # Snap palette: persisted swatches of colors picked via 💉 or 🪄 auto-extract.
-        # Stored as ROWS — each 🪄 extract creates a new row; 💉 clicks append to
+        # Snap palette: persisted swatches of colors picked via 💉 or ✨ auto-extract.
+        # Stored as ROWS — each ✨ extract creates a new row; 💉 clicks append to
         # the most-recent row. Global dedup across all rows.
         self.snapped_rows = []  # list[list[str]]
         self.snapped_rows_max = 10  # FIFO cap on number of rows
@@ -1306,6 +1326,7 @@ class RandomImageViewer(QMainWindow):
         # Autoplay-on-end: advance to the next item when a video or animated
         # GIF finishes, so clips play back to back. Off by default.
         self.autoplay_next_enabled = False
+        self.loop_media_enabled = False   # repeat the clip instead of ending it
         self._autoplay_advancing = False   # re-entrancy guard while switching
         self._gif_prev_frame = -1          # last GIF frame seen (loop detection)
         self._gif_started_at = 0.0         # monotonic time the GIF pass began
@@ -1839,8 +1860,8 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         # 💉 Color Snap (eyedropper) — sample a color from the image as line color
         self.color_snap_btn = QToolButton(); self.color_snap_btn.setText("💉"); self.color_snap_btn.setToolTip("Color Snap (I): hover to preview (after ~350ms), click to pick (saves to palette →)"); self.color_snap_btn.setCheckable(True); self.color_snap_btn.setFixedSize(24,24); self.color_snap_btn.toggled.connect(self.toggle_color_snap); toolbar.addWidget(self.color_snap_btn)
-        # 🪄 Auto-extract palette from current image
-        self.palette_extract_btn = QToolButton(); self.palette_extract_btn.setText("🪄"); self.palette_extract_btn.setToolTip("Auto-extract dominant colors from current image into palette"); self.palette_extract_btn.setFixedSize(24,24); self.palette_extract_btn.clicked.connect(self.extract_palette_from_image); toolbar.addWidget(self.palette_extract_btn)
+        # ✨ Auto-extract palette from current image
+        self.palette_extract_btn = QToolButton(); self.palette_extract_btn.setText("✨"); self.palette_extract_btn.setToolTip("Auto-extract dominant colors from current image into palette"); self.palette_extract_btn.setFixedSize(24,24); self.palette_extract_btn.clicked.connect(self.extract_palette_from_image); toolbar.addWidget(self.palette_extract_btn)
         # 🧽 Clear palette
         self.palette_clear_btn = QToolButton(); self.palette_clear_btn.setText("🧽"); self.palette_clear_btn.setToolTip("Clear saved color palette"); self.palette_clear_btn.setFixedSize(24,24); self.palette_clear_btn.clicked.connect(self.clear_snapped_palette); toolbar.addWidget(self.palette_clear_btn)
         add_section_divider()
@@ -1896,6 +1917,8 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         # Autoplay next: when a video / animated GIF ends, move to the next item
         self.autoplay_next_btn = QToolButton(); self.autoplay_next_btn.setText("⏭"); self.autoplay_next_btn.setToolTip("Autoplay next: when a video or animated GIF finishes, advance to the next item"); self.autoplay_next_btn.setCheckable(True); self.autoplay_next_btn.setChecked(self.autoplay_next_enabled); self.autoplay_next_btn.setFixedSize(24,24); self.autoplay_next_btn.toggled.connect(self.toggle_autoplay_next); toolbar.addWidget(self.autoplay_next_btn)
+        add_spacer(2)
+        self.loop_btn = QToolButton(); self.loop_btn.setText("\U0001f501"); self.loop_btn.setToolTip("Loop: when this video or animated GIF ends, play it again from the start"); self.loop_btn.setCheckable(True); self.loop_btn.setChecked(self.loop_media_enabled); self.loop_btn.setFixedSize(24,24); self.loop_btn.toggled.connect(self.toggle_loop_media); toolbar.addWidget(self.loop_btn)
         add_section_divider()
 
         # ── PDF page navigation (hidden until a PDF is loaded) ──
@@ -2069,6 +2092,7 @@ class RandomImageViewer(QMainWindow):
                 'open_btn', 'new_canvas_btn', 'delete_file_btn', 'save_btn',
                 'prev_btn', 'next_btn', 'sort_order_button', 'type_filter_btn',
                 'timer_button', 'timer_spin', 'circle_timer', 'autoplay_next_btn',
+                'loop_btn',
             ]),
             # Everything for drawing lives in this one panel, one row per job,
             # top to bottom in the order you reach for it: make a mark, fill a
@@ -3089,10 +3113,35 @@ class RandomImageViewer(QMainWindow):
         if hasattr(self, '_video_overlay'):
             self._video_overlay.update_autoplay_state(self.autoplay_next_enabled)
         if self.autoplay_next_enabled:
+            if self.loop_media_enabled:
+                self.toggle_loop_media(False)
             self.status.showMessage(
                 "Autoplay next: on — videos and GIFs advance when they finish.")
         else:
             self.status.showMessage("Autoplay next: off.")
+
+    def toggle_loop_media(self, checked):
+        """Repeat the video / GIF on screen instead of ending it.
+
+        Looping and autoplay-next are opposite answers to the same question
+        ("this clip just finished - now what?"), so turning one on turns the
+        other off.
+        """
+        self.loop_media_enabled = bool(checked)
+        btn = getattr(self, "loop_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(self.loop_media_enabled)
+            btn.blockSignals(False)
+        if hasattr(self, '_video_overlay'):
+            self._video_overlay.update_loop_state(self.loop_media_enabled)
+        if self.loop_media_enabled:
+            if self.autoplay_next_enabled:
+                self.toggle_autoplay_next(False)
+            self.status.showMessage(
+                "Loop: on \u2014 this video or GIF repeats when it ends.")
+        else:
+            self.status.showMessage("Loop: off.")
 
     def _reset_gif_loop_tracking(self):
         """Start GIF loop detection over for a freshly started animation."""
@@ -3109,9 +3158,23 @@ class RandomImageViewer(QMainWindow):
         from PySide6.QtMultimedia import QMediaPlayer
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
             return
+        if self.loop_media_enabled:
+            self.image_label.video_restart()
+            return
         if not self.autoplay_next_enabled:
             return
         self._autoplay_advance()
+
+    def _on_gif_finished(self):
+        """A GIF with a finite loop count reached its end.
+
+        Only files that declare how many times to repeat ever get here; the
+        usual infinite ones keep going on their own.
+        """
+        if self.loop_media_enabled:
+            self.image_label.gif_restart()
+        elif self.autoplay_next_enabled:
+            self._autoplay_advance()
 
     def _check_gif_loop_complete(self, movie, frame_number):
         """Advance when an animated GIF completes a full pass.
@@ -3530,7 +3593,7 @@ class RandomImageViewer(QMainWindow):
             return
 
         # Animated GIFs: redirect to animated display with full enhancement support
-        if is_animated_gif(img_path) and not getattr(self, '_gif_static_fallback', False):
+        if is_animated_image(img_path) and not getattr(self, '_gif_static_fallback', False):
             # Already displaying this GIF (playing or paused) — don't restart it,
             # which would silently un-pause it.
             if self.image_label.is_animation_active() and self.current_image == img_path:
@@ -4499,11 +4562,35 @@ class RandomImageViewer(QMainWindow):
         
         return result
 
+    @staticmethod
+    def _lut_relpath(full_path, folder_path):
+        """Path of ``full_path`` relative to ``folder_path``.
+
+        LUT paths come from ``os.walk(folder_path)`` so they start with the
+        folder verbatim; slicing the prefix off is ~50x cheaper than
+        ``os.path.relpath`` (which normalises both paths on every call) and
+        this runs once per LUT - thousands of times - at startup and on
+        every LUT selection.
+        """
+        prefix = folder_path if folder_path.endswith(('\\', '/')) else folder_path + os.sep
+        if full_path.startswith(prefix):
+            return full_path[len(prefix):]
+        return os.path.relpath(full_path, folder_path)
+
+    def _lut_display_name(self, lut_file):
+        """Combo-box name of a LUT: relative path, forward slashes, no .cube."""
+        display_name = os.path.splitext(
+            self._lut_relpath(lut_file, self.lut_folder))[0].replace('\\', '/')
+        # If it's just a filename (no subfolder), show only the name
+        if '/' not in display_name:
+            display_name = os.path.basename(display_name)
+        return display_name
+
     def scan_lut_folder(self, folder_path):
         """Scan a folder and its subfolders for CUBE LUT files"""
         if not folder_path or not os.path.exists(folder_path):
             return []
-        
+
         lut_files = []
         try:
             # Walk through all subdirectories to find .cube files
@@ -4512,10 +4599,10 @@ class RandomImageViewer(QMainWindow):
                     if file.lower().endswith('.cube'):
                         full_path = os.path.join(root, file)
                         lut_files.append(full_path)
-            
+
             # Sort: first by first-level folder (relative to root), then by filename
             def lut_sort_key(full_path):
-                rel = os.path.relpath(full_path, folder_path)
+                rel = self._lut_relpath(full_path, folder_path)
                 parts = rel.split(os.sep)
                 if len(parts) == 1:
                     # File directly in root: group key empty so it appears before folder groups
@@ -9730,20 +9817,9 @@ class RandomImageViewer(QMainWindow):
             self.lut_combo.blockSignals(True)
             self.lut_combo.clear()
             self.lut_combo.addItem("None")
-            
-            for lut_file in self.lut_files:
-                # Create a display name that shows subfolder structure
-                relative_path = os.path.relpath(lut_file, self.lut_folder)
-                
-                # Remove the .cube extension and use forward slashes for consistency
-                display_name = os.path.splitext(relative_path)[0].replace('\\', '/')
-                
-                # If it's just a filename (no subfolder), show only the name
-                if '/' not in display_name:
-                    display_name = os.path.basename(display_name)
-                
-                self.lut_combo.addItem(display_name)
-            
+            # One addItems() call instead of thousands of addItem() round-trips.
+            self.lut_combo.addItems(
+                [self._lut_display_name(f) for f in self.lut_files])
             self.lut_combo.blockSignals(False)
             self._update_lut_item_tooltips()
 
@@ -9770,14 +9846,8 @@ class RandomImageViewer(QMainWindow):
             # backslashes and/or a .cube extension) still resolve.
             requested = os.path.splitext(lut_name)[0].replace('\\', '/')
             for lut_file in self.lut_files:
-                # Create the same display name format as in update_lut_combo
-                relative_path = os.path.relpath(lut_file, self.lut_folder)
-                display_name = os.path.splitext(relative_path)[0].replace('\\', '/')
-
-                # If it's just a filename (no subfolder), show only the name
-                if '/' not in display_name:
-                    display_name = os.path.basename(display_name)
-
+                # Same display name format as in update_lut_combo
+                display_name = self._lut_display_name(lut_file)
                 if display_name == lut_name or display_name == requested:
                     lut_file_found = lut_file
                     break
@@ -10393,7 +10463,7 @@ class RandomImageViewer(QMainWindow):
         self.clear_lines()
 
         # Animated GIF: play with QMovie instead of static pixmap
-        if is_animated_gif(img_path):
+        if is_animated_image(img_path):
             self._display_animated_gif(img_path)
             return
         

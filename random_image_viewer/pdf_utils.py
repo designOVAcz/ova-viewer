@@ -70,7 +70,7 @@ class PdfDocument:
     CACHE_SIZE = 16
 
     def __init__(self, pdf_path):
-        import fitz
+        import pymupdf as fitz
         self.pdf_path = pdf_path
         self._doc = fitz.open(pdf_path)
         self.page_count = self._doc.page_count
@@ -142,7 +142,7 @@ class PdfDocument:
             if self._hires_key == cache_key and self._hires_img is not None:
                 return self._hires_img
 
-        import fitz
+        import pymupdf as fitz
         from PySide6.QtGui import QImage
 
         with self._fitz_lock:
@@ -189,7 +189,7 @@ class PdfDocument:
             if self._hires_key == cache_key and self._hires_img is not None:
                 return self._hires_img
 
-        import fitz
+        import pymupdf as fitz
         from PySide6.QtGui import QImage, QPainter
         from PySide6.QtCore import Qt
 
@@ -373,7 +373,7 @@ class PdfDocument:
     # ── internal ────────────────────────────────────────────────
 
     def _do_render(self, page_num):
-        import fitz
+        import pymupdf as fitz
         # PyMuPDF is not thread-safe — serialize document access so that
         # the main thread (synchronous renders) and the prefetch worker
         # never touch self._doc concurrently.

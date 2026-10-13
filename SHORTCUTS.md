@@ -76,6 +76,8 @@ Flip vertical has no working shortcut: the context menu lists `Ctrl+V`, but
 | Click the timeline | Jump to that moment |
 | Drag the timeline | Scrub (a drag can start from the click) |
 | Hover the timeline | Preview the frame at that moment |
+| 🔁 button | Loop: play the clip again when it ends (turns off ⏭ autoplay-next) |
+| ⏭ button | Autoplay next: move to the next item when the clip ends (turns off 🔁 loop) |
 
 | Shortcut | Action |
 |---|---|
@@ -95,6 +97,7 @@ Flip vertical has no working shortcut: the context menu lists `Ctrl+V`, but
 
 ## Supported Formats
 
-- **Images:** `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`
+- **Images:** `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.webp`, `.jp2`, `.j2k`, `.jpf`, `.jpx`
+  (animated `.gif` and `.webp` play like a video, with the same controls)
 - **Videos:** `.mp4`, `.avi`, `.mkv`, `.mov`, `.webm`, `.flv`, `.wmv`
 - **Documents:** `.pdf`, `.epub`

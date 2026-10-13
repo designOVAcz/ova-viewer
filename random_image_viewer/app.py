@@ -53,10 +53,8 @@ def main():
     status("Loading main window module (this is the largest import)\u2026")
     from random_image_viewer.viewer.main_window import RandomImageViewer
 
-    # ---- Stage 8: GPU check ----
-    status("Probing GPU for OpenCL acceleration (LUT / drawing)\u2026")
-    from random_image_viewer.constants import _check_gpu_available
-    _check_gpu_available()
+    # (No GPU probe here: importing pyopencl costs ~0.3 s and the GPU code
+    # checks availability lazily the first time an effect needs it.)
 
     # ---- Build the application ----
     status("Configuring image memory limits and applying stylesheet\u2026")
@@ -64,6 +62,11 @@ def main():
     app.setStyleSheet(get_adaptive_stylesheet())
 
     status("Building main window: toolbar, sliders, image canvas\u2026")
+    # Emoji/symbol buttons would otherwise make Qt scan every installed font
+    # (~1.5 s) the first time one is measured; see font_utils.
+    from random_image_viewer.font_utils import SymbolFontPinner, warm_font_fallbacks
+    pinner = SymbolFontPinner()
+    app.installEventFilter(pinner)
     viewer = RandomImageViewer()
 
     if is_windows_dark_mode():
@@ -79,5 +82,10 @@ def main():
     # number reflects a genuinely interactive window rather than just the
     # moment show() returned.
     QTimer.singleShot(0, lambda: viewer.report_startup_ready(launch_t0))
+
+    def _startup_done():
+        app.removeEventFilter(pinner)
+        warm_font_fallbacks(app)
+    QTimer.singleShot(0, _startup_done)
 
     sys.exit(app.exec())

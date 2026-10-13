@@ -16,19 +16,18 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# One-folder build (dist/Ova Viewer/): a one-file exe unpacks its whole
+# bundle to %TEMP% on every launch (~3.5 s of the old ~4.3 s startup).
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='Ova Viewer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -36,4 +35,13 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['icon.ico'],
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='Ova Viewer',
 )

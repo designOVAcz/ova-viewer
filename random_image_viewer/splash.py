@@ -3,8 +3,8 @@
 import os
 import sys
 
-from PySide6.QtWidgets import QSplashScreen, QApplication
-from PySide6.QtGui import QPainter, QColor, QFont, QPixmap
+from PySide6.QtWidgets import QWidget, QApplication
+from PySide6.QtGui import QPainter, QColor, QFont, QPixmap, QGuiApplication
 from PySide6.QtCore import Qt, QRect
 
 
@@ -20,8 +20,13 @@ def _find_splash_image():
     return None
 
 
-class DynamicSplash(QSplashScreen):
-    """A splash screen that displays module loading progress."""
+class DynamicSplash(QWidget):
+    """A splash screen that displays module loading progress.
+
+    A plain frameless QWidget rather than QSplashScreen: on Windows
+    QSplashScreen.show() blocks until the window reports itself exposed and
+    routinely sits out its full 1 s timeout, adding a second to every launch.
+    """
 
     WIDTH = 420
     HEIGHT = 300
@@ -39,11 +44,17 @@ class DynamicSplash(QSplashScreen):
             pixmap = QPixmap(self.WIDTH, self.HEIGHT)
             pixmap.fill(QColor(45, 45, 45))
 
-        super().__init__(pixmap)
+        super().__init__(None, Qt.SplashScreen | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint)
+        self._pixmap = pixmap
         self._has_image = img_path is not None
-        self.setWindowFlag(Qt.WindowStaysOnTopHint)
-        self.setWindowFlag(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(pixmap.size())
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            r = self.rect()
+            r.moveCenter(screen.availableGeometry().center())
+            self.move(r.topLeft())
         self._status = "Starting Ova Viewer\u2026"
 
     def set_status(self, text: str):
@@ -51,6 +62,16 @@ class DynamicSplash(QSplashScreen):
         self._status = text
         self.repaint()
         QApplication.processEvents()
+
+    def mousePressEvent(self, event):
+        # Same as QSplashScreen: a click dismisses the splash.
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self._pixmap)
+        self.drawContents(painter)
+        painter.end()
 
     # ------------------------------------------------------------------
     def drawContents(self, painter: QPainter):

@@ -21,6 +21,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - Added Form Lines — cross-contour line work that reads the subject’s form from its shading (contour, hatch and wrap modes).
 - Merged the LINE / COLOR panel into DRAW: one panel, a row per job (mark, fill, colour, look, fix, view). Press **I** for the colour snap eyedropper.
 - Added triangle fill (drag) and polygon fill (click corners, straight edges).
+- Added WebP support: `.webp` pictures browse like any other image, and animated ones play like GIFs.
+- Added a 🔁 loop toggle for videos and animated GIFs.
 - Video timeline: click anywhere to jump there, drag to scrub, and hover to preview the frame at that moment.
 - Fixed drawing on rotated pictures: at 90° / 270° clicks, brush strokes and the eraser landed away from the cursor on any non-square image.
 
@@ -28,12 +30,13 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 **Viewing**
 - 📁 Open any folder (including subfolders) via button or drag & drop
-- 🖼️ Images · 📄 PDFs (single / 2-page / 3-page book spread) · 📚 EPUBs · 🗜️ CBR/CBZ comics · 🎞️ Animated GIFs · 🎬 Videos
+- 🖼️ Images (JPEG, PNG, BMP, WebP, JPEG 2000) · 📄 PDFs (single / 2-page / 3-page book spread) · 📚 EPUBs · 🗜️ CBR/CBZ comics · 🎞️ Animated GIFs and WebP · 🎬 Videos
 - 🔍 Zoom & pan (mouse wheel + right-click drag)
 - 🔄 Rotate, flip horizontal/vertical
 - 🖥️ Fullscreen (F11) and minimal/frameless mode
 - 🕒 Auto-advance timer with circular countdown overlay
 - ⏭ **Autoplay next** — when a video or animated GIF finishes, move on to the next item automatically (holds the auto-advance countdown so a long clip is never cut short)
+- 🔁 **Loop** — repeat the video or GIF on screen instead of stopping at the end. The opposite of autoplay-next, so switching one on switches the other off
 - 🎵 **Dub audio** — if an audio file sits beside a video with the same name (`clip.mp4` → `clip.mp3`), play it instead of the video's own track, held in sync through seeking, stepping and pause. Off by default; toggled from the video controls
 - ⏱ **Video timeline** — click anywhere on it to jump there, drag to scrub (including straight on from that click), and hover to see a thumbnail of the frame at that moment
 - ⏮️ History navigation (back/forward through viewed images)
@@ -52,7 +55,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 **Color & Enhancement**
 - 💉 **Color Snap eyedropper** (**I**) — hover to preview, click to pick a color from the image
-- 🪄 **Auto-extract palette** — extracts dominant colors into the floating palette panel
+- ✨ **Auto-extract palette** — extracts dominant colors into the floating palette panel
 - 🎨 **Floating palette panel** — resizable, draggable, persists across tool switches; swatches organized by extraction session
 - 🎞️ **CUBE LUT support** with GPU-accelerated (OpenCL) processing and adjustable strength
 - ◑ **Posterize/value filter** — reduce images to 2-10 grayscale tones for value studies
@@ -72,15 +75,22 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Installation
 
-```sh
+Requires **Python 3.15** (Windows). Dependencies go into a project-local
+virtual environment (`.venv`), not the global Python:
+
+```bat
 git clone https://github.com/designOVAcz/ova-viewer.git
 cd ova-viewer
-pip install -r requirements.txt
-# Optional GPU LUT acceleration:
-# pip install pyopencl
-# If installing dependencies manually, include opencv-python for edge detection.
+py -3.15 -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
 python main.py
 ```
+
+Later sessions only need `.venv\Scripts\activate` (VS Code picks the venv up
+automatically) — or skip activation and run `.venv\Scripts\python main.py`.
+`pyopencl` (GPU LUT acceleration) is included; without a working OpenCL
+driver the CPU path is used.
 
 ---
 
@@ -89,7 +99,7 @@ python main.py
 1. Drag a folder into the app or click 📁 to open one
 2. Navigate with **← →** or enable the auto-advance timer (**⚡**)
 3. Annotate with the tools in the **DRAW** panel — brush, lines, fills, colour, eraser and view helpers all live there
-4. Toggle **💉** (or press **I**) to pick colors from the image; use **🪄** to auto-extract a palette
+4. Toggle **💉** (or press **I**) to pick colors from the image; use **✨** to auto-extract a palette
 5. Load a `.cube` LUT file and adjust strength with the slider
 6. Press **F11** for fullscreen, **Esc** to exit
 
@@ -97,11 +107,17 @@ python main.py
 
 ## Build a Standalone Executable
 
-```sh
-pip install pyinstaller
-pyinstaller "Ova Viewer.spec"
-# Output: dist/Ova Viewer.exe
+Run `build_exe.bat` — it creates/updates `.venv`, installs
+`requirements-dev.txt` (adds PyInstaller) and builds from `Ova Viewer.spec`.
+By hand, with the venv active:
+
+```bat
+python -m pip install -r requirements-dev.txt
+python -m PyInstaller --noconfirm "Ova Viewer.spec"
 ```
+
+Output: `dist/Ova Viewer/Ova Viewer.exe` — keep the folder together (a
+one-folder build starts ~4x faster than a one-file exe).
 
 ---
 

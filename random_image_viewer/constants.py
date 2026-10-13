@@ -3,7 +3,12 @@ import os
 # Bump on release. Shown (with the startup time) in the status bar corner.
 APP_VERSION = "1.0.0"
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.jp2', '.j2k', '.jpf', '.jpx'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp',
+                    '.jp2', '.j2k', '.jpf', '.jpx'}
+
+# Image formats that can hold an animation; Qt's QMovie plays both of these.
+# (Note .webp is a picture, .webm a video - they are different files.)
+ANIMATED_EXTENSIONS = {'.gif', '.webp'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv'}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 

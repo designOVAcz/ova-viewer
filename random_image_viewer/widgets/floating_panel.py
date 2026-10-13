@@ -15,6 +15,8 @@ classic top toolbars:
   whenever geometry or collapsed state changes so the owner can persist layout.
 """
 
+import html
+
 from PySide6.QtWidgets import QLayout, QWidget, QSizePolicy, QLabel, QVBoxLayout
 from PySide6.QtCore import Qt, QRect, QSize, QPoint, Signal
 
@@ -232,8 +234,13 @@ class FloatingPanel(QWidget):
 
     # ── helpers ──
     def _handle_text(self):
-        arrow = "▸ " if self._collapsed else ""
-        return arrow + self._title
+        if not self._collapsed:
+            return self._title
+        # Segoe UI has no ▸, and drawing it via font fallback makes Qt scan
+        # every installed font (~1.5 s at startup with collapsed panels).
+        # Name the font Qt's fallback would pick so it looks the same.
+        return ("<span style=\"font-family:'MS UI Gothic'\">▸</span> "
+                + html.escape(self._title))
 
     # ── tool management ──
     def add_tool(self, widget, show=True):

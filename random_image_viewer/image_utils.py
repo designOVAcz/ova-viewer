@@ -6,18 +6,26 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPixmap, QPainter, QFont, QIcon, QImageReader, QImage
 from PySide6.QtCore import Qt, QSize, QObject, Signal
 
-from random_image_viewer.constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS, PLAYLIST_EXTENSIONS
+from random_image_viewer.constants import (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS,
+                                           PLAYLIST_EXTENSIONS, ANIMATED_EXTENSIONS)
 
 
-def is_animated_gif(file_path):
-    """Check if a file is an animated GIF (has more than one frame)"""
-    if not file_path or not file_path.lower().endswith('.gif'):
+def is_animated_image(file_path):
+    """Check if a file is an animation (a GIF or WebP with several frames)."""
+    if not file_path:
+        return False
+    if os.path.splitext(file_path)[1].lower() not in ANIMATED_EXTENSIONS:
         return False
     try:
         reader = QImageReader(file_path)
         return reader.imageCount() > 1
     except Exception:
         return False
+
+
+# The old name, kept so nothing that imports it breaks. It covers animated
+# WebP as well now, which is why the general name exists.
+is_animated_gif = is_animated_image
 
 
 def is_video_file(file_path):
