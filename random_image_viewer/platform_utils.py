@@ -111,6 +111,27 @@ def enable_windows_dark_title_bar(window):
         return False
 
 
+def set_window_cloaked(window, cloaked):
+    """Hide/reveal a window via DWM cloaking (Windows 8+).
+
+    A cloaked window is fully alive - shown, laid out and painted - but the
+    compositor does not put it on screen. Showing the main window cloaked and
+    revealing it once its first frame is painted avoids the white rectangle
+    Windows otherwise displays until Qt's first paint. Unlike window opacity
+    it leaves no layered-window overhead behind. Returns True on success.
+    """
+    if not ctypes or os.name != 'nt':
+        return False
+    try:
+        DWMWA_CLOAK = 13
+        value = ctypes.c_int(1 if cloaked else 0)
+        return ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            int(window.winId()), DWMWA_CLOAK,
+            ctypes.byref(value), ctypes.sizeof(value)) == 0
+    except Exception:
+        return False
+
+
 def setup_image_allocation_limit():
     """Increase Qt's image allocation limit to handle large images"""
     # Set allocation limit to 1GB (1024 MB) instead of default 256 MB

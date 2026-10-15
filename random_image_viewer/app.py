@@ -27,7 +27,8 @@ def main():
     # ---- Stage 2: Platform utilities ----
     status("Detecting OS theme and configuring platform integration\u2026")
     from random_image_viewer.platform_utils import (
-        setup_image_allocation_limit, is_windows_dark_mode, enable_windows_dark_title_bar
+        setup_image_allocation_limit, is_windows_dark_mode, enable_windows_dark_title_bar,
+        set_window_cloaked
     )
 
     # ---- Stage 3: Styles ----
@@ -70,13 +71,20 @@ def main():
     app.installEventFilter(pinner)
     viewer = RandomImageViewer()
 
-    if is_windows_dark_mode():
-        QTimer.singleShot(0, lambda: enable_windows_dark_title_bar(viewer))
-
     status("Loading window\u2026")
+    # No white flash: Windows shows a new window as a blank (white) rectangle
+    # until the app paints it. So create the native window first, give it the
+    # dark title bar, and show it cloaked; reveal it only once the first frame
+    # is painted. The splash stays up until then, so there is never a gap.
+    viewer.winId()
+    if is_windows_dark_mode():
+        enable_windows_dark_title_bar(viewer)
+    cloaked = set_window_cloaked(viewer, True)
     viewer.show()
-
-    # Close both splashes
+    app.processEvents()  # deliver show/resize/layout events
+    viewer.repaint()     # paint the first frame now, while still hidden
+    if cloaked:
+        set_window_cloaked(viewer, False)
     close_splash(splash)
 
     # Report once the event loop has drained the show/paint work, so the
@@ -92,9 +100,10 @@ def main():
     if launch_paths:
         QTimer.singleShot(0, lambda: viewer.open_paths(launch_paths))
 
-    def _startup_done():
-        app.removeEventFilter(pinner)
-        warm_font_fallbacks(app)
-    QTimer.singleShot(0, _startup_done)
+    app.removeEventFilter(pinner)
+    # The warm-up holds Qt's font lock while it runs, so start it only after
+    # the first frame (and anything opened from the command line) is on
+    # screen - starting it earlier stalled the first paint for ~1 s.
+    QTimer.singleShot(500, lambda: warm_font_fallbacks(app))
 
     sys.exit(app.exec())
