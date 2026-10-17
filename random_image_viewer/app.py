@@ -5,6 +5,10 @@ import time
 
 def main():
     launch_t0 = time.perf_counter()
+    # Capture prints, tracebacks and Qt warnings before anything else runs:
+    # the exe has no console, so this is the only place they end up.
+    from random_image_viewer import log_capture
+    log_capture.install()
     # ---- Stage 0: Minimal Qt to show splash ASAP ----
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt
@@ -94,9 +98,19 @@ def main():
 
     # Files/folders passed on the command line - this is how Explorer's
     # "Open with" and default-app double-click hand over the file.
-    # app.arguments() has Qt's own options (-platform ...) already removed.
-    launch_paths = [os.path.abspath(a) for a in app.arguments()[1:]
-                    if os.path.exists(a)]
+    # Read sys.argv, not app.arguments(): on Windows Qt round-trips the
+    # arguments through the ANSI code page, turning e.g. Cyrillic names into
+    # '?' so the path no longer exists. Python's argv is the real Unicode
+    # command line.
+    launch_args = sys.argv[1:]
+    if launch_args:
+        print(f"Launch arguments: {launch_args!r}")
+    launch_paths = []
+    for a in launch_args:
+        if os.path.exists(a):
+            launch_paths.append(os.path.abspath(a))
+        else:
+            print(f"Warning: launch argument is not an existing path: {a!r}")
     if launch_paths:
         QTimer.singleShot(0, lambda: viewer.open_paths(launch_paths))
 

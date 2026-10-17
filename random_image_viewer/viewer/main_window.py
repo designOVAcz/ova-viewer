@@ -54,6 +54,8 @@ from random_image_viewer.widgets.color_picker_popup import ColorPickerPopup
 from random_image_viewer.widgets.effect_window import EffectWindow
 from random_image_viewer.widgets.type_filter_window import TypeFilterWindow
 from random_image_viewer.widgets.floating_panel import FloatingPanel
+from random_image_viewer.widgets.log_window import LogBridge, LogWindow
+from random_image_viewer import log_capture
 from random_image_viewer.widgets.video_timeline import (SeekSlider, ThumbnailPopup,
                                                         ThumbnailWorker)
 from random_image_viewer.processing.gpu_processor import GPULutProcessor
@@ -1578,12 +1580,28 @@ class RandomImageViewer(QMainWindow):
             "QToolButton:hover { color: #fff; }"
         )
         self.panel_reset_btn.clicked.connect(self._reset_panel_layout)
+
+        # Log button: opens a live view of everything the app prints, plus Qt
+        # and FFmpeg warnings (the exe has no console). Turns orange/red when
+        # a warning/error arrives that has not been looked at yet.
+        self.log_btn = QToolButton()
+        self.log_btn.setText("≡")
+        self.log_btn.setFixedSize(16, 16)
+        self.log_btn.setCursor(Qt.PointingHandCursor)
+        self.log_btn.clicked.connect(self._show_log_window)
+        self._log_window = None
+        self._log_unseen_level = log_capture.LEVEL_INFO
+        self._log_bridge = LogBridge(self)
+        self._log_bridge.lineAdded.connect(self._on_log_line)
+        self._update_log_button()
+
         # Wrap in a container that vertically centers the button so its glyph
         # lines up with the status-bar text instead of hugging the top edge.
         _reset_wrap = QWidget()
         _reset_wrap_layout = QHBoxLayout(_reset_wrap)
         _reset_wrap_layout.setContentsMargins(0, 0, 6, 0)
-        _reset_wrap_layout.setSpacing(0)
+        _reset_wrap_layout.setSpacing(4)
+        _reset_wrap_layout.addWidget(self.log_btn, 0, Qt.AlignVCenter)
         _reset_wrap_layout.addWidget(self.panel_reset_btn, 0, Qt.AlignVCenter)
         self.statusBar().addPermanentWidget(_reset_wrap)
 
@@ -2288,6 +2306,37 @@ class RandomImageViewer(QMainWindow):
             x += pw + gap
             row_h = max(row_h, ph)
 
+    def _show_log_window(self):
+        if self._log_window is None:
+            self._log_window = LogWindow(self._log_bridge, self)
+        self._log_window.show()
+        self._log_window.raise_()
+        self._log_window.activateWindow()
+        self._log_unseen_level = log_capture.LEVEL_INFO
+        self._update_log_button()
+
+    def _on_log_line(self, _line, level):
+        if self._log_window is not None and self._log_window.isVisible():
+            return
+        if level > self._log_unseen_level:
+            self._log_unseen_level = level
+            self._update_log_button()
+
+    def _update_log_button(self):
+        color = {log_capture.LEVEL_WARNING: "#e0a030",
+                 log_capture.LEVEL_ERROR: "#ff5f56"}.get(
+                     self._log_unseen_level, "#888")
+        self.log_btn.setStyleSheet(
+            "QToolButton { border: none; padding: 0px; margin: 0px;"
+            f" color: {color}; font-size: 14px; }}"
+            "QToolButton:hover { color: #fff; }")
+        tip = "Show log (what happens under the hood)"
+        if self._log_unseen_level == log_capture.LEVEL_ERROR:
+            tip += " – new errors"
+        elif self._log_unseen_level == log_capture.LEVEL_WARNING:
+            tip += " – new warnings"
+        self.log_btn.setToolTip(tip)
+
     def _reset_panel_layout(self):
         """Snap all tool panels into the default right-side vertical stack.
 
@@ -2851,6 +2900,8 @@ class RandomImageViewer(QMainWindow):
                     player.positionChanged.connect(self._on_video_position_changed)
                     player.playbackStateChanged.connect(self._on_video_state_changed)
                     player.mediaStatusChanged.connect(self._on_video_media_status)
+                    player.errorOccurred.connect(
+                        lambda _err, msg, p=img_path: self._on_video_error(p, msg))
                 except RuntimeError:
                     pass
                 self._video_controls_widget.show()
@@ -3149,6 +3200,14 @@ class RandomImageViewer(QMainWindow):
         self._gif_prev_frame = -1
         self._gif_started_at = time.monotonic()
 
+    def _on_video_error(self, path, message):
+        """Slot: QMediaPlayer could not open or decode the current video."""
+        name = os.path.basename(path)
+        print(f"Video error: {name}: {message or 'unknown error'}")
+        self.statusBar().showMessage(
+            f"Cannot play {name}: {message or 'unknown error'} (see log ≡)",
+            8000)
+
     def _on_video_media_status(self, status):
         """Slot: QMediaPlayer status changed. EndOfMedia means the clip ended.
 
@@ -3157,6 +3216,9 @@ class RandomImageViewer(QMainWindow):
         trigger an advance.
         """
         from PySide6.QtMultimedia import QMediaPlayer
+        if status == QMediaPlayer.MediaStatus.InvalidMedia:
+            print(f"Video error: invalid or unsupported media: "
+                  f"{os.path.basename(self.current_image or '')}")
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
             return
         if self.loop_media_enabled:
