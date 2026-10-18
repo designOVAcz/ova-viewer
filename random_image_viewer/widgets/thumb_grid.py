@@ -45,9 +45,10 @@ from collections import OrderedDict, deque
 from PySide6.QtWidgets import (
     QAbstractScrollArea, QFrame, QWidget, QToolButton, QLabel, QHBoxLayout,
 )
-from PySide6.QtCore import Qt, QTimer, QRectF, QRect, QEvent, QPoint, Signal
-from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QPen, QFontMetrics
+from PySide6.QtCore import Qt, QTimer, QRectF, QRect, QEvent, QPoint, QSize, QUrl, Signal
+from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QPen, QFontMetrics, QMovie
 
+from random_image_viewer.constants import ANIMATED_EXTENSIONS
 from random_image_viewer.platform_utils import is_windows_dark_mode
 from random_image_viewer.services.thumbnails import (
     ThumbLoader, item_kind, THUMB_EDGE, SHARP_EDGES, GUESS_ASPECT,
@@ -192,6 +193,9 @@ class ThumbGrid(QAbstractScrollArea):
         self._inertia = QTimer(self, interval=16)
         self._inertia.timeout.connect(self._inertia_step)
 
+        # In-place playback of one GIF / animated WebP / video at a time.
+        self._playing = None                 # {'path', 'movie' | 'media', 'frame', 'paused'}
+
         # Click-to-centre: the camera glides to a target offset.
         self._glide_target = (0.0, 0.0)
         self._glide = QTimer(self, interval=16)
@@ -230,6 +234,7 @@ class ThumbGrid(QAbstractScrollArea):
     # ── public API ───────────────────────────────────────────────
     def set_items(self, paths, current=None):
         """Show *paths*. Shapes and thumbnails already known are kept."""
+        self.stop_playback()
         self._items = list(paths)
         self._index = {p: i for i, p in enumerate(self._items)}
         self._hover = -1
@@ -247,15 +252,112 @@ class ThumbGrid(QAbstractScrollArea):
         self.viewport().update()
 
     def suspend(self):
-        """Grid hidden: stop decoding and motion, save what was measured."""
+        """Grid hidden: stop decoding, playback and motion, save what was measured."""
+        self.stop_playback()
         self._loader.request([])
         self._scroll_timer.stop()
         self._inertia.stop()
         self._save_aspects()
 
     def shutdown(self):
+        self.stop_playback()
         self._loader.stop()
         self._save_aspects()
+
+    # ── in-place playback ────────────────────────────────────────
+    def _playing_index(self):
+        return self._index.get(self._playing['path'], -1) if self._playing else -1
+
+    def toggle_playback(self, i):
+        """Click on a GIF / animated WebP / video: play it in its cell; click
+        again to pause or resume. Clicking anything else stops the one playing,
+        so at most one item ever decodes frames."""
+        path = self._items[i]
+        pl = self._playing
+        if pl is not None and pl['path'] == path:
+            pl['paused'] = not pl['paused']
+            if 'movie' in pl:
+                pl['movie'].setPaused(pl['paused'])
+            elif pl['paused']:
+                pl['media'].pause()
+            else:
+                pl['media'].play()
+            self._update_cell(i)
+            return
+        self.stop_playback()
+        kind = item_kind(path)
+        if kind == 'video':
+            self._play_video(path)
+        elif os.path.splitext(path)[1].lower() in ANIMATED_EXTENSIONS:
+            self._play_animation(i, path)
+        if self._playing is not None:
+            self._update_cell(i)
+
+    def _play_animation(self, i, path):
+        movie = QMovie(path)
+        if not movie.isValid() or movie.frameCount() == 1:
+            return                      # a still GIF / WebP: nothing to play
+        # Decode frames at the size they are shown, not the file's full size.
+        r = self._row_of(i)
+        if r is not None:
+            rect = self._picture_rect(i, self._screen_rect(i, r))
+            dpr = self.viewport().devicePixelRatioF()
+            native = QMovie(path)
+            native.jumpToFrame(0)
+            full = native.currentImage().size()
+            if full.isValid() and rect.width() * dpr < full.width():
+                w = max(1, round(rect.width() * dpr))
+                movie.setScaledSize(QSize(w, max(1, round(w * full.height() / full.width()))))
+        movie.setCacheMode(QMovie.CacheNone)
+        self._playing = {'path': path, 'movie': movie, 'frame': None, 'paused': False}
+        movie.frameChanged.connect(self._on_movie_frame)
+        movie.start()
+
+    def _play_video(self, path):
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+        except ImportError:
+            return
+        media = QMediaPlayer(self)
+        sink = QVideoSink(self)
+        media.setVideoSink(sink)                 # no audio output: plays muted
+        media.setLoops(QMediaPlayer.Loops.Infinite)
+        sink.videoFrameChanged.connect(self._on_video_frame)
+        media.setSource(QUrl.fromLocalFile(path))
+        self._playing = {'path': path, 'media': media, 'sink': sink, 'frame': None, 'paused': False}
+        media.play()
+
+    def _on_movie_frame(self, _n):
+        pl = self._playing
+        if pl is not None and 'movie' in pl:
+            pl['frame'] = pl['movie'].currentPixmap()
+            self._update_cell(self._playing_index())
+
+    def _on_video_frame(self, frame):
+        pl = self._playing
+        if pl is None or 'media' not in pl or not frame.isValid():
+            return
+        image = frame.toImage()
+        if not image.isNull():
+            pl['frame'] = image
+            self._update_cell(self._playing_index())
+
+    def stop_playback(self):
+        pl, self._playing = self._playing, None
+        if pl is None:
+            return
+        if 'movie' in pl:
+            pl['movie'].stop()
+            pl['movie'].frameChanged.disconnect(self._on_movie_frame)
+            pl['movie'].deleteLater()
+        else:
+            pl['sink'].videoFrameChanged.disconnect(self._on_video_frame)
+            pl['media'].stop()
+            pl['media'].deleteLater()
+            pl['sink'].deleteLater()
+        i = self._index.get(pl['path'], -1)
+        if i >= 0:
+            self._update_cell(i)
 
     def track(self, widget):
         """Keep this grid laid exactly over *widget* (the image canvas)."""
@@ -881,6 +983,10 @@ class ThumbGrid(QAbstractScrollArea):
         self._window = window
         self._loader.request(jobs)
         self._update_status()
+        # Nobody watches a clip scrolled out of view: stop decoding it.
+        playing = self._playing_index()
+        if playing >= 0 and not self._screen_rect(playing).intersects(self.viewport().rect()):
+            self.stop_playback()
 
     def _on_thumb(self, path, image, edge):
         i = self._index.get(path)
@@ -976,7 +1082,17 @@ class ThumbGrid(QAbstractScrollArea):
                 cell = self._screen_rect(i, r)
                 path = self._items[i]
                 t = self._thumbs.get(path)
-                if t is not None:
+                live = self._playing['frame'] if self._playing and self._playing['path'] == path else None
+                if live is not None:
+                    # The playing GIF / video: its current frame, scaled on the fly.
+                    rect = self._picture_rect(i, cell)
+                    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                    src = QRectF(self._source_rect(live, rect.width(), rect.height()))
+                    if isinstance(live, QPixmap):
+                        p.drawPixmap(QRectF(rect), live, src)
+                    else:
+                        p.drawImage(QRectF(rect), live, src)
+                elif t is not None:
                     rect = self._picture_rect(i, cell)
                     if self._zooming or rect.width() * rect.height() > vp_area:
                         # Mid-zoom, or a cell bigger than the screen (a cached
@@ -990,9 +1106,8 @@ class ThumbGrid(QAbstractScrollArea):
                 else:
                     rect = cell
                     self._paint_placeholder(p, cell, path, glyph_font)
-                kind = item_kind(path)
-                if kind != 'image' and t is not None:
-                    self._paint_badge(p, rect, path, kind)
+                if t is not None or live is not None:
+                    self._paint_badge(p, rect, path)
                 if self._names or i == self._hover:
                     self._paint_name(p, rect, path, name_font, fm)
                 if i == self._hover:
@@ -1011,22 +1126,40 @@ class ThumbGrid(QAbstractScrollArea):
             p.setPen(self._glyph)
             p.drawText(rect, Qt.AlignCenter, glyph)
 
-    def _paint_badge(self, p, rect, path, kind):
-        text = "▶" if kind == 'video' else os.path.splitext(path)[1][1:].upper()
+    def _paint_badge(self, p, rect, path):
+        """Corner tag: ▶ on videos, GIF on GIFs, the type on documents; on the
+        item playing in place, pause bars (or ▶ while paused)."""
+        kind = item_kind(path)
+        ext = os.path.splitext(path)[1].lower()
+        pl = self._playing
+        pause_bars = False
+        if pl is not None and pl['path'] == path:
+            text, pause_bars = ("▶", False) if pl['paused'] else ("", True)
+        elif kind == 'video':
+            text = "▶"
+        elif kind == 'doc' or ext == '.gif':
+            text = ext[1:].upper()
+        else:
+            return
         s = 18
-        badge = QRect(rect.left() + 5, rect.top() + 5, s + (14 if kind == 'doc' else 0), s)
+        badge = QRect(rect.left() + 5, rect.top() + 5, s + (14 if len(text) > 1 else 0), s)
         if rect.width() < badge.width() + 10 or rect.height() < s + 10:
             return
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 150))
         p.drawRoundedRect(badge, 4, 4)
-        p.setPen(QColor(255, 255, 255, 230))
-        f = QFont(self.font())
-        f.setPointSize(7 if kind == 'doc' else 8)
-        f.setBold(True)
-        p.setFont(f)
-        p.drawText(badge, Qt.AlignCenter, text)
+        white = QColor(255, 255, 255, 230)
+        if pause_bars:
+            p.fillRect(QRect(badge.left() + 5, badge.top() + 4, 3, s - 8), white)
+            p.fillRect(QRect(badge.right() - 7, badge.top() + 4, 3, s - 8), white)
+        else:
+            p.setPen(white)
+            f = QFont(self.font())
+            f.setPointSize(7 if len(text) > 1 else 8)
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(badge, Qt.AlignCenter, text)
         p.setRenderHint(QPainter.Antialiasing, False)
 
     def _paint_name(self, p, rect, path, font, fm):
@@ -1263,8 +1396,11 @@ class ThumbGrid(QAbstractScrollArea):
         if event.button() != Qt.LeftButton:
             return
         i = self._item_at(event.position().toPoint())
+        # The release that follows must not toggle playback again.
+        self._press_item = -1
         if i >= 0:
             self._glide.stop()
+            self.stop_playback()
             self._selected = i
             self.activated.emit(self._items[i])
 
@@ -1292,6 +1428,9 @@ class ThumbGrid(QAbstractScrollArea):
         i = self._item_at(event.position().toPoint())
         if i >= 0 and i == getattr(self, '_press_item', -1):
             self.focus_item(i)
+            self.toggle_playback(i)
+        elif i < 0 and getattr(self, '_press_item', -1) < 0 and self._playing is not None:
+            self.stop_playback()        # a click on the empty background stops it
 
     def keyPressEvent(self, event):
         self._center_on = -1
