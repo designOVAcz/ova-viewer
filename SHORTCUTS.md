@@ -31,8 +31,9 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Input | Action |
 |---|---|
 | `G` / ▦ button | Open / close the thumbnail grid |
-| Click | Select and glide it to the centre, keeping the zoom; a GIF, animated WebP or video starts playing in place (muted) |
-| Click the playing item again | Pause / resume |
+| Click | Frame it: zoom so it fills the window and centre it; a GIF, animated WebP or video starts playing in place (muted) |
+| Click the framed picture again | Fly back to the view you came from (a playing GIF / video pauses / resumes instead) |
+| Click the empty background | Stop playback and fly back to the view you came from |
 | Double-click / `Enter` / `Space` | Open that item in the viewer |
 | Arrow keys, `PgUp` / `PgDn`, `Home` / `End` | Move the selection |
 | Mouse wheel | Smooth scroll (`Shift` + wheel: sideways) |

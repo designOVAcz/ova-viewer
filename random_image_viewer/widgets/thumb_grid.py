@@ -68,6 +68,7 @@ MAX_ZOOM = 40.0
 ZOOM_STEP = 1.15            # per wheel notch
 ZOOM_SETTLE_MS = 160        # after the last zoom step, re-cut thumbnails sharp
 PAN_FRICTION = 4.5          # inertia decay per second (higher stops sooner)
+FOCUS_MARGIN = 0.94         # a framed picture fills this share of the window
 SETTINGS_KEY = "thumb_grid"
 
 
@@ -196,8 +197,10 @@ class ThumbGrid(QAbstractScrollArea):
         # In-place playback of one GIF / animated WebP / video at a time.
         self._playing = None                 # {'path', 'movie' | 'media', 'frame', 'paused'}
 
-        # Click-to-centre: the camera glides to a target offset.
-        self._glide_target = (0.0, 0.0)
+        # Click-to-frame: the camera flies to fit the clicked picture.
+        self._camera_anim = None
+        self._focused = -1                   # item the camera last framed
+        self._prev_view = None               # (zoom, cx, cy) before framing
         self._glide = QTimer(self, interval=16)
         self._glide.timeout.connect(self._glide_step)
 
@@ -643,6 +646,7 @@ class ThumbGrid(QAbstractScrollArea):
         self._placed = 0
         self._next_y = float(self._gap)
         self._content_w = self._avail_width() + 2 * self._gap
+        self._forget_focus()
         self._drop_scaled()
         if self._justified:
             W = self._avail_width()
@@ -1217,6 +1221,7 @@ class ThumbGrid(QAbstractScrollArea):
         pan['last'] = pos
         if not pan['moved'] and (pos - pan['start']).manhattanLength() > 3:
             pan['moved'] = True
+            self._forget_focus()
         self._set_offset(self._ox() - d.x(), self._oy() - d.y())
         pan['samples'].append((time.monotonic(), pos.x(), pos.y()))
 
@@ -1247,41 +1252,82 @@ class ThumbGrid(QAbstractScrollArea):
         if math.hypot(vx, vy) < 25 or (self._ox(), self._oy()) == before:
             self._inertia.stop()
 
+    def _forget_focus(self):
+        """The user moved the camera by hand (or the layout changed): there is
+        no framed picture to step back from any more."""
+        self._focused = -1
+        self._prev_view = None
+
     def _stop_motion(self):
         """Any new input takes over from gliding, inertia and smooth scrolling."""
         self._glide.stop()
         self._inertia.stop()
         self._scroll_timer.stop()
 
+    def _view_state(self):
+        """(zoom, canvas x, canvas y) at the centre of the view."""
+        z = self._zoom
+        vp = self.viewport()
+        return z, (self._ox() + vp.width() / 2) / z, (self._oy() + vp.height() / 2) / z
+
     def focus_item(self, idx):
-        """Select *idx* and glide the camera to centre it, keeping the zoom."""
+        """Select *idx* and fly the camera to frame it: zoomed so the picture
+        fills the window (keeping its shape, with a small margin) and centred.
+        The view it left is remembered so a second click can return to it."""
         r = self._row_of(idx)
         if r is None:
             return
         old, self._selected = self._selected, idx
         self._update_cell(old)
         self._update_cell(idx)
-        rect = self._screen_rect(idx, r)
+        # The picture's own rectangle in canvas pixels (fitted inside the
+        # square in the plain grid).
+        cell = QRect(self._cell_x[idx], self._row_y[r], self._cell_w[idx], self._row_h[r])
+        pic = QRectF(self._picture_rect(idx, cell))
         vw, vh = self.viewport().width(), self.viewport().height()
+        fit = min(vw / pic.width(), vh / pic.height()) * FOCUS_MARGIN
+        if self._focused < 0:
+            # Hopping from one framed picture to the next keeps the overview
+            # it all started from, so one step back returns there.
+            self._prev_view = self._view_state()
+        self._focused = idx
+        self._animate_camera(max(1.0, min(self._max_zoom(), fit)),
+                             pic.center().x(), pic.center().y())
+
+    def unfocus(self):
+        """Fly back to the view the last focus click left."""
+        if self._prev_view is not None:
+            self._animate_camera(*self._prev_view)
+        self._focused = -1
+        self._prev_view = None
+
+    def _animate_camera(self, zoom, cx, cy, duration=0.32):
+        """Glide zoom and position together to *zoom* centred on canvas (cx, cy)."""
         self._stop_motion()
-        self._glide_target = (self._ox() + rect.center().x() - vw // 2,
-                              self._oy() + rect.center().y() - vh // 2)
+        self._camera_anim = (time.monotonic(), duration, *self._view_state(), zoom, cx, cy)
         self._glide.start()
 
     def _glide_step(self):
+        t0, duration, z0, cx0, cy0, z1, cx1, cy1 = self._camera_anim
+        u = min(1.0, (time.monotonic() - t0) / duration)
+        e = 1 - (1 - u) ** 3                       # ease out
+        z = z0 * (z1 / z0) ** e                    # zoom moves evenly on a log scale
+        cx, cy = cx0 + (cx1 - cx0) * e, cy0 + (cy1 - cy0) * e
+        vp = self.viewport()
+        self._zoom = z
+        self._update_ranges()
+        # Scale thumbnails on the fly while moving; re-cut sharp once settled.
+        self._zooming = True
+        self._zoom_settle.start()
         hsb, vsb = self.horizontalScrollBar(), self.verticalScrollBar()
-        tx = max(hsb.minimum(), min(hsb.maximum(), self._glide_target[0]))
-        ty = max(vsb.minimum(), min(vsb.maximum(), self._glide_target[1]))
-        dx, dy = tx - self._ox(), ty - self._oy()
-        if abs(dx) < 1 and abs(dy) < 1:
+        hsb.setValue(max(0, min(hsb.maximum(), round(cx * z - vp.width() / 2))))
+        vsb.setValue(max(0, min(vsb.maximum(), round(cy * z - vp.height() / 2))))
+        self._scroll_target = vsb.value()
+        vp.update()
+        self._schedule_requests()
+        if u >= 1.0:
             self._glide.stop()
-            return
-        # Ease out: cover a fixed share of the remaining way each frame.
-        def step(d):
-            s = d * 0.22
-            return (max(1, s) if d > 0 else min(-1, s)) if abs(d) >= 1 else 0
-        hsb.setValue(int(round(self._ox() + step(dx))))
-        vsb.setValue(int(round(self._oy() + step(dy))))
+            self._update_status()
 
     def ensure_visible(self, idx, center=False):
         r = self._row_of(idx)
@@ -1347,6 +1393,7 @@ class ThumbGrid(QAbstractScrollArea):
         self._center_on = -1
         self._glide.stop()
         self._inertia.stop()
+        self._forget_focus()
         dy = event.angleDelta().y()
         pos = event.position().toPoint()
         # Right button held (or Ctrl): zoom around the cursor.
@@ -1423,14 +1470,25 @@ class ThumbGrid(QAbstractScrollArea):
             return
         if event.button() != Qt.LeftButton:
             return
-        # A single click frames the picture: select it and centre it at the
-        # current zoom. Double-click (or Enter) opens it.
+        # A single click frames the picture (fills the window) and starts a
+        # GIF / video playing. Clicking the framed item again pauses / resumes
+        # what plays, or flies a still picture back to the previous view.
+        # Double-click (or Enter) opens it.
         i = self._item_at(event.position().toPoint())
         if i >= 0 and i == getattr(self, '_press_item', -1):
-            self.focus_item(i)
-            self.toggle_playback(i)
-        elif i < 0 and getattr(self, '_press_item', -1) < 0 and self._playing is not None:
-            self.stop_playback()        # a click on the empty background stops it
+            playing_here = self._playing is not None and self._playing['path'] == self._items[i]
+            if i == self._focused and playing_here:
+                self.toggle_playback(i)
+            elif i == self._focused:
+                self.unfocus()
+            else:
+                self.focus_item(i)
+                self.toggle_playback(i)
+        elif i < 0 and getattr(self, '_press_item', -1) < 0:
+            # A click on the empty background stops playback and steps back out.
+            self.stop_playback()
+            if self._focused >= 0:
+                self.unfocus()
 
     def keyPressEvent(self, event):
         self._center_on = -1
