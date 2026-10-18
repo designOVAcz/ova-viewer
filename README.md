@@ -6,6 +6,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Recent Updates
 
+- Added a ▦ thumbnail grid (**G**): opens instantly even on huge folders, loads only what is on screen (progress in the status bar), with a GRID panel for pictures per row, gap, justified rows, fit-all-on-screen, file names and GPU (OpenGL) drawing. Thumbnails are decoded in parallel and cached on disk.
 - Added an eraser tool that removes annotations without touching the underlying image.
 - Added live free-line preview while placing 2-click line annotations.
 - Added posterize/value-filter controls for reducing images to N grayscale tones.
@@ -39,6 +40,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 🔁 **Loop** — repeat the video or GIF on screen instead of stopping at the end. The opposite of autoplay-next, so switching one on switches the other off
 - 🎵 **Dub audio** — if an audio file sits beside a video with the same name (`clip.mp4` → `clip.mp3`), play it instead of the video's own track, held in sync through seeking, stepping and pause. Off by default; toggled from the video controls
 - ⏱ **Video timeline** — click anywhere on it to jump there, drag to scrub (including straight on from that click), and hover to see a thumbnail of the frame at that moment
+- ▦ **Thumbnail grid** (**G**) — every item in the folder at a glance, PureRef-style. The default grid gives each item an equal square cell, so even a folder of tens of thousands of files opens instantly and you can jump anywhere; ▤ **justified rows** fill each row edge to edge instead (picture sizes are read once per folder and remembered, and thumbnails never shift once placed). Only what is on screen plus about a screen around it is loaded — a thin line along the bottom and the status bar show the percentage. Like a PureRef board, hold the right button and turn the wheel to zoom around the pointer, and right-drag to pan in any direction (flick to glide) — zooming in never loads more than the plain view. A floating GRID panel (bottom-right, collapsed) sets pictures per row, the gap, the layout, **fit all on screen**, file names and **GPU** drawing (OpenGL viewport, off at each start). Big cells (few per row) get sharper versions. Videos, PDFs/EPUBs and comics show their first frame or page. Thumbnails are cached in `%LOCALAPPDATA%\OvaViewer\thumbs` (1 GB cap, oldest evicted), so reopening a folder is instant; smooth with tens of thousands of files
 - ⏮️ History navigation (back/forward through viewed images)
 - 🔀 Random or alphabetical sorting
 - 🗂 **File Types palette** — lists every file type found in the loaded folder with a checkbox and file count; uncheck a type to skip it while browsing (all types shown by default)

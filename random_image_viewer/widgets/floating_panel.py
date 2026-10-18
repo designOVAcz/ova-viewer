@@ -499,6 +499,15 @@ class FloatingPanel(QWidget):
         self._right_gap = max(0, pw - (self.x() + self.width()))
         self._bottom_gap = max(0, ph - (self.y() + self.height()))
 
+    def dock(self, horizontal, vertical, gap_x=8, gap_y=8):
+        """Pin the panel to a corner ('left'/'right', 'top'/'bottom') with the
+        given gaps to the edges, as if the user had dragged it there."""
+        self._anchor_h, self._anchor_v = horizontal, vertical
+        self._left_pos = self._right_gap = gap_x
+        self._top_pos = self._bottom_gap = gap_y
+        self._user_moved = True
+        self.reposition_to_anchor()
+
     def reposition_to_anchor(self):
         """Move the panel so it honours its current anchor, then clamp on-screen.
 

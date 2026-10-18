@@ -26,6 +26,20 @@
 While something you drew is still unsaved, the mouse wheel zooms instead of
 changing the image, so a stray scroll cannot throw the drawing away.
 
+## Thumbnail Grid
+
+| Input | Action |
+|---|---|
+| `G` / ▦ button | Open / close the thumbnail grid |
+| Click | Select and glide it to the centre, keeping the zoom |
+| Double-click / `Enter` / `Space` | Open that item in the viewer |
+| Arrow keys, `PgUp` / `PgDn`, `Home` / `End` | Move the selection |
+| Mouse wheel | Smooth scroll (`Shift` + wheel: sideways) |
+| Right button held + mouse wheel, `Ctrl` + wheel, `Ctrl++` / `Ctrl+-` | Zoom in / out around the pointer |
+| Right-drag (or middle-drag) | Pan in any direction; flick and let go to glide |
+| `Ctrl+0` | Zoom back to fit the width |
+| `Esc` | Back to the viewer |
+
 ## Drawing
 
 | Shortcut | Action |

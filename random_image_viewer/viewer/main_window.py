@@ -1711,6 +1711,10 @@ class RandomImageViewer(QMainWindow):
         self.i_shortcut = QShortcut("I", self)
         self.i_shortcut.activated.connect(self._shortcut_color_snap)
 
+        # Thumbnail grid on / off - the same as clicking ▦
+        self.g_shortcut = QShortcut("G", self)
+        self.g_shortcut.activated.connect(lambda: self.grid_view_btn.toggle())
+
         # Finishing / trimming a polygon fill. Only enabled while one is being
         # placed, so Enter and Backspace keep their usual meaning otherwise.
         self._polygon_shortcuts = []
@@ -1729,6 +1733,9 @@ class RandomImageViewer(QMainWindow):
         if self._placing_polygon():
             self.cancel_fill()
             self.status.showMessage("Polygon cancelled")
+            return
+        if self._grid_visible():
+            self.grid_view_btn.setChecked(False)
             return
         if self.is_fullscreen:
             self.force_exit_fullscreen()
@@ -1928,6 +1935,9 @@ class RandomImageViewer(QMainWindow):
         # File Types palette: per-extension checkboxes that filter what you browse
         self.type_filter_btn = QToolButton(); self.type_filter_btn.setText("🗂"); self.type_filter_btn.setToolTip("File Types: show only the file types you check (e.g. only MP4 or GIF)"); self.type_filter_btn.setCheckable(True); self.type_filter_btn.setFixedSize(24,24); self.type_filter_btn.toggled.connect(self._toggle_type_filter_window); toolbar.addWidget(self.type_filter_btn)
         add_spacer(2)
+        # Named symbol font: Segoe UI has no ▦ and a fallback scan is slow.
+        self.grid_view_btn = QToolButton(); self.grid_view_btn.setText("▦"); self.grid_view_btn.setFont(QFont("Segoe UI Symbol", 11)); self.grid_view_btn.setToolTip("Thumbnail grid of the whole folder (G)"); self.grid_view_btn.setCheckable(True); self.grid_view_btn.setFixedSize(24,24); self.grid_view_btn.toggled.connect(self.toggle_grid_view); toolbar.addWidget(self.grid_view_btn)
+        add_spacer(2)
         self.timer_button = QToolButton(); self.timer_button.setCheckable(True); self.timer_button.setText("⚡"); self.timer_button.setToolTip("Toggle Auto Advance"); self.timer_button.setFixedSize(24,24); self.timer_button.toggled.connect(self.toggle_timer); toolbar.addWidget(self.timer_button)
         add_spacer(2)
         self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(44); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
@@ -2110,7 +2120,7 @@ class RandomImageViewer(QMainWindow):
             ("FILE / NAV", [
                 'open_btn', 'new_canvas_btn', 'delete_file_btn', 'save_btn',
                 'prev_btn', 'next_btn', 'sort_order_button', 'type_filter_btn',
-                'timer_button', 'timer_spin', 'circle_timer', 'autoplay_next_btn',
+                'grid_view_btn', 'timer_button', 'timer_spin', 'circle_timer', 'autoplay_next_btn',
                 'loop_btn',
             ]),
             # Everything for drawing lives in this one panel, one row per job,
@@ -11692,6 +11702,9 @@ class RandomImageViewer(QMainWindow):
         worker = getattr(self, '_thumb_worker', None)
         if worker is not None:
             worker.stop()
+        grid = getattr(self, '_thumb_grid', None)
+        if grid is not None:
+            grid.shutdown()
         super().closeEvent(event)
 
     def report_startup_ready(self, launch_t0=None):
@@ -12246,6 +12259,8 @@ class RandomImageViewer(QMainWindow):
                            if self._item_type(path) not in hidden]
         else:
             self.images = list(self._all_items)
+        if self._grid_visible():
+            self._thumb_grid.set_items(self.images, self.current_image)
 
     def _set_playlist_items(self, items):
         """Install a freshly scanned playlist and apply the current filter.
@@ -12322,6 +12337,76 @@ class RandomImageViewer(QMainWindow):
             self._type_filter_window = win
             self._refresh_type_filter_panel()
         return self._type_filter_window
+
+    # ── Thumbnail grid ────────────────────────────────────────────
+
+    def _grid_visible(self):
+        grid = getattr(self, '_thumb_grid', None)
+        return grid is not None and grid.isVisible()
+
+    def toggle_grid_view(self, on):
+        """Lay the thumbnail grid over the canvas, or take it away again.
+
+        The grid is a sibling stacked over the canvas, not a child of it, so
+        the canvas and its tool panels stay exactly as they were underneath.
+        It is built on first use only, keeping it out of startup.
+        """
+        if on and not self.images:
+            self.status.showMessage("Open a folder first — the grid shows its thumbnails")
+            self.grid_view_btn.blockSignals(True)
+            self.grid_view_btn.setChecked(False)
+            self.grid_view_btn.blockSignals(False)
+            return
+        grid = getattr(self, '_thumb_grid', None)
+        if on:
+            if grid is None:
+                from random_image_viewer.widgets.thumb_grid import ThumbGrid
+                grid = ThumbGrid(self.image_label.parentWidget(), self._settings)
+                grid.activated.connect(self._on_grid_activated)
+                grid.close_requested.connect(lambda: self.grid_view_btn.setChecked(False))
+                grid.open_folder_requested.connect(self.choose_folder)
+                grid.file_types_requested.connect(self._grid_show_file_types)
+                grid.progress.connect(self._on_grid_progress)
+                grid.track(self.image_label)
+                self._thumb_grid = grid
+            # Nothing plays behind the grid; picked back up on return.
+            self._grid_paused_media = self._pause_media_for_minimize()
+            grid.show()
+            grid.raise_()
+            grid.set_items(self.images, self.current_image)
+            grid.setFocus()
+        elif grid is not None and grid.isVisible():
+            grid.hide()
+            grid.suspend()
+            if getattr(self, '_grid_paused_media', False):
+                self._resume_media_after_minimize()
+            self._grid_paused_media = False
+            self.image_label.setFocus()
+
+    def _on_grid_activated(self, path):
+        """A thumbnail was clicked: close the grid and show that item."""
+        if path != self.current_image:
+            self._grid_paused_media = False     # a new item replaces the paused one
+        self.grid_view_btn.setChecked(False)
+        if path != self.current_image:
+            self._load_playlist_item(path)
+            if path in self.images:
+                self.current_index = self.images.index(path)
+
+    def _on_grid_progress(self, done, total):
+        """Status-bar progress for the thumbnails around the grid's view."""
+        if not self._grid_visible():
+            return
+        if total and done < total:
+            self.status.showMessage(f"Thumbnails {done * 100 // total}%  ({done}/{total})")
+        else:
+            self.status.showMessage(f"Thumbnails ready · {len(self.images)} items", 3000)
+
+    def _grid_show_file_types(self):
+        if self.type_filter_btn.isChecked():
+            self._show_type_filter_window()
+        else:
+            self.type_filter_btn.setChecked(True)
 
     def _toggle_type_filter_window(self, checked):
         """Show/hide the File Types panel from the toolbar button."""
