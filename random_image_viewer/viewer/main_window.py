@@ -31,7 +31,8 @@ from random_image_viewer.constants import (IMAGE_EXTENSIONS, MEDIA_EXTENSIONS, D
 from random_image_viewer.version import get_version
 from random_image_viewer.platform_utils import (  # noqa: F401
     process_uptime_seconds,
-    is_windows_dark_mode, enable_windows_dark_title_bar, setup_image_allocation_limit
+    is_windows_dark_mode, enable_windows_dark_title_bar, setup_image_allocation_limit,
+    pick_folders,
 )
 from random_image_viewer.styles import get_adaptive_stylesheet
 from random_image_viewer.image_utils import (
@@ -1087,6 +1088,9 @@ class RandomImageViewer(QMainWindow):
         self.images = []            # Browsing list AFTER the file-type filter
         self._all_items = []        # Every scanned item, before filtering
         self._hidden_types = set()  # Extensions hidden via the File Types panel
+        # Add mode (➕): opening / dropping adds to the list instead of replacing it
+        self.add_to_playlist_mode = False
+        self._scan_append = False
         self._type_filter_window = None
         self._type_filter_window_pos = None  # session-only memory of last drag pos
         self.history = []
@@ -1779,6 +1783,8 @@ class RandomImageViewer(QMainWindow):
         # ── SECTION: File ──
         self.open_btn = open_btn = QToolButton(); open_btn.setText("📁"); open_btn.setToolTip("Open Folder"); open_btn.setFixedSize(24,24); open_btn.clicked.connect(self.choose_folder); toolbar.addWidget(open_btn)
         add_spacer(2)
+        self.add_mode_btn = QToolButton(); self.add_mode_btn.setText("➕"); self.add_mode_btn.setToolTip("Add mode: opening or dropping a folder or files adds them to the current list instead of replacing it\n(hold Ctrl while dropping or clicking 📁 to add just once)"); self.add_mode_btn.setCheckable(True); self.add_mode_btn.setFixedSize(24,24); self.add_mode_btn.toggled.connect(self.toggle_add_mode); toolbar.addWidget(self.add_mode_btn)
+        add_spacer(2)
         self.delete_file_btn = QToolButton(); self.delete_file_btn.setText("🗑"); self.delete_file_btn.setToolTip("Move current file to Recycle Bin (Delete)"); self.delete_file_btn.setFixedSize(24,24); self.delete_file_btn.clicked.connect(self.delete_current_file); toolbar.addWidget(self.delete_file_btn)
         add_spacer(2)
         self.new_canvas_btn = QToolButton(); self.new_canvas_btn.setText("📝"); self.new_canvas_btn.setToolTip("New sketch: blank mid-grey canvas with the free-draw tool ready \u2014 save it with 💾"); self.new_canvas_btn.setFixedSize(24,24); self.new_canvas_btn.clicked.connect(self.new_draw_canvas); toolbar.addWidget(self.new_canvas_btn)
@@ -2118,7 +2124,7 @@ class RandomImageViewer(QMainWindow):
         # exist are added, so this is resilient to future changes.
         groups = [
             ("FILE / NAV", [
-                'open_btn', 'new_canvas_btn', 'delete_file_btn', 'save_btn',
+                'open_btn', 'add_mode_btn', 'new_canvas_btn', 'delete_file_btn', 'save_btn',
                 'prev_btn', 'next_btn', 'sort_order_button', 'type_filter_btn',
                 'grid_view_btn', 'timer_button', 'timer_spin', 'circle_timer', 'autoplay_next_btn',
                 'loop_btn',
@@ -11866,11 +11872,32 @@ class RandomImageViewer(QMainWindow):
         default_folder = r"Y:\_REFERENCES_MAIN"
         start_dir = default_folder if os.path.exists(default_folder) else ""
         
-        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder", start_dir)
-        if folder:
+        add = self._wants_add()
+        title = ("Add Folders to the Current List" if add else "Select Image Folders") + \
+            " — Ctrl/Shift-click to pick several"
+        # The native Windows picker can select several folders at once;
+        # Qt's own dialog (the fallback) only one.
+        folders = pick_folders(self, title, start_dir)
+        if folders is None:
+            folder = QFileDialog.getExistingDirectory(self, title, start_dir)
+            folders = [folder] if folder else []
+        if folders:
             # Mixed playlist: images, videos, GIFs, and PDF/EPUB/CBR all walk
             # through the same Next/Previous flow.
-            self._load_playlist([folder], source="from folder dialog")
+            self._load_playlist(folders, source="from folder dialog", append=add)
+
+    def toggle_add_mode(self, checked):
+        """➕ on: opening or dropping adds to the current list instead of replacing it."""
+        self.add_to_playlist_mode = bool(checked)
+        self.status.showMessage(
+            "Add mode on — opened or dropped folders and files join the current list"
+            if checked else "Add mode off — opening a folder replaces the list", 4000)
+
+    def _wants_add(self):
+        """Add instead of replace: add mode is on, or Ctrl is held for a
+        one-off add. Only meaningful when there is a list to add to."""
+        ctrl = bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
+        return bool(self._all_items) and (self.add_to_playlist_mode or ctrl)
 
     def delete_current_file(self):
         """Move the currently displayed file to the Recycle Bin."""
@@ -12138,23 +12165,26 @@ class RandomImageViewer(QMainWindow):
             return
 
         local_paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
-        if self.open_paths(local_paths, source="dropped"):
+        if self.open_paths(local_paths, source="dropped", append=self._wants_add()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def open_paths(self, paths, source="opened"):
+    def open_paths(self, paths, source="opened", append=False):
         """Open files/folders given by a drop or on the command line (Explorer's
         "Open with" / default-app launch passes the file as an argument).
 
         A single file uses the standalone open path (its folder becomes the
         playlist). Multiple paths, or any folder, build a mixed playlist that
         walks images, videos, GIFs, PDFs, EPUBs, and CBR/CBZ archives.
-        Returns True if anything was opened.
+        With *append*, everything — a single file included — is added to the
+        current list instead. Returns True if anything was opened.
         """
         paths = [p for p in paths if p]
         if not paths:
             return False
+        if append:
+            return self._load_playlist(paths, source=source, append=True)
         if len(paths) == 1 and not os.path.isdir(paths[0]):
             return self._open_local_path(paths[0], source=source)
         return self._load_playlist(paths, source=source)
@@ -12484,14 +12514,16 @@ class RandomImageViewer(QMainWindow):
                 and self.current_image is not None
                 and self.current_image in self.images)
 
-    def _load_playlist(self, paths, source="dropped"):
+    def _load_playlist(self, paths, source="dropped", append=False):
         """Build a unified playlist from *paths* (files and/or folders).
 
         The actual recursive walk runs on a background :class:`QThread` via
         :class:`PlaylistScanner` so the GUI stays responsive when the user
         drops a folder containing tens of thousands of files. The first
         playlist item is loaded from :meth:`_finish_playlist` once the
-        worker emits ``finished``.
+        worker emits ``finished``. With *append* the scanned items are added
+        to the current list by :meth:`_append_to_playlist` and the view stays
+        where it is.
 
         Returns True if a scan was started, False if the request was rejected
         (e.g. another scan is already running, or no paths were given).
@@ -12508,9 +12540,12 @@ class RandomImageViewer(QMainWindow):
             )
             return False
 
-        self._close_pdf()
-        self._close_epub()
-        self._close_cbr()
+        append = append and bool(self._all_items)
+        if not append:
+            # Adding keeps whatever is on screen; replacing starts afresh.
+            self._close_pdf()
+            self._close_epub()
+            self._close_cbr()
 
         # First folder in the drop is remembered for self.folder (used by
         # status text / open-in-explorer). Loose files don't define a folder.
@@ -12520,6 +12555,7 @@ class RandomImageViewer(QMainWindow):
                 first_folder = p
                 break
 
+        self._scan_append = append
         self._begin_scan(list(paths), source=source, first_folder=first_folder)
         return True
 
@@ -12580,15 +12616,39 @@ class RandomImageViewer(QMainWindow):
         """Slot: scanner completed, build the playlist and load first item."""
         source = self._scan_source
         first_folder = getattr(self, "_scan_first_folder", None)
+        append, self._scan_append = self._scan_append, False
         self._scan_in_progress = False
         self._scan_thread = None
         self._scan_worker = None
         self._restore_scan_cursor()
 
-        self._finish_playlist(items, source=source, first_folder=first_folder)
+        if append and self._all_items:
+            self._append_to_playlist(items, source=source)
+        else:
+            self._finish_playlist(items, source=source, first_folder=first_folder)
+
+    def _append_to_playlist(self, items, source="dropped"):
+        """Add freshly scanned *items* after the current list, skipping any
+        already in it. What is on screen, the history and self.folder stay."""
+        known = set(self._all_items)
+        new = [p for p in items if p not in known]
+        if not new:
+            self.status.showMessage(
+                f"Nothing new to add — all {len(items):,} items {source} are already in the list")
+            return False
+        self._set_playlist_items(list(self._all_items) + new)
+        if self.current_image in self.images:
+            self.current_index = self.images.index(self.current_image)
+        self._update_title()
+        skipped = len(items) - len(new)
+        extra = f", {skipped:,} already in it" if skipped else ""
+        self.status.showMessage(
+            f"Added {len(new):,} items ({source}{extra}) — {len(self._all_items):,} in the list")
+        return True
 
     def _on_scan_cancelled(self):
         """Slot: scanner was cancelled before completion."""
+        self._scan_append = False
         self._scan_in_progress = False
         self._scan_thread = None
         self._scan_worker = None

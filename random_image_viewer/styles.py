@@ -68,6 +68,14 @@ QMenu::separator {
     background: #35383b;
     margin: 2px 0;
 }
+QComboBox QAbstractItemView {
+    background: #232629;
+    color: #c7ccd1;
+    border: 1px solid #35383b;
+    outline: 0;
+    selection-background-color: #424242;
+    selection-color: #fff;
+}
 """
 
 LIGHT_STYLESHEET = """
@@ -137,6 +145,14 @@ QMenu::separator {
     height: 1px;
     background: #cccccc;
     margin: 2px 0;
+}
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #333333;
+    border: 1px solid #cccccc;
+    outline: 0;
+    selection-background-color: #0078d4;
+    selection-color: #fff;
 }
 """
 

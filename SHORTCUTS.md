@@ -110,6 +110,9 @@ Flip vertical has no working shortcut: the context menu lists `Ctrl+V`, but
 | PDF file | Open PDF viewer |
 | EPUB file | Open EPUB viewer |
 | Image / GIF / Video file | Open file and load parent folder for navigation |
+| Anything, with ➕ add mode on (or `Ctrl` held) | Add it to the current list instead of replacing it — what is on screen stays, duplicates are skipped |
+
+`Ctrl` + click on 📁 also adds the chosen folder just this once. In the 📁 dialog, Ctrl/Shift-click to pick several folders at once.
 
 ## Supported Formats
 

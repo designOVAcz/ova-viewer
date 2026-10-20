@@ -7,7 +7,9 @@ stays responsive:
   that needs every picture's shape, read from file headers in order and
   remembered on disk, so a folder is only ever read once. Rows are only
   appended below, and a placed cell never moves. The plain *grid* gives every
-  item the same square cell, so it needs nothing from the files at all.
+  item the same square cell, filled edge to edge by a centre crop, so it
+  needs nothing from the files at all and the only space between pictures
+  is the gap setting.
 * **A canvas with a camera.** The layout is computed once, in "canvas" pixels
   that fill the window width. On top sits a camera — a zoom factor and an
   x / y offset. Right-drag (or middle-drag) pans in any direction with a bit
@@ -206,7 +208,7 @@ class ThumbGrid(QAbstractScrollArea):
 
         # Options (persisted)
         self._per_row = 6
-        self._gap = 6
+        self._gap = 3
         self._names = False
         self._fit_all = False
         self._gpu = False
@@ -452,7 +454,8 @@ class ThumbGrid(QAbstractScrollArea):
         self._justify_btn = self._tool(
             "▤", "Justified rows: fill each row edge to edge, no empty space.\n"
                  "Reads every picture's size first (once per folder). Off: equal "
-                 "square cells, instant even for very large folders.", True, self._justified)
+                 "squares filled edge to edge (pictures centre-cropped),\n"
+                 "instant even for very large folders.", True, self._justified)
         self._justify_btn.toggled.connect(self._on_justified)
         self._fit_btn = self._tool("⛶", "Fit all: size the cells so everything fills the screen "
                                    f"(up to {FIT_ALL_MAX_ITEMS} items)", True, self._fit_all)
@@ -875,19 +878,10 @@ class ThumbGrid(QAbstractScrollArea):
                 left + vw * (1 + margin_x), top + vh * (1 + margin_down))
 
     def _picture_rect(self, i, cell):
-        """Where the picture itself sits: the whole cell in justified rows,
-        the fitted, centred part of the square in the grid."""
-        if self._justified:
-            return cell
-        a = self._aspect.get(self._items[i])
-        if not a:
-            return cell
-        w, h = cell.width(), cell.height()
-        if a >= w / h:
-            ph = max(1, round(w / a))
-            return QRect(cell.left(), cell.top() + (h - ph) // 2, w, ph)
-        pw = max(1, round(h * a))
-        return QRect(cell.left() + (w - pw) // 2, cell.top(), pw, h)
+        """Where the picture sits: always the whole cell. Justified rows are
+        shaped like the picture; the plain grid's squares are filled with a
+        centre crop, so the only space between pictures is the gap setting."""
+        return cell
 
     def _item_at(self, pos):
         z = self._zoom
@@ -945,6 +939,11 @@ class ThumbGrid(QAbstractScrollArea):
     def _edge_for(self, i, r, dpr):
         """Smallest thumbnail size that stays sharp in item *i*'s cell on screen."""
         need = max(self._cell_w[i], self._row_h[r]) * self._zoom * dpr
+        if not self._justified:
+            # A square filled by a centre crop shows the picture's short side
+            # across the whole cell, so the long edge must be that much longer.
+            a = self._aspect.get(self._items[i], REFERENCE_ASPECT)
+            need *= max(a, 1 / a)
         for edge in EDGES:
             if edge * 1.15 >= need:
                 return edge
@@ -1280,8 +1279,7 @@ class ThumbGrid(QAbstractScrollArea):
         old, self._selected = self._selected, idx
         self._update_cell(old)
         self._update_cell(idx)
-        # The picture's own rectangle in canvas pixels (fitted inside the
-        # square in the plain grid).
+        # The picture's rectangle in canvas pixels (its whole cell).
         cell = QRect(self._cell_x[idx], self._row_y[r], self._cell_w[idx], self._row_h[r])
         pic = QRectF(self._picture_rect(idx, cell))
         vw, vh = self.viewport().width(), self.viewport().height()

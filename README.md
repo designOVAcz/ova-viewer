@@ -6,6 +6,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Recent Updates
 
+- Added ➕ add mode: opening or dropping folders adds them to the current list instead of replacing it (or hold `Ctrl` for a one-off add).
 - Added a ▦ thumbnail grid (**G**): opens instantly even on huge folders, loads only what is on screen (progress in the status bar), with a GRID panel for pictures per row, gap, justified rows, fit-all-on-screen, file names and GPU (OpenGL) drawing. Thumbnails are decoded in parallel and cached on disk.
 - Added an eraser tool that removes annotations without touching the underlying image.
 - Added live free-line preview while placing 2-click line annotations.
@@ -30,7 +31,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 ## Features
 
 **Viewing**
-- 📁 Open any folder (including subfolders) via button or drag & drop
+- 📁 Open any folder (including subfolders) via button or drag & drop — the 📁 dialog takes several folders at once (Ctrl/Shift-click them, then *Select Folder*)
+- ➕ **Add mode** — opened or dropped folders and files join the current list instead of replacing it (hold `Ctrl` while dropping or clicking 📁 to add just once); the picture on screen stays and duplicates are skipped
 - 🖼️ Images (JPEG, PNG, BMP, WebP, JPEG 2000) · 📄 PDFs (single / 2-page / 3-page book spread) · 📚 EPUBs · 🗜️ CBR/CBZ comics · 🎞️ Animated GIFs and WebP · 🎬 Videos
 - 🔍 Zoom & pan (mouse wheel + right-click drag)
 - 🔄 Rotate, flip horizontal/vertical
