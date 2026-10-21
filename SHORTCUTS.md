@@ -30,7 +30,8 @@ changing the image, so a stray scroll cannot throw the drawing away.
 
 | Input | Action |
 |---|---|
-| `G` / ▦ button | Open / close the thumbnail grid |
+| `G` / ▦ button / double-click the picture | Open / close the thumbnail grid — with a PDF, EPUB or CBR/CBZ open it shows that document's pages (double-click a page to go to it) |
+| 📄 in the GRID panel | Switch between the open document's pages and the whole folder |
 | Click | Frame it: zoom so it fills the window and centre it; a GIF, animated WebP or video starts playing in place (muted) |
 | Click the framed picture again | Fly back to the view you came from (a playing GIF / video pauses / resumes instead) |
 | Click the empty background | Stop playback and fly back to the view you came from |
@@ -40,6 +41,7 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Right button held + mouse wheel, `Ctrl` + wheel, `Ctrl++` / `Ctrl+-` | Zoom in / out around the pointer |
 | Right-drag (or middle-drag) | Pan in any direction; flick and let go to glide |
 | `Ctrl+0` | Zoom back to fit the width |
+| ▶ in the GRID panel | Slideshow: frame one picture after another (GIFs / videos play); seconds and order follow ⚡ and 🔀. ▶ again stops and flies back; any click, drag, wheel or key stops it where it is |
 | `Esc` | Back to the viewer |
 
 ## Drawing
@@ -73,7 +75,7 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Right-drag (zoomed in) | Pan |
 | Left-drag (zoomed in, no tool on) | Pan |
 | Right-click (not zoomed in) | Context menu |
-| Double-click | Exit fullscreen |
+| Double-click | Open the thumbnail grid (no drawing tool on); with nothing open, exit fullscreen |
 | `Ctrl+H` | Flip horizontal |
 
 Flip vertical has no working shortcut: the context menu lists `Ctrl+V`, but

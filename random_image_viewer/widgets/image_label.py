@@ -803,7 +803,26 @@ class ImageLabel(QLabel):
         if event.button() == Qt.MiddleButton:
             event.accept()
             return
+        # Double-click on the picture opens the thumbnail grid (like G) — only
+        # with no drawing / colour-snap tool engaged, so marking stays as it was.
+        if (event.button() == Qt.LeftButton and viewer is not None
+                and (viewer.images or viewer._open_document() is not None)
+                and self._no_tool_engaged()):
+            viewer.grid_view_btn.setChecked(True)
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
+
+    def _no_tool_engaged(self):
+        """True when no drawing, fill, eraser or colour-snap tool is on — the
+        plain left button is then free for panning and opening the grid."""
+        viewer = self.parent_viewer
+        return bool(viewer) and not (
+            viewer.line_drawing_mode or viewer.horizontal_line_drawing_mode
+            or viewer.free_line_drawing_mode or viewer.free_draw_mode
+            or getattr(viewer, 'eraser_mode', False)
+            or getattr(viewer, 'fill_mode', None)
+            or getattr(viewer, 'color_snap_mode', False))
 
     def mousePressEvent(self, event):
         # Handle middle-click for next image
@@ -831,15 +850,8 @@ class ImageLabel(QLabel):
         # interferes with annotation.
         if (event.button() == Qt.LeftButton and
             self.zoom_factor > 1.0 and
-            self.parent_viewer and
             self.pixmap() and not self.pixmap().isNull() and
-            not self.parent_viewer.line_drawing_mode and
-            not self.parent_viewer.horizontal_line_drawing_mode and
-            not self.parent_viewer.free_line_drawing_mode and
-            not self.parent_viewer.free_draw_mode and
-            not getattr(self.parent_viewer, 'eraser_mode', False) and
-            not getattr(self.parent_viewer, 'fill_mode', None) and
-            not getattr(self.parent_viewer, 'color_snap_mode', False)):
+            self._no_tool_engaged()):
 
             self.is_panning = True
             self.last_pan_point = event.position()

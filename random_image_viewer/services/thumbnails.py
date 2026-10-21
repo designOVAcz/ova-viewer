@@ -29,6 +29,7 @@ import os
 import threading
 import time
 import zipfile
+from collections import OrderedDict
 
 from PySide6.QtCore import QObject, Signal, QSize, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage, QImageReader, QImageIOHandler
@@ -47,9 +48,35 @@ JPEG_QUALITY = 85
 # PyMuPDF is not thread-safe, even across separate documents.
 _FITZ_LOCK = threading.Lock()
 
+# A page of a PDF / EPUB / comic archive as a grid item: "<file>::page::<n>"
+# (0-based). Everything — cache, size reading, decoding — accepts it like a path.
+PAGE_SEP = "::page::"
+
+
+def page_item(path, n):
+    return f"{path}{PAGE_SEP}{n}"
+
+
+def split_page_item(item):
+    """(document path, 0-based page) for a page item, else None."""
+    if PAGE_SEP not in item:
+        return None
+    path, n = item.rsplit(PAGE_SEP, 1)
+    return path, int(n)
+
+
+def display_name(item):
+    """File name, or "book.pdf · p. 12" for a page."""
+    page = split_page_item(item)
+    if page is None:
+        return os.path.basename(item)
+    return f"{os.path.basename(page[0])} · p. {page[1] + 1}"
+
 
 def item_kind(path):
     """'image', 'video' or 'doc' — drives the decoder and the placeholder."""
+    if PAGE_SEP in path:
+        return 'image'          # a single page shows as a picture
     ext = os.path.splitext(path)[1].lower()
     if ext in VIDEO_EXTENSIONS:
         return 'video'
@@ -76,9 +103,11 @@ def _cache_file(key, ext):
 
 
 def _find_cached(path, edge=THUMB_EDGE):
-    """(key, cached file) for *path* at *edge*; the file is None if not cached."""
+    """(key, cached file) for *path* at *edge*; the file is None if not cached.
+    A page item is keyed by its document's file plus the page number."""
+    page = split_page_item(path)
     try:
-        key = _cache_key(path, os.stat(path), edge)
+        key = _cache_key(path, os.stat(page[0] if page else path), edge)
     except OSError:
         return None, None
     for ext in ('.jpg', '.png'):
@@ -207,47 +236,64 @@ def _decode_video(path, edge):
         cap.release()
 
 
-def _decode_pdf_like(path, edge):
+# ── documents: pages of PDF / EPUB / comic archives ──────────────
+#
+# A page grid asks for many pages of one document, so the opened document
+# (or archive) is kept for the next page instead of being re-opened — an
+# EPUB lays out the whole book when it opens. A couple at most are kept.
+
+_OPEN_DOCS_MAX = 2
+_FITZ_DOCS = OrderedDict()          # path -> pymupdf document; use under _FITZ_LOCK
+_ARCHIVES = OrderedDict()           # path -> (backend, page names, lock)
+_ARCHIVES_LOCK = threading.Lock()
+
+
+def _fitz_doc(path):
+    """The open PyMuPDF document for *path*. Call with _FITZ_LOCK held."""
     import pymupdf
-    with _FITZ_LOCK:
+    doc = _FITZ_DOCS.pop(path, None)
+    if doc is None:
         doc = pymupdf.open(path)
-        try:
-            if doc.page_count == 0:
-                return QImage()
-            page = doc[0]
-            r = page.rect
-            zoom = edge / max(r.width, r.height, 1)
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
-            return QImage(pix.samples, pix.width, pix.height, pix.stride,
-                          QImage.Format_RGB888).copy()
-        finally:
-            doc.close()
+    _FITZ_DOCS[path] = doc
+    while len(_FITZ_DOCS) > _OPEN_DOCS_MAX:
+        _FITZ_DOCS.popitem(last=False)[1].close()
+    return doc
 
 
-def _decode_archive(path, edge):
-    """First picture of a CBZ / CBR comic, in the viewer's own page order."""
-    from random_image_viewer.cbr_utils import _is_image_entry
+def _archive(path):
+    """(backend, page entry names in the viewer's order, lock) for a comic."""
+    from random_image_viewer.cbr_utils import _is_image_entry, _ZipBackend, _RarBackend
     from random_image_viewer.image_utils import natural_sort_key
+    with _ARCHIVES_LOCK:
+        entry = _ARCHIVES.pop(path, None)
+        if entry is None:
+            backend = _ZipBackend(path) if zipfile.is_zipfile(path) else _RarBackend(path)
+            pages = sorted((n for n in backend.names() if _is_image_entry(n)),
+                           key=lambda p: (natural_sort_key(os.path.dirname(p)),
+                                          natural_sort_key(os.path.basename(p))))
+            entry = (backend, pages, threading.Lock())
+        _ARCHIVES[path] = entry
+        while len(_ARCHIVES) > _OPEN_DOCS_MAX:
+            old_backend, _pages, old_lock = _ARCHIVES.popitem(last=False)[1]
+            with old_lock:
+                old_backend.close()
+        return entry
 
-    def first(names):
-        pages = [n for n in names if _is_image_entry(n)]
-        if not pages:
-            return None
-        return min(pages, key=lambda p: (natural_sort_key(os.path.dirname(p)),
-                                         natural_sort_key(os.path.basename(p))))
 
-    data = None
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as zf:
-            name = first(n for n in zf.namelist() if not n.endswith('/'))
-            data = zf.read(name) if name else None
-    else:
-        import rarfile
-        with rarfile.RarFile(path) as rf:
-            name = first(rf.namelist())
-            data = rf.read(name) if name else None
-    if not data:
-        return QImage()
+def release_documents():
+    """Close every kept document and archive (the grid was closed), so the
+    files are not held open — Windows would refuse to move or delete them."""
+    with _FITZ_LOCK:
+        while _FITZ_DOCS:
+            _FITZ_DOCS.popitem()[1].close()
+    with _ARCHIVES_LOCK:
+        while _ARCHIVES:
+            backend, _pages, lock = _ARCHIVES.popitem()[1]
+            with lock:
+                backend.close()
+
+
+def _decode_bytes(data, edge):
     buf = QBuffer()
     buf.setData(QByteArray(data))
     buf.open(QIODevice.ReadOnly)
@@ -259,17 +305,64 @@ def _decode_archive(path, edge):
     return image
 
 
-def make_thumbnail(path, edge=THUMB_EDGE):
-    """Decode a fresh thumbnail for *path* with long edge *edge* (or the
-    original size if smaller). Returns a (possibly null) QImage."""
+def _decode_page(path, n, edge):
+    """Page *n* of a PDF / EPUB / CBZ / CBR at thumbnail size."""
+    if os.path.splitext(path)[1].lower() in ('.pdf', '.epub'):
+        import pymupdf
+        with _FITZ_LOCK:
+            doc = _fitz_doc(path)
+            if not 0 <= n < doc.page_count:
+                return QImage()
+            page = doc[n]
+            r = page.rect
+            zoom = edge / max(r.width, r.height, 1)
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+            return QImage(pix.samples, pix.width, pix.height, pix.stride,
+                          QImage.Format_RGB888).copy()
+    backend, pages, lock = _archive(path)
+    if not 0 <= n < len(pages):
+        return QImage()
+    with lock:
+        data = backend.read(pages[n])
+    return _decode_bytes(data, edge) if data else QImage()
+
+
+def _probe_page(path, n):
+    """Shape of page *n* without rendering it, or None."""
     ext = os.path.splitext(path)[1].lower()
+    if ext in ('.pdf', '.epub'):
+        with _FITZ_LOCK:
+            doc = _fitz_doc(path)
+            if 0 <= n < doc.page_count:
+                r = doc[n].rect
+                return r.width / r.height if r.height else None
+        return None
+    backend, pages, lock = _archive(path)
+    zf = getattr(backend, '_zf', None)
+    if zf is None or not 0 <= n < len(pages):
+        return None     # RAR: reading an entry means running unrar — too slow just for a size
+    with lock, zf.open(pages[n]) as fh:
+        head = fh.read(256 * 1024)          # image headers sit at the start
+    buf = QBuffer()
+    buf.setData(QByteArray(head))
+    buf.open(QIODevice.ReadOnly)
+    size = QImageReader(buf).size()
+    return size.width() / size.height() if size.isValid() and size.height() > 0 else None
+
+
+def make_thumbnail(path, edge=THUMB_EDGE):
+    """Decode a fresh thumbnail for *path* (a file, or a page item) with long
+    edge *edge* (or the original size if smaller). Returns a (possibly null)
+    QImage. A document file on its own shows its first page."""
     try:
+        page = split_page_item(path)
+        if page is not None:
+            return _decode_page(page[0], page[1], edge)
+        ext = os.path.splitext(path)[1].lower()
         if ext in VIDEO_EXTENSIONS:
             return _decode_video(path, edge)
-        if ext in ('.pdf', '.epub'):
-            return _decode_pdf_like(path, edge)
-        if ext in ('.cbz', '.cbr'):
-            return _decode_archive(path, edge)
+        if ext in DOCUMENT_EXTENSIONS:
+            return _decode_page(path, 0, edge)
         return _decode_image(path, edge)
     except Exception as e:
         print(f"Thumbnail failed for {os.path.basename(path)}: {e}")
@@ -297,6 +390,13 @@ def probe_aspect(path):
     cached thumbnail yet) it returns a typical one for the kind, so the grid
     can place every cell once and never move it again.
     """
+    page = split_page_item(path)
+    if page is not None:
+        try:
+            a = _probe_page(*page)
+        except Exception:
+            a = None
+        return a or GUESS_ASPECT['doc']
     kind = item_kind(path)
     if kind == 'image':
         reader = QImageReader(path)

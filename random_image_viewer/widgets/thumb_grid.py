@@ -41,11 +41,12 @@ import bisect
 import json
 import math
 import os
+import random
 import time
 from collections import OrderedDict, deque
 
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QFrame, QWidget, QToolButton, QLabel, QHBoxLayout,
+    QAbstractScrollArea, QApplication, QFrame, QWidget, QToolButton, QLabel, QHBoxLayout,
 )
 from PySide6.QtCore import Qt, QTimer, QRectF, QRect, QEvent, QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QPen, QFontMetrics, QMovie
@@ -54,7 +55,7 @@ from random_image_viewer.constants import ANIMATED_EXTENSIONS
 from random_image_viewer.platform_utils import is_windows_dark_mode
 from random_image_viewer.services.thumbnails import (
     ThumbLoader, item_kind, THUMB_EDGE, SHARP_EDGES, GUESS_ASPECT,
-    load_aspect_index, save_aspect_index,
+    load_aspect_index, save_aspect_index, display_name, release_documents, PAGE_SEP,
 )
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
 from random_image_viewer.widgets.floating_panel import FloatingPanel
@@ -71,6 +72,7 @@ ZOOM_STEP = 1.15            # per wheel notch
 ZOOM_SETTLE_MS = 160        # after the last zoom step, re-cut thumbnails sharp
 PAN_FRICTION = 4.5          # inertia decay per second (higher stops sooner)
 FOCUS_MARGIN = 0.94         # a framed picture fills this share of the window
+FLIGHT_S = 0.32             # camera flight from one framed picture to the next
 SETTINGS_KEY = "thumb_grid"
 
 
@@ -129,6 +131,7 @@ class ThumbGrid(QAbstractScrollArea):
     close_requested = Signal()       # Esc / G / back button
     open_folder_requested = Signal()
     file_types_requested = Signal()
+    pages_toggled = Signal(bool)     # show the open document's pages (True) or the folder
     progress = Signal(int, int)      # thumbnails loaded / wanted around the view
 
     # Keys the grid handles itself even though the main window has global
@@ -202,6 +205,15 @@ class ThumbGrid(QAbstractScrollArea):
         # Click-to-frame: the camera flies to fit the clicked picture.
         self._camera_anim = None
         self._focused = -1                   # item the camera last framed
+
+        # Slideshow: the camera frames one picture after another. The owner
+        # supplies (seconds per picture, random order?) — the viewer's own
+        # timer and 🔀 setting — through slideshow_settings.
+        self.slideshow_settings = lambda: (4, False)
+        self._slide_deck = []                # random order still to show
+        self._slideshow = QTimer(self, singleShot=True)
+        self._slideshow.timeout.connect(self._slideshow_step)
+        self._click_item, self._click_time = -1, 0.0   # last single click, for double-click
         self._prev_view = None               # (zoom, cx, cy) before framing
         self._glide = QTimer(self, interval=16)
         self._glide.timeout.connect(self._glide_step)
@@ -239,6 +251,7 @@ class ThumbGrid(QAbstractScrollArea):
     # ── public API ───────────────────────────────────────────────
     def set_items(self, paths, current=None):
         """Show *paths*. Shapes and thumbnails already known are kept."""
+        self.stop_slideshow()
         self.stop_playback()
         self._items = list(paths)
         self._index = {p: i for i, p in enumerate(self._items)}
@@ -252,14 +265,26 @@ class ThumbGrid(QAbstractScrollArea):
         self._reset_layout()
         self._update_status()
 
+    def set_pages_toggle(self, available, showing_pages):
+        """Show the 📄 pages ⇄ folder switch (only while a document is open)."""
+        self._pages_btn.blockSignals(True)
+        self._pages_btn.setChecked(showing_pages)
+        self._pages_btn.blockSignals(False)
+        if self._pages_btn.isHidden() == available:
+            self._pages_btn.setVisible(available)
+            self._panel.relayout()
+            self._panel.reposition_to_anchor()
+
     def set_current(self, path):
         self._current = path
         self.viewport().update()
 
     def suspend(self):
         """Grid hidden: stop decoding, playback and motion, save what was measured."""
+        self.stop_slideshow()
         self.stop_playback()
         self._loader.request([])
+        release_documents()
         self._scroll_timer.stop()
         self._inertia.stop()
         self._save_aspects()
@@ -466,13 +491,25 @@ class ThumbGrid(QAbstractScrollArea):
                                           "Off at every start: the CPU path opens instantly.", True, self._gpu)
         self._gpu_btn.setFixedWidth(34)
         self._gpu_btn.toggled.connect(self._on_gpu)
+        self._slideshow_btn = self._tool(
+            "▶", "Slideshow: fly from picture to picture, framing each one\n"
+                 "(GIFs and videos play). Seconds per picture and random / sorted order\n"
+                 "follow the viewer's ⚡ timer and 🔀 setting. Any click, drag or key stops it.",
+            True, False)
+        self._slideshow_btn.toggled.connect(self._on_slideshow)
 
         self._count_label = QLabel("")
         self._count_label.setFixedHeight(24)
         self._count_label.setMinimumWidth(170)
         self._count_label.setToolTip("Right-drag: pan · right button + wheel: zoom · Ctrl+0: fit width")
 
-        for w in (back, open_btn, types_btn):
+        # Only shown while a PDF / EPUB / comic is open: its pages or the folder.
+        self._pages_btn = self._tool("📄", "Pages of the open document (on) or the whole folder (off)",
+                                     True, False)
+        self._pages_btn.toggled.connect(self.pages_toggled)
+        self._pages_btn.hide()
+
+        for w in (back, open_btn, types_btn, self._pages_btn, self._slideshow_btn):
             p.add_tool(w)
         p.add_separator()
         for w in (row_box, gap_box, self._justify_btn, self._fit_btn, names_btn, self._gpu_btn):
@@ -514,6 +551,61 @@ class ThumbGrid(QAbstractScrollArea):
         self._relayout_keeping_view(reset_zoom=True)
         self._save_settings()
 
+    # ── slideshow ────────────────────────────────────────────────
+    def _on_slideshow(self, on):
+        if on:
+            self.start_slideshow()
+        else:
+            self.stop_slideshow(fly_back=True)
+
+    def start_slideshow(self):
+        if not self._placed:
+            self._set_slideshow_button(False)
+            return
+        self._slide_deck = []
+        self._set_slideshow_button(True)
+        self._slideshow_step(first=True)
+
+    def stop_slideshow(self, fly_back=False):
+        """End the slideshow. From the ▶ button it flies back to the overview;
+        when the user takes over (click, drag, wheel, key) the view stays."""
+        if not self._slideshow.isActive() and not self._slideshow_btn.isChecked():
+            return
+        self._slideshow.stop()
+        self._set_slideshow_button(False)
+        if fly_back:
+            self.stop_playback()
+            if self._focused >= 0:
+                self.unfocus()
+        self._update_status()
+
+    def _set_slideshow_button(self, on):
+        self._slideshow_btn.blockSignals(True)
+        self._slideshow_btn.setChecked(on)
+        self._slideshow_btn.blockSignals(False)
+
+    def _slideshow_step(self, first=False):
+        n = self._placed
+        if not n or not self.isVisible():
+            self.stop_slideshow()
+            return
+        seconds, random_order = self.slideshow_settings()
+        if random_order and n > 1:
+            if not self._slide_deck:
+                # A shuffled deck shows every picture once before repeating.
+                self._slide_deck = [k for k in range(n) if k != self._selected]
+                random.shuffle(self._slide_deck)
+            i = self._slide_deck.pop()
+        elif first and 0 <= self._selected < n and self._focused != self._selected:
+            i = self._selected              # start on the selected picture
+        else:
+            i = (max(0, self._selected) + 1) % n
+        self.focus_item(i)
+        if self._playing is None or self._playing['path'] != self._items[i]:
+            self.toggle_playback(i)         # GIFs / videos play while framed
+        self._slideshow.start(int(max(1, seconds) * 1000 + FLIGHT_S * 1000))
+        self._update_status()
+
     def _on_names(self, on):
         self._names = on
         self.viewport().update()
@@ -531,6 +623,8 @@ class ThumbGrid(QAbstractScrollArea):
         total = len(self._window)
         done = sum(1 for p in self._window if p in self._thumbs or p in self._failed)
         zoom = f" · {round(self._zoom * 100)}%" if self._zoom > 1.001 else ""
+        if self._slideshow.isActive():
+            zoom += " · slideshow"
         if self._probing:
             text = f"{n} items · reading sizes {self._placed * 100 // max(1, n)}%"
             fraction = self._placed / max(1, n)
@@ -636,8 +730,8 @@ class ThumbGrid(QAbstractScrollArea):
         if n > FIT_ALL_MAX_ITEMS:
             return smallest
         for cols in range(1, smallest + 1):
-            cell = (W - gap * (cols - 1)) / cols
-            if gap + math.ceil(n / cols) * (cell + gap) <= vh:
+            cell_h = (W - gap * (cols - 1)) / cols / self._cell_aspect()
+            if gap + math.ceil(n / cols) * (cell_h + gap) <= vh:
                 return cols
         return smallest
 
@@ -658,7 +752,7 @@ class ThumbGrid(QAbstractScrollArea):
                 self._target = self._fit_all_height(W) if not self._probing else 0
             else:
                 n_row = max(1, self._per_row)
-                self._target = max(24.0, (W - self._gap * (n_row - 1)) / (n_row * REFERENCE_ASPECT))
+                self._target = max(24.0, (W - self._gap * (n_row - 1)) / (n_row * self._reference_aspect()))
             self._extend_layout()
         else:
             self._layout_uniform()
@@ -671,23 +765,37 @@ class ThumbGrid(QAbstractScrollArea):
                 self._bytes -= t.scaled.width() * t.scaled.height() * 4
                 t.scaled = None
 
+    def _showing_pages(self):
+        return bool(self._items) and PAGE_SEP in self._items[0]
+
+    def _reference_aspect(self):
+        """Shape 'per row' counts: a 3:2 photo, or a typical page when the
+        grid shows a document's pages (so 6 per row means 6 pages)."""
+        return GUESS_ASPECT['doc'] if self._showing_pages() else REFERENCE_ASPECT
+
+    def _cell_aspect(self):
+        """Width / height of a plain-grid cell: square for files, page-shaped
+        for pages (a square would crop away the top and bottom of the text)."""
+        return GUESS_ASPECT['doc'] if self._showing_pages() else 1.0
+
     def _layout_uniform(self):
-        """Equal square cells: needs nothing from the files, so it is instant."""
+        """Equal cells: needs nothing from the files, so it is instant."""
         n, gap = len(self._items), self._gap
         W = self._avail_width()
         cols = self._fit_all_columns(W) if self._fit_all else max(1, self._per_row)
         cell = max(16.0, (W - gap * (cols - 1)) / cols)
+        cell_h = cell / self._cell_aspect()
         xs = [round(gap + c * (cell + gap)) for c in range(cols)]
         ws = [round(gap + c * (cell + gap) + cell) - xs[c] for c in range(cols)]
         rows = math.ceil(n / cols)
-        self._row_y = [round(gap + r * (cell + gap)) for r in range(rows)]
-        self._row_h = [round(cell)] * rows
+        self._row_y = [round(gap + r * (cell_h + gap)) for r in range(rows)]
+        self._row_h = [round(cell_h)] * rows
         self._row_start = list(range(0, n, cols))
         self._cell_x = [xs[i % cols] for i in range(n)]
         self._cell_w = [ws[i % cols] for i in range(n)]
         self._placed = n
-        self._next_y = gap + rows * (cell + gap)
-        self._target = cell
+        self._next_y = gap + rows * (cell_h + gap)
+        self._target = cell_h
         self._layout_grew()
 
     def _extend_layout(self):
@@ -808,7 +916,7 @@ class ThumbGrid(QAbstractScrollArea):
         largest size (beyond that it is just blur). At least 3x."""
         target = max(1.0, self._target)
         dpr = self.viewport().devicePixelRatioF()
-        sharp_limit = EDGES[-1] * 1.25 / (target * REFERENCE_ASPECT * dpr)
+        sharp_limit = EDGES[-1] * 1.25 / (target * max(1.0, self._reference_aspect()) * dpr)
         rows_limit = self.viewport().height() * 4 / target
         return max(1.0, min(MAX_ZOOM, max(3.0, min(sharp_limit, rows_limit))))
 
@@ -942,7 +1050,9 @@ class ThumbGrid(QAbstractScrollArea):
         if not self._justified:
             # A square filled by a centre crop shows the picture's short side
             # across the whole cell, so the long edge must be that much longer.
-            a = self._aspect.get(self._items[i], REFERENCE_ASPECT)
+            # (the cell's own shape is already in need; scale by how much more
+            # elongated the picture is than its cell)
+            a = self._aspect.get(self._items[i], self._reference_aspect()) / self._cell_aspect()
             need *= max(a, 1 / a)
         for edge in EDGES:
             if edge * 1.15 >= need:
@@ -1173,7 +1283,7 @@ class ThumbGrid(QAbstractScrollArea):
         p.fillRect(strip, QColor(0, 0, 0, 150))
         p.setFont(font)
         p.setPen(QColor(235, 235, 235))
-        name = fm.elidedText(os.path.basename(path), Qt.ElideMiddle, max(10, rect.width() - 8))
+        name = fm.elidedText(display_name(path), Qt.ElideMiddle, max(10, rect.width() - 8))
         p.drawText(strip.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, name)
 
     @staticmethod
@@ -1299,7 +1409,7 @@ class ThumbGrid(QAbstractScrollArea):
         self._focused = -1
         self._prev_view = None
 
-    def _animate_camera(self, zoom, cx, cy, duration=0.32):
+    def _animate_camera(self, zoom, cx, cy, duration=FLIGHT_S):
         """Glide zoom and position together to *zoom* centred on canvas (cx, cy)."""
         self._stop_motion()
         self._camera_anim = (time.monotonic(), duration, *self._view_state(), zoom, cx, cy)
@@ -1388,6 +1498,7 @@ class ThumbGrid(QAbstractScrollArea):
         return super().event(event)
 
     def wheelEvent(self, event):
+        self.stop_slideshow()           # the user takes over
         self._center_on = -1
         self._glide.stop()
         self._inertia.stop()
@@ -1427,6 +1538,7 @@ class ThumbGrid(QAbstractScrollArea):
 
     def mousePressEvent(self, event):
         self.setFocus()
+        self.stop_slideshow()           # the user takes over
         pos = event.position().toPoint()
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
             self._right_wheeled = False
@@ -1440,7 +1552,13 @@ class ThumbGrid(QAbstractScrollArea):
         """Double-click opens the picture in the viewer."""
         if event.button() != Qt.LeftButton:
             return
-        i = self._item_at(event.position().toPoint())
+        # Open what the first click of the pair landed on: that click starts
+        # the camera flying to frame it, so by the second click a different
+        # picture may well be under the pointer (very likely when zoomed out).
+        i = self._click_item
+        if not (0 <= i < self._placed) or \
+                time.monotonic() - self._click_time > QApplication.doubleClickInterval() / 1000 + 0.15:
+            i = self._item_at(event.position().toPoint())
         # The release that follows must not toggle playback again.
         self._press_item = -1
         if i >= 0:
@@ -1473,6 +1591,7 @@ class ThumbGrid(QAbstractScrollArea):
         # what plays, or flies a still picture back to the previous view.
         # Double-click (or Enter) opens it.
         i = self._item_at(event.position().toPoint())
+        self._click_item, self._click_time = i, time.monotonic()
         if i >= 0 and i == getattr(self, '_press_item', -1):
             playing_here = self._playing is not None and self._playing['path'] == self._items[i]
             if i == self._focused and playing_here:
@@ -1491,6 +1610,7 @@ class ThumbGrid(QAbstractScrollArea):
     def keyPressEvent(self, event):
         self._center_on = -1
         self._glide.stop()
+        self.stop_slideshow()           # the user takes over
         key = event.key()
         if key in (Qt.Key_Escape, Qt.Key_G):
             self.close_requested.emit()

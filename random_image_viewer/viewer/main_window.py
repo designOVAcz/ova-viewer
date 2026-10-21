@@ -12290,7 +12290,7 @@ class RandomImageViewer(QMainWindow):
         else:
             self.images = list(self._all_items)
         if self._grid_visible():
-            self._thumb_grid.set_items(self.images, self.current_image)
+            self._refresh_grid()
 
     def _set_playlist_items(self, items):
         """Install a freshly scanned playlist and apply the current filter.
@@ -12381,7 +12381,7 @@ class RandomImageViewer(QMainWindow):
         the canvas and its tool panels stay exactly as they were underneath.
         It is built on first use only, keeping it out of startup.
         """
-        if on and not self.images:
+        if on and not self.images and self._open_document() is None:
             self.status.showMessage("Open a folder first — the grid shows its thumbnails")
             self.grid_view_btn.blockSignals(True)
             self.grid_view_btn.setChecked(False)
@@ -12397,13 +12397,18 @@ class RandomImageViewer(QMainWindow):
                 grid.open_folder_requested.connect(self.choose_folder)
                 grid.file_types_requested.connect(self._grid_show_file_types)
                 grid.progress.connect(self._on_grid_progress)
+                grid.pages_toggled.connect(self._on_grid_pages_toggled)
+                # The grid slideshow follows the viewer's ⚡ seconds and 🔀 order.
+                grid.slideshow_settings = lambda: (self.timer_spin.value(), self.random_mode)
                 grid.track(self.image_label)
                 self._thumb_grid = grid
             # Nothing plays behind the grid; picked back up on return.
             self._grid_paused_media = self._pause_media_for_minimize()
             grid.show()
             grid.raise_()
-            grid.set_items(self.images, self.current_image)
+            # With a PDF / EPUB / comic open, the grid starts on its pages.
+            self._grid_shows_pages = True
+            self._refresh_grid()
             grid.setFocus()
         elif grid is not None and grid.isVisible():
             grid.hide()
@@ -12413,8 +12418,51 @@ class RandomImageViewer(QMainWindow):
             self._grid_paused_media = False
             self.image_label.setFocus()
 
+    def _open_document(self):
+        """(file, page count, current page, show-page method, uses spreads)
+        for the open PDF / EPUB / comic archive, or None."""
+        if getattr(self, '_pdf_doc', None):
+            return (self._pdf_doc.pdf_path, self._pdf_doc.page_count, self._pdf_page,
+                    self._show_pdf_page, True)
+        if getattr(self, '_epub_doc', None):
+            return (self._epub_doc.epub_path, self._epub_doc.page_count, self._epub_page,
+                    self._show_epub_page, False)
+        if getattr(self, '_cbr_doc', None):
+            return (self._cbr_doc.archive_path, self._cbr_doc.page_count, self._cbr_page,
+                    self._show_cbr_page, True)
+        return None
+
+    def _refresh_grid(self):
+        """Fill the grid: the open document's pages, or the folder's items."""
+        from random_image_viewer.services.thumbnails import page_item
+        grid = self._thumb_grid
+        doc = self._open_document()
+        # A document opened on its own has no folder list to switch to.
+        pages = doc is not None and (getattr(self, '_grid_shows_pages', True) or not self.images)
+        grid.set_pages_toggle(doc is not None and bool(self.images), pages)
+        if pages:
+            path, count, current, _show, _spreads = doc
+            grid.set_items([page_item(path, n) for n in range(count)], page_item(path, current))
+        else:
+            grid.set_items(self.images, self.current_image)
+
+    def _on_grid_pages_toggled(self, pages):
+        self._grid_shows_pages = pages
+        self._refresh_grid()
+
     def _on_grid_activated(self, path):
         """A thumbnail was clicked: close the grid and show that item."""
+        from random_image_viewer.services.thumbnails import split_page_item
+        page = split_page_item(path)
+        if page is not None:
+            # A page of the open document: go to it (snapped to its spread).
+            doc = self._open_document()
+            self.grid_view_btn.setChecked(False)
+            if doc is not None and os.path.normcase(doc[0]) == os.path.normcase(page[0]):
+                _path, _count, _current, show_page, spreads = doc
+                self.clear_lines()
+                show_page(self._spread_anchor(page[1]) if spreads else page[1])
+            return
         if path != self.current_image:
             self._grid_paused_media = False     # a new item replaces the paused one
         self.grid_view_btn.setChecked(False)

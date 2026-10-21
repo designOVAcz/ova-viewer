@@ -6,6 +6,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Recent Updates
 
+- The thumbnail grid now shows the pages of an open PDF, EPUB or CBR/CBZ: click to frame a page, double-click to go to it, ▶ to fly through them; 📄 switches back to the whole folder.
+- Added a ▶ slideshow to the thumbnail grid: the camera flies from picture to picture, framing each one (GIFs and videos play), with the viewer's ⚡ seconds and 🔀 order.
 - Added ➕ add mode: opening or dropping folders adds them to the current list instead of replacing it (or hold `Ctrl` for a one-off add).
 - Added a ▦ thumbnail grid (**G**): opens instantly even on huge folders, loads only what is on screen (progress in the status bar), with a GRID panel for pictures per row, gap, justified rows, fit-all-on-screen, file names and GPU (OpenGL) drawing. Thumbnails are decoded in parallel and cached on disk.
 - Added an eraser tool that removes annotations without touching the underlying image.
