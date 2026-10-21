@@ -648,6 +648,9 @@ class VideoControlsOverlay(QWidget):
 
 
 class RandomImageViewer(QMainWindow):
+    # Small toolbar spin boxes: hide the arrow buttons so the number shows.
+    _SPIN_NO_ARROWS = "QSpinBox::up-button, QSpinBox::down-button { width: 0px; border: none; }"
+
     # ...existing code...
     def _create_overlay_icon(self, icon_type):
         """Create a QPainter-drawn icon for overlay tool buttons.
@@ -1814,7 +1817,7 @@ class RandomImageViewer(QMainWindow):
         self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Eraser (erase parts of lines/drawings, not the image)"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_eraser); toolbar.addWidget(self.eraser_tool_btn)
         add_spacer(2)
         # Matches the brush range: erasing a 400px stroke with a 30px eraser is hopeless.
-        self.eraser_size_spin = QSpinBox(); self.eraser_size_spin.setRange(1,400); self.eraser_size_spin.setValue(self.eraser_size); self.eraser_size_spin.setSuffix("px"); self.eraser_size_spin.setFixedHeight(24); self.eraser_size_spin.setFixedWidth(58); self.eraser_size_spin.setToolTip("Eraser size (1-400px)"); self.eraser_size_spin.valueChanged.connect(self.update_eraser_size); toolbar.addWidget(self.eraser_size_spin)
+        self.eraser_size_spin = QSpinBox(); self.eraser_size_spin.setRange(1,400); self.eraser_size_spin.setValue(self.eraser_size); self.eraser_size_spin.setSuffix("px"); self.eraser_size_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.eraser_size_spin.setAlignment(Qt.AlignCenter); self.eraser_size_spin.setFixedHeight(24); self.eraser_size_spin.setFixedWidth(58); self.eraser_size_spin.setToolTip("Eraser size (1-400px)"); self.eraser_size_spin.valueChanged.connect(self.update_eraser_size); toolbar.addWidget(self.eraser_size_spin)
         add_spacer(2)
         self.undo_line_btn = QToolButton(); self.undo_line_btn.setText("↶"); self.undo_line_btn.setToolTip("Undo Last Line"); self.undo_line_btn.setFixedSize(24,24); self.undo_line_btn.clicked.connect(self.undo_last_line); toolbar.addWidget(self.undo_line_btn)
         add_section_divider()
@@ -1946,7 +1949,10 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.timer_button = QToolButton(); self.timer_button.setCheckable(True); self.timer_button.setText("⚡"); self.timer_button.setToolTip("Toggle Auto Advance"); self.timer_button.setFixedSize(24,24); self.timer_button.toggled.connect(self.toggle_timer); toolbar.addWidget(self.timer_button)
         add_spacer(2)
-        self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(44); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
+        # Arrows hidden by stylesheet: Qt's Windows 11 style draws them side by
+        # side and they ate the whole box (NoButtons blanks the text instead).
+        # Wheel, Up/Down keys and typing still work.
+        self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.timer_spin.setAlignment(Qt.AlignCenter); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(52); self.timer_spin.setToolTip("Slideshow interval (1-3600 s) — type, scroll or use ↑/↓"); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
         add_spacer(2)
         self.circle_timer = CircularCountdown(self.timer_spin.value()); self.circle_timer.set_parent_viewer(self); toolbar.addWidget(self.circle_timer)
         add_spacer(2)

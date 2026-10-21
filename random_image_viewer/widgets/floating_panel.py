@@ -221,7 +221,7 @@ class FloatingPanel(QWidget):
             "}"
         )
         self._handle.setCursor(Qt.OpenHandCursor)
-        self._handle.setToolTip("Drag to move · double-click to collapse/expand · drag right edge to resize")
+        self._handle.setToolTip("Drag to move · double- or middle-click to collapse/expand · drag right edge to resize")
         self._handle.setMouseTracking(True)
         outer.addWidget(self._handle)
 
@@ -383,22 +383,33 @@ class FloatingPanel(QWidget):
 
     # ── hit testing ──
     def _in_handle(self, pos):
-        return self._handle.geometry().contains(pos)
+        # The whole strip above the tools counts, margins included, so a
+        # slightly-off click still hits the title. Collapsed, the panel is
+        # nothing but its title.
+        if self._collapsed:
+            return self.rect().contains(pos)
+        return 0 <= pos.y() < self._content.geometry().top() and self.rect().contains(pos)
 
     def _on_right_edge(self, pos):
         return (not self._collapsed) and (self.width() - pos.x() <= self.RESIZE_MARGIN) \
             and 0 <= pos.x() <= self.width()
 
     # ── mouse ──
+    # Clicks on the panel never fall through to the canvas behind it: there a
+    # double-click opens the grid and a middle-click skips the picture.
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton and self._in_handle(event.position().toPoint()):
             self.toggle_collapsed()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
+        if event.button() == Qt.MiddleButton:
+            # Middle-click on the title is a one-click collapse/expand.
+            if self._in_handle(pos):
+                self.toggle_collapsed()
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._on_right_edge(pos):
             self._resizing = True
             self._resize_start = event.globalPosition().toPoint()
@@ -412,7 +423,7 @@ class FloatingPanel(QWidget):
             self.raise_()
             event.accept()
             return
-        super().mousePressEvent(event)
+        event.accept()
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
