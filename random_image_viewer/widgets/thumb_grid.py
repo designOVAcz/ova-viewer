@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea, QApplication, QFrame, QWidget, QToolButton, QLabel, QHBoxLayout,
 )
 from PySide6.QtCore import Qt, QTimer, QRectF, QRect, QEvent, QPoint, QSize, QUrl, Signal
-from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QPen, QFontMetrics, QMovie
+from PySide6.QtGui import QPainter, QPixmap, QImage, QColor, QFont, QPen, QFontMetrics, QMovie
 
 from random_image_viewer.constants import ANIMATED_EXTENSIONS
 from random_image_viewer.platform_utils import is_windows_dark_mode
@@ -73,6 +73,7 @@ ZOOM_SETTLE_MS = 160        # after the last zoom step, re-cut thumbnails sharp
 PAN_FRICTION = 4.5          # inertia decay per second (higher stops sooner)
 FOCUS_MARGIN = 0.94         # a framed picture fills this share of the window
 FLIGHT_S = 0.32             # camera flight from one framed picture to the next
+MOTION_BLUR_MIN_SCALE = 0.25  # fastest flight frames are drawn at this resolution
 SETTINGS_KEY = "thumb_grid"
 
 
@@ -204,6 +205,7 @@ class ThumbGrid(QAbstractScrollArea):
 
         # Click-to-frame: the camera flies to fit the clicked picture.
         self._camera_anim = None
+        self._motion_blur = 0.0              # 0 = sharp … 1 = strongest, while flying
         self._focused = -1                   # item the camera last framed
 
         # Slideshow: the camera frames one picture after another. The owner
@@ -212,7 +214,7 @@ class ThumbGrid(QAbstractScrollArea):
         self.slideshow_settings = lambda: (4, False)
         self._slide_deck = []                # random order still to show
         self._slideshow = QTimer(self, singleShot=True)
-        self._slideshow.timeout.connect(self._slideshow_step)
+        self._slideshow.timeout.connect(self._slideshow_tick)
         self._click_item, self._click_time = -1, 0.0   # last single click, for double-click
         self._prev_view = None               # (zoom, cx, cy) before framing
         self._glide = QTimer(self, interval=16)
@@ -305,13 +307,7 @@ class ThumbGrid(QAbstractScrollArea):
         path = self._items[i]
         pl = self._playing
         if pl is not None and pl['path'] == path:
-            pl['paused'] = not pl['paused']
-            if 'movie' in pl:
-                pl['movie'].setPaused(pl['paused'])
-            elif pl['paused']:
-                pl['media'].pause()
-            else:
-                pl['media'].play()
+            self._set_clip_paused(pl, not pl['paused'])
             self._update_cell(i)
             return
         self.stop_playback()
@@ -327,11 +323,14 @@ class ThumbGrid(QAbstractScrollArea):
         movie = QMovie(path)
         if not movie.isValid() or movie.frameCount() == 1:
             return                      # a still GIF / WebP: nothing to play
-        # Decode frames at the size they are shown, not the file's full size.
+        # Decode frames at the size they are shown, not the file's full size —
+        # the size it will have once framed when the camera is flying there.
         r = self._row_of(i)
         if r is not None:
             rect = self._picture_rect(i, self._screen_rect(i, r))
             dpr = self.viewport().devicePixelRatioF()
+            if self._glide.isActive() and self._camera_anim and i == self._focused:
+                dpr *= self._camera_anim[5] / self._zoom      # target zoom / zoom now
             native = QMovie(path)
             native.jumpToFrame(0)
             full = native.currentImage().size()
@@ -341,6 +340,7 @@ class ThumbGrid(QAbstractScrollArea):
         movie.setCacheMode(QMovie.CacheNone)
         self._playing = {'path': path, 'movie': movie, 'frame': None, 'paused': False}
         movie.frameChanged.connect(self._on_movie_frame)
+        movie.finished.connect(self._on_media_cycle)     # GIFs with a finite loop count
         movie.start()
 
     def _play_video(self, path):
@@ -353,15 +353,37 @@ class ThumbGrid(QAbstractScrollArea):
         media.setVideoSink(sink)                 # no audio output: plays muted
         media.setLoops(QMediaPlayer.Loops.Infinite)
         sink.videoFrameChanged.connect(self._on_video_frame)
+        media.positionChanged.connect(self._on_video_position)
         media.setSource(QUrl.fromLocalFile(path))
         self._playing = {'path': path, 'media': media, 'sink': sink, 'frame': None, 'paused': False}
         media.play()
 
-    def _on_movie_frame(self, _n):
+    def _on_movie_frame(self, n):
         pl = self._playing
         if pl is not None and 'movie' in pl:
             pl['frame'] = pl['movie'].currentPixmap()
             self._update_cell(self._playing_index())
+            # The frame number wrapping round = one full play of the GIF.
+            if n < pl.get('last_frame', -1):
+                self._on_media_cycle()
+            pl['last_frame'] = n
+
+    def _on_video_position(self, ms):
+        pl = self._playing
+        if pl is None or 'media' not in pl:
+            return
+        # The position jumping back to the start = one full play of the clip.
+        if ms + 250 < pl.get('last_pos', 0):
+            self._on_media_cycle()
+        pl['last_pos'] = ms
+
+    def _on_media_cycle(self):
+        """The GIF / video on screen has played through once. A slideshow
+        waiting for it (⏭ autoplay-next) moves on now."""
+        pl = self._playing
+        if pl is not None and pl.get('advance_on_end') and self._slideshow_btn.isChecked():
+            pl['advance_on_end'] = False
+            self._slideshow.start(150)
 
     def _on_video_frame(self, frame):
         pl = self._playing
@@ -377,11 +399,13 @@ class ThumbGrid(QAbstractScrollArea):
         if pl is None:
             return
         if 'movie' in pl:
-            pl['movie'].stop()
             pl['movie'].frameChanged.disconnect(self._on_movie_frame)
+            pl['movie'].finished.disconnect(self._on_media_cycle)
+            pl['movie'].stop()
             pl['movie'].deleteLater()
         else:
             pl['sink'].videoFrameChanged.disconnect(self._on_video_frame)
+            pl['media'].positionChanged.disconnect(self._on_video_position)
             pl['media'].stop()
             pl['media'].deleteLater()
             pl['sink'].deleteLater()
@@ -579,6 +603,41 @@ class ThumbGrid(QAbstractScrollArea):
                 self.unfocus()
         self._update_status()
 
+    def hold_activity(self):
+        """Window minimised: hold the slideshow (keeping its remaining time)
+        and pause the clip playing in place. True if anything was held."""
+        held = False
+        if self._slideshow.isActive():
+            self._slideshow_left = max(500, self._slideshow.remainingTime())
+            self._slideshow.stop()
+            held = True
+        pl = self._playing
+        if pl is not None and not pl['paused']:
+            self._set_clip_paused(pl, True)
+            pl['held'] = True
+            held = True
+        return held
+
+    def release_activity(self):
+        """Window restored: pick up exactly what :meth:`hold_activity` held."""
+        pl = self._playing
+        if pl is not None and pl.pop('held', False):
+            self._set_clip_paused(pl, False)
+        left = getattr(self, '_slideshow_left', None)
+        self._slideshow_left = None
+        if left is not None and self._slideshow_btn.isChecked():
+            self._slideshow.start(left)
+
+    @staticmethod
+    def _set_clip_paused(pl, paused):
+        pl['paused'] = paused
+        if 'movie' in pl:
+            pl['movie'].setPaused(paused)
+        elif paused:
+            pl['media'].pause()
+        else:
+            pl['media'].play()
+
     def _set_slideshow_button(self, on):
         self._slideshow_btn.blockSignals(True)
         self._slideshow_btn.setChecked(on)
@@ -589,7 +648,9 @@ class ThumbGrid(QAbstractScrollArea):
         if not n or not self.isVisible():
             self.stop_slideshow()
             return
-        seconds, random_order = self.slideshow_settings()
+        settings = self.slideshow_settings()
+        seconds, random_order = settings[0], settings[1]
+        autoplay_next = len(settings) > 2 and settings[2]
         if random_order and n > 1:
             if not self._slide_deck:
                 # A shuffled deck shows every picture once before repeating.
@@ -603,8 +664,22 @@ class ThumbGrid(QAbstractScrollArea):
         self.focus_item(i)
         if self._playing is None or self._playing['path'] != self._items[i]:
             self.toggle_playback(i)         # GIFs / videos play while framed
+        pl = self._playing
+        if autoplay_next and pl is not None and pl['path'] == self._items[i]:
+            # Like the viewer's ⏭: a clip plays to its end, then the show moves on.
+            pl['advance_on_end'] = True
         self._slideshow.start(int(max(1, seconds) * 1000 + FLIGHT_S * 1000))
         self._update_status()
+
+    def _slideshow_tick(self):
+        """Time for the next picture — unless a clip is still playing through
+        (⏭), in which case check again shortly. A clip that never produced a
+        frame (undecodable) does not hold the show up."""
+        pl = self._playing
+        if pl is not None and pl.get('advance_on_end') and pl['frame'] is not None:
+            self._slideshow.start(1000)
+            return
+        self._slideshow_step()
 
     def _on_names(self, on):
         self._names = on
@@ -1096,9 +1171,12 @@ class ThumbGrid(QAbstractScrollArea):
         self._window = window
         self._loader.request(jobs)
         self._update_status()
-        # Nobody watches a clip scrolled out of view: stop decoding it.
+        # Nobody watches a clip scrolled out of view: stop decoding it. Not the
+        # framed one, though — the camera may still be flying towards it
+        # (a slideshow step to a picture that starts far off-screen).
         playing = self._playing_index()
-        if playing >= 0 and not self._screen_rect(playing).intersects(self.viewport().rect()):
+        if playing >= 0 and playing != self._focused \
+                and not self._screen_rect(playing).intersects(self.viewport().rect()):
             self.stop_playback()
 
     def _on_thumb(self, path, image, edge):
@@ -1163,7 +1241,29 @@ class ThumbGrid(QAbstractScrollArea):
     def paintEvent(self, event):
         vp = self.viewport()
         p = QPainter(vp)
-        clip = event.rect()
+        blur = self._motion_blur if self._glide.isActive() else 0.0
+        if blur > 0.05 and self._row_y:
+            # Motion blur, cheaply: while the camera flies fast, draw the
+            # frame at reduced resolution and stretch it smoothly over the
+            # view. Stronger blur = smaller frame, so a blurred frame costs
+            # less than a sharp one; the flight ends on a full-resolution frame.
+            scale = max(MOTION_BLUR_MIN_SCALE, 1.0 - (1.0 - MOTION_BLUR_MIN_SCALE) * blur)
+            w, h = max(1, round(vp.width() * scale)), max(1, round(vp.height() * scale))
+            frame = QImage(w, h, QImage.Format_RGB32)
+            fp = QPainter(frame)
+            fp.scale(w / vp.width(), h / vp.height())
+            self._paint_view(fp, vp.rect(), scale)
+            fp.end()
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawImage(QRectF(vp.rect()), frame)
+            p.end()
+            return
+        self._paint_view(p, event.rect(), vp.devicePixelRatioF())
+        p.end()
+
+    def _paint_view(self, p, clip, dpr):
+        """Draw the cells in *clip* (viewport pixels) with painter *p*."""
+        vp = self.viewport()
         p.fillRect(clip, self._bg)
         if not self._items:
             p.setPen(self._glyph)
@@ -1173,7 +1273,6 @@ class ThumbGrid(QAbstractScrollArea):
             p.setPen(self._glyph)
             p.drawText(vp.rect(), Qt.AlignCenter, "Reading picture sizes…")
             return
-        dpr = vp.devicePixelRatioF()
         z = self._zoom
         ox, oy = self._ox(), self._oy()
         name_font = QFont(self.font())
@@ -1229,7 +1328,6 @@ class ThumbGrid(QAbstractScrollArea):
                     self._paint_frame(p, rect, self._accent, 3)
                 elif i == self._selected and has_focus:
                     self._paint_frame(p, rect, QColor(255, 255, 255, 200), 2)
-        p.end()
 
     def _paint_placeholder(self, p, rect, path, font):
         p.fillRect(rect, self._placeholder)
@@ -1422,6 +1520,12 @@ class ThumbGrid(QAbstractScrollArea):
         z = z0 * (z1 / z0) ** e                    # zoom moves evenly on a log scale
         cx, cy = cx0 + (cx1 - cx0) * e, cy0 + (cy1 - cy0) * e
         vp = self.viewport()
+        # How far the picture moved on screen since the last frame — pan
+        # distance plus how much the zoom spread it — sets the blur.
+        before = (self._zoom, self._ox(), self._oy())
+        moved = math.hypot(cx * z - vp.width() / 2 - before[1], cy * z - vp.height() / 2 - before[2]) \
+            + abs(math.log(z / before[0])) * math.hypot(vp.width(), vp.height()) / 2
+        self._motion_blur = 0.0 if u >= 1.0 else min(1.0, max(0.0, (moved - 4) / 60))
         self._zoom = z
         self._update_ranges()
         # Scale thumbnails on the fly while moving; re-cut sharp once settled.

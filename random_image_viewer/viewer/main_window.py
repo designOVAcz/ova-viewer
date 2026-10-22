@@ -11671,10 +11671,16 @@ class RandomImageViewer(QMainWindow):
                 was = getattr(self, '_was_minimized', False)
                 if minimized and not was:
                     self._paused_by_minimize = self._pause_media_for_minimize()
+                    # The grid's slideshow and in-place clip hold too.
+                    self._grid_held_by_minimize = (
+                        self._grid_visible() and self._thumb_grid.hold_activity())
                 elif was and not minimized:
                     if getattr(self, '_paused_by_minimize', False):
                         self._resume_media_after_minimize()
                     self._paused_by_minimize = False
+                    if getattr(self, '_grid_held_by_minimize', False) and self._grid_visible():
+                        self._thumb_grid.release_activity()
+                    self._grid_held_by_minimize = False
                 self._was_minimized = minimized
         except Exception as e:
             print(f"changeEvent error: {e}")
@@ -12404,8 +12410,10 @@ class RandomImageViewer(QMainWindow):
                 grid.file_types_requested.connect(self._grid_show_file_types)
                 grid.progress.connect(self._on_grid_progress)
                 grid.pages_toggled.connect(self._on_grid_pages_toggled)
-                # The grid slideshow follows the viewer's ⚡ seconds and 🔀 order.
-                grid.slideshow_settings = lambda: (self.timer_spin.value(), self.random_mode)
+                # The grid slideshow follows the viewer's ⚡ seconds, 🔀 order and
+                # ⏭ autoplay-next (clips play to their end before moving on).
+                grid.slideshow_settings = lambda: (self.timer_spin.value(), self.random_mode,
+                                                   self.autoplay_next_enabled)
                 grid.track(self.image_label)
                 self._thumb_grid = grid
             # Nothing plays behind the grid; picked back up on return.
