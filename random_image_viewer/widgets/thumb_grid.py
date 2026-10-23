@@ -214,6 +214,7 @@ class ThumbGrid(QAbstractScrollArea):
         # timer and 🔀 setting — through slideshow_settings.
         self.slideshow_settings = lambda: (4, False)
         self._slide_deck = []                # random order still to show
+        self._slideshow_pending = False      # waiting for its first picture to be laid out
         self._slideshow = QTimer(self, singleShot=True)
         self._slideshow.timeout.connect(self._slideshow_tick)
         self._click_item, self._click_time = -1, 0.0   # last single click, for double-click
@@ -580,18 +581,39 @@ class ThumbGrid(QAbstractScrollArea):
     def _on_slideshow(self, on):
         if on:
             self.start_slideshow()
+            self.setFocus()             # so Tab / keys reach the grid, not the panel
         else:
             # Stay on the last picture / clip; clicking it (or the background)
             # flies back to the overview as with any framed picture.
             self.stop_slideshow()
 
     def start_slideshow(self):
-        if not self._placed:
+        if not self._items:
             self._set_slideshow_button(False)
             return
         self._slide_deck = []
         self._set_slideshow_button(True)
+        if not 0 <= self._selected < self._placed and self._placed < len(self._items):
+            # Its first picture is not laid out yet (a big folder is still
+            # being read): start the moment it is, not after everything.
+            self._slideshow_pending = True
+            self._update_status()
+            return
         self._slideshow_step(first=True)
+
+    def toggle_slideshow(self):
+        """Tab / ▶: start or stop the slideshow."""
+        if self.slideshow_running():
+            self.stop_slideshow()
+        else:
+            self.start_slideshow()
+
+    def slideshow_running(self):
+        return self._slideshow_btn.isChecked()
+
+    def slideshow_item(self):
+        """The item the slideshow is on (to carry it on in the viewer), or None."""
+        return self._items[self._selected] if 0 <= self._selected < len(self._items) else None
 
     def stop_slideshow(self):
         """End the slideshow, staying on the picture / clip it showed last
@@ -599,6 +621,7 @@ class ThumbGrid(QAbstractScrollArea):
         so clicking the framed picture flies back there."""
         if not self._slideshow.isActive() and not self._slideshow_btn.isChecked():
             return
+        self._slideshow_pending = False
         self._slideshow.stop()
         self._set_slideshow_button(False)
         self._update_status()
@@ -660,7 +683,14 @@ class ThumbGrid(QAbstractScrollArea):
         elif first and 0 <= self._selected < n and self._focused != self._selected:
             i = self._selected              # start on the selected picture
         else:
-            i = (max(0, self._selected) + 1) % n
+            i = max(0, self._selected) + 1
+            if i >= n:
+                if n < len(self._items):
+                    # The next picture is not laid out yet: try again shortly
+                    # rather than wrap back to the first one.
+                    self._slideshow.start(400)
+                    return
+                i = 0
         self._slideshow_show(i, seconds, autoplay_next)
 
     def _slideshow_show(self, i, seconds=None, autoplay_next=None):
@@ -707,7 +737,7 @@ class ThumbGrid(QAbstractScrollArea):
         total = len(self._window)
         done = sum(1 for p in self._window if p in self._thumbs or p in self._failed)
         zoom = f" · {round(self._zoom * 100)}%" if self._zoom > 1.001 else ""
-        if self._slideshow.isActive():
+        if self._slideshow.isActive() or self._slideshow_pending:
             zoom += " · slideshow"
         if self._probing:
             text = f"{n} items · reading sizes {self._placed * 100 // max(1, n)}%"
@@ -919,6 +949,9 @@ class ThumbGrid(QAbstractScrollArea):
         if 0 <= self._center_on < self._placed:
             self.ensure_visible(self._center_on, center=True)
             self._center_on = -1
+        if self._slideshow_pending and 0 <= self._selected < self._placed:
+            self._slideshow_pending = False
+            self._slideshow_step(first=True)
         self._schedule_requests()
 
     def _update_ranges(self):
@@ -1722,12 +1755,13 @@ class ThumbGrid(QAbstractScrollArea):
 
     def keyPressEvent(self, event):
         self._center_on = -1
-        self._glide.stop()
-        self.stop_slideshow()           # the user takes over
         key = event.key()
         if key in (Qt.Key_Escape, Qt.Key_G):
+            # Closing keeps a running slideshow going: it carries on in the viewer.
             self.close_requested.emit()
             return
+        self._glide.stop()
+        self.stop_slideshow()           # the user takes over
         if key == Qt.Key_Delete:
             return          # never delete the viewer's file from inside the grid
         n = self._placed

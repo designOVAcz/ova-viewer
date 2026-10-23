@@ -1718,6 +1718,10 @@ class RandomImageViewer(QMainWindow):
         self.i_shortcut = QShortcut("I", self)
         self.i_shortcut.activated.connect(self._shortcut_color_snap)
 
+        # Slideshow on / off: the grid's ▶ in the grid, ⚡ auto-advance otherwise
+        self.tab_shortcut = QShortcut("Tab", self)
+        self.tab_shortcut.activated.connect(self.toggle_slideshow)
+
         # Thumbnail grid on / off - the same as clicking ▦
         self.g_shortcut = QShortcut("G", self)
         self.g_shortcut.activated.connect(lambda: self.grid_view_btn.toggle())
@@ -12416,6 +12420,11 @@ class RandomImageViewer(QMainWindow):
                                                    self.autoplay_next_enabled)
                 grid.track(self.image_label)
                 self._thumb_grid = grid
+            # A running ⚡ slideshow carries on in the grid (and must not keep
+            # changing the picture underneath it).
+            carry = self._auto_advance_active
+            if carry:
+                self.timer_button.setChecked(False)
             # Nothing plays behind the grid; picked back up on return.
             self._grid_paused_media = self._pause_media_for_minimize()
             grid.show()
@@ -12424,13 +12433,27 @@ class RandomImageViewer(QMainWindow):
             self._grid_shows_pages = True
             self._refresh_grid()
             grid.setFocus()
+            if carry:
+                grid.start_slideshow()
         elif grid is not None and grid.isVisible():
+            # The grid's slideshow carries on in the viewer, from the picture it
+            # was on — or from the one just double-clicked.
+            carry = grid.slideshow_running()
+            item = getattr(self, '_grid_open_item', None) or (grid.slideshow_item() if carry else None)
+            self._grid_open_item = None
             grid.hide()
             grid.suspend()
+            if item is not None and self._show_grid_item(item):
+                self._grid_paused_media = False     # a new item replaces the paused one
             if getattr(self, '_grid_paused_media', False):
                 self._resume_media_after_minimize()
             self._grid_paused_media = False
             self.image_label.setFocus()
+            if carry:
+                if self.timer_button.isChecked():
+                    self._reset_timer()
+                else:
+                    self.timer_button.setChecked(True)
 
     def _open_document(self):
         """(file, page count, current page, show-page method, uses spreads)
@@ -12465,25 +12488,46 @@ class RandomImageViewer(QMainWindow):
         self._refresh_grid()
 
     def _on_grid_activated(self, path):
-        """A thumbnail was clicked: close the grid and show that item."""
+        """A thumbnail was double-clicked: close the grid and show that item
+        (closing the grid shows it, see :meth:`toggle_grid_view`)."""
+        self._grid_open_item = path
+        self.grid_view_btn.setChecked(False)
+
+    def _show_grid_item(self, path):
+        """Show a grid item in the viewer: a page of the open document (snapped
+        to its spread) or a playlist item. True if the view changed."""
         from random_image_viewer.services.thumbnails import split_page_item
         page = split_page_item(path)
         if page is not None:
-            # A page of the open document: go to it (snapped to its spread).
             doc = self._open_document()
-            self.grid_view_btn.setChecked(False)
-            if doc is not None and os.path.normcase(doc[0]) == os.path.normcase(page[0]):
-                _path, _count, _current, show_page, spreads = doc
-                self.clear_lines()
-                show_page(self._spread_anchor(page[1]) if spreads else page[1])
+            if doc is None or os.path.normcase(doc[0]) != os.path.normcase(page[0]):
+                return False
+            _path, _count, current, show_page, spreads = doc
+            target = self._spread_anchor(page[1]) if spreads else page[1]
+            if target == current:
+                return False
+            self.clear_lines()
+            show_page(target)
+            return True
+        if path == self.current_image:
+            return False
+        self._load_playlist_item(path)
+        if path in self.images:
+            self.current_index = self.images.index(path)
+        return True
+
+    def toggle_slideshow(self):
+        """Tab: start / stop the slideshow — the grid's ▶ while the grid is
+        open, the viewer's ⚡ auto-advance otherwise."""
+        if self._grid_visible():
+            self._thumb_grid.toggle_slideshow()
+            on = self._thumb_grid.slideshow_running()
+        elif self._auto_advance_has_content():
+            self.timer_button.toggle()
+            on = self._auto_advance_active
+        else:
             return
-        if path != self.current_image:
-            self._grid_paused_media = False     # a new item replaces the paused one
-        self.grid_view_btn.setChecked(False)
-        if path != self.current_image:
-            self._load_playlist_item(path)
-            if path in self.images:
-                self.current_index = self.images.index(path)
+        self.status.showMessage("Slideshow on" if on else "Slideshow off", 2000)
 
     def _on_grid_progress(self, done, total):
         """Status-bar progress for the thumbnails around the grid's view."""

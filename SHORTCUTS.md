@@ -14,6 +14,7 @@
 | `Ctrl+U` | Hide / show all panels (minimal mode) |
 | `Ctrl+Shift+R` | Reset tool panels to the default stack |
 | `Delete` | Move the current file to the Recycle Bin |
+| `Tab` | Start / stop the slideshow (⚡ auto-advance in the viewer, ▶ in the grid) — a running slideshow carries on when you switch between viewer and grid |
 
 ## Navigation
 
