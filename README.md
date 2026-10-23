@@ -6,7 +6,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Recent Updates
 
-- Grid slideshow follows ⏭ autoplay-next (a GIF or video plays to its end before moving on), and the camera's flights between pictures now carry a light motion blur.
+- Grid slideshow follows ⏭ autoplay-next (a GIF or video plays to its end before moving on), and while the camera flies to a picture the surrounding ones fade gently, so the one in focus stands out.
 - The thumbnail grid now shows the pages of an open PDF, EPUB or CBR/CBZ: click to frame a page, double-click to go to it, ▶ to fly through them; 📄 switches back to the whole folder.
 - Added a ▶ slideshow to the thumbnail grid: the camera flies from picture to picture, framing each one (GIFs and videos play), with the viewer's ⚡ seconds and 🔀 order.
 - Added ➕ add mode: opening or dropping folders adds them to the current list instead of replacing it (or hold `Ctrl` for a one-off add).

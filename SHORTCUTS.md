@@ -41,7 +41,7 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Right button held + mouse wheel, `Ctrl` + wheel, `Ctrl++` / `Ctrl+-` | Zoom in / out around the pointer |
 | Right-drag (or middle-drag) | Pan in any direction; flick and let go to glide |
 | `Ctrl+0` | Zoom back to fit the width |
-| ▶ in the GRID panel | Slideshow: frame one picture after another (GIFs / videos play); seconds and order follow ⚡ and 🔀, and with ⏭ autoplay-next on a GIF / video plays to its end before the show moves on. ▶ again stops and flies back; any click, drag, wheel or key stops it where it is |
+| ▶ in the GRID panel | Slideshow: frame one picture after another (GIFs / videos play); seconds and order follow ⚡ and 🔀, and with ⏭ autoplay-next on a GIF / video plays to its end before the show moves on. Click another picture to jump the show there and carry on from it. ▶ again (or a drag, wheel, key or a click on the empty background) stops it on the last picture / clip — click that picture to fly back to the overview |
 | `Esc` | Back to the viewer |
 
 ## Drawing

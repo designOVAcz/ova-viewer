@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea, QApplication, QFrame, QWidget, QToolButton, QLabel, QHBoxLayout,
 )
 from PySide6.QtCore import Qt, QTimer, QRectF, QRect, QEvent, QPoint, QSize, QUrl, Signal
-from PySide6.QtGui import QPainter, QPixmap, QImage, QColor, QFont, QPen, QFontMetrics, QMovie
+from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QPen, QFontMetrics, QMovie
 
 from random_image_viewer.constants import ANIMATED_EXTENSIONS
 from random_image_viewer.platform_utils import is_windows_dark_mode
@@ -73,7 +73,7 @@ ZOOM_SETTLE_MS = 160        # after the last zoom step, re-cut thumbnails sharp
 PAN_FRICTION = 4.5          # inertia decay per second (higher stops sooner)
 FOCUS_MARGIN = 0.94         # a framed picture fills this share of the window
 FLIGHT_S = 0.32             # camera flight from one framed picture to the next
-MOTION_BLUR_MIN_SCALE = 0.25  # fastest flight frames are drawn at this resolution
+FLIGHT_FADE = 0.55          # how far other pictures fade to the background mid-flight (0..1)
 SETTINGS_KEY = "thumb_grid"
 
 
@@ -205,7 +205,8 @@ class ThumbGrid(QAbstractScrollArea):
 
         # Click-to-frame: the camera flies to fit the clicked picture.
         self._camera_anim = None
-        self._motion_blur = 0.0              # 0 = sharp … 1 = strongest, while flying
+        self._fade = 0.0                     # surrounding pictures' fade during a flight
+        self._spotlight = -1                 # the picture the flight is about
         self._focused = -1                   # item the camera last framed
 
         # Slideshow: the camera frames one picture after another. The owner
@@ -580,7 +581,9 @@ class ThumbGrid(QAbstractScrollArea):
         if on:
             self.start_slideshow()
         else:
-            self.stop_slideshow(fly_back=True)
+            # Stay on the last picture / clip; clicking it (or the background)
+            # flies back to the overview as with any framed picture.
+            self.stop_slideshow()
 
     def start_slideshow(self):
         if not self._placed:
@@ -590,17 +593,14 @@ class ThumbGrid(QAbstractScrollArea):
         self._set_slideshow_button(True)
         self._slideshow_step(first=True)
 
-    def stop_slideshow(self, fly_back=False):
-        """End the slideshow. From the ▶ button it flies back to the overview;
-        when the user takes over (click, drag, wheel, key) the view stays."""
+    def stop_slideshow(self):
+        """End the slideshow, staying on the picture / clip it showed last
+        (a clip keeps playing). The view it started from is still remembered,
+        so clicking the framed picture flies back there."""
         if not self._slideshow.isActive() and not self._slideshow_btn.isChecked():
             return
         self._slideshow.stop()
         self._set_slideshow_button(False)
-        if fly_back:
-            self.stop_playback()
-            if self._focused >= 0:
-                self.unfocus()
         self._update_status()
 
     def hold_activity(self):
@@ -661,6 +661,15 @@ class ThumbGrid(QAbstractScrollArea):
             i = self._selected              # start on the selected picture
         else:
             i = (max(0, self._selected) + 1) % n
+        self._slideshow_show(i, seconds, autoplay_next)
+
+    def _slideshow_show(self, i, seconds=None, autoplay_next=None):
+        """Frame item *i* as the slideshow's current picture and give it its
+        full turn. Also used when a click jumps the show to a picture."""
+        if seconds is None:
+            settings = self.slideshow_settings()
+            seconds = settings[0]
+            autoplay_next = len(settings) > 2 and settings[2]
         self.focus_item(i)
         if self._playing is None or self._playing['path'] != self._items[i]:
             self.toggle_playback(i)         # GIFs / videos play while framed
@@ -1241,23 +1250,6 @@ class ThumbGrid(QAbstractScrollArea):
     def paintEvent(self, event):
         vp = self.viewport()
         p = QPainter(vp)
-        blur = self._motion_blur if self._glide.isActive() else 0.0
-        if blur > 0.05 and self._row_y:
-            # Motion blur, cheaply: while the camera flies fast, draw the
-            # frame at reduced resolution and stretch it smoothly over the
-            # view. Stronger blur = smaller frame, so a blurred frame costs
-            # less than a sharp one; the flight ends on a full-resolution frame.
-            scale = max(MOTION_BLUR_MIN_SCALE, 1.0 - (1.0 - MOTION_BLUR_MIN_SCALE) * blur)
-            w, h = max(1, round(vp.width() * scale)), max(1, round(vp.height() * scale))
-            frame = QImage(w, h, QImage.Format_RGB32)
-            fp = QPainter(frame)
-            fp.scale(w / vp.width(), h / vp.height())
-            self._paint_view(fp, vp.rect(), scale)
-            fp.end()
-            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            p.drawImage(QRectF(vp.rect()), frame)
-            p.end()
-            return
         self._paint_view(p, event.rect(), vp.devicePixelRatioF())
         p.end()
 
@@ -1284,6 +1276,10 @@ class ThumbGrid(QAbstractScrollArea):
         if self._zooming:
             p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         c_left, c_right = (ox + clip.left()) / z, (ox + clip.right() + 1) / z
+        fade = None
+        if self._glide.isActive() and self._fade > 0.01:
+            fade = QColor(self._bg)
+            fade.setAlphaF(self._fade)
 
         vp_area = vp.width() * vp.height()
         for r in self._visible_rows((oy + clip.top()) / z, (oy + clip.bottom() + 1) / z):
@@ -1328,6 +1324,8 @@ class ThumbGrid(QAbstractScrollArea):
                     self._paint_frame(p, rect, self._accent, 3)
                 elif i == self._selected and has_focus:
                     self._paint_frame(p, rect, QColor(255, 255, 255, 200), 2)
+                if fade and i != self._spotlight:
+                    p.fillRect(cell, fade)      # one translucent fill per cell: cheap
 
     def _paint_placeholder(self, p, rect, path, font):
         p.fillRect(rect, self._placeholder)
@@ -1497,12 +1495,14 @@ class ThumbGrid(QAbstractScrollArea):
             # it all started from, so one step back returns there.
             self._prev_view = self._view_state()
         self._focused = idx
+        self._spotlight = idx                   # stays bright while the rest fade
         self._animate_camera(max(1.0, min(self._max_zoom(), fit)),
                              pic.center().x(), pic.center().y())
 
     def unfocus(self):
         """Fly back to the view the last focus click left."""
         if self._prev_view is not None:
+            self._spotlight = self._focused     # the picture being left stays bright
             self._animate_camera(*self._prev_view)
         self._focused = -1
         self._prev_view = None
@@ -1520,12 +1520,6 @@ class ThumbGrid(QAbstractScrollArea):
         z = z0 * (z1 / z0) ** e                    # zoom moves evenly on a log scale
         cx, cy = cx0 + (cx1 - cx0) * e, cy0 + (cy1 - cy0) * e
         vp = self.viewport()
-        # How far the picture moved on screen since the last frame — pan
-        # distance plus how much the zoom spread it — sets the blur.
-        before = (self._zoom, self._ox(), self._oy())
-        moved = math.hypot(cx * z - vp.width() / 2 - before[1], cy * z - vp.height() / 2 - before[2]) \
-            + abs(math.log(z / before[0])) * math.hypot(vp.width(), vp.height()) / 2
-        self._motion_blur = 0.0 if u >= 1.0 else min(1.0, max(0.0, (moved - 4) / 60))
         self._zoom = z
         self._update_ranges()
         # Scale thumbnails on the fly while moving; re-cut sharp once settled.
@@ -1537,7 +1531,11 @@ class ThumbGrid(QAbstractScrollArea):
         self._scroll_target = vsb.value()
         vp.update()
         self._schedule_requests()
+        # Surrounding pictures fade gently towards the background while the
+        # camera moves — most at mid-flight, none once it has arrived.
+        self._fade = FLIGHT_FADE * math.sin(math.pi * u)
         if u >= 1.0:
+            self._fade = 0.0
             self._glide.stop()
             self._update_status()
 
@@ -1642,7 +1640,10 @@ class ThumbGrid(QAbstractScrollArea):
 
     def mousePressEvent(self, event):
         self.setFocus()
-        self.stop_slideshow()           # the user takes over
+        # The user takes over — except a left click, which during a slideshow
+        # may just jump the show to another picture (decided on release).
+        if event.button() != Qt.LeftButton:
+            self.stop_slideshow()
         pos = event.position().toPoint()
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
             self._right_wheeled = False
@@ -1696,6 +1697,14 @@ class ThumbGrid(QAbstractScrollArea):
         # Double-click (or Enter) opens it.
         i = self._item_at(event.position().toPoint())
         self._click_item, self._click_time = i, time.monotonic()
+        if self._slideshow_btn.isChecked():
+            if i >= 0 and i == getattr(self, '_press_item', -1):
+                # Slideshow running: jump it to the clicked picture and carry
+                # on from there (clicking the one on show changes nothing).
+                if i != self._focused:
+                    self._slideshow_show(i)
+                return
+            self.stop_slideshow()       # a click on the background ends it
         if i >= 0 and i == getattr(self, '_press_item', -1):
             playing_here = self._playing is not None and self._playing['path'] == self._items[i]
             if i == self._focused and playing_here:
