@@ -269,6 +269,12 @@ class ThumbGrid(QAbstractScrollArea):
         self._reset_layout()
         self._update_status()
 
+    def set_panel_visible(self, visible):
+        """The viewer's ▣ (and minimal mode) hide / show this GRID panel too."""
+        self._panel.setVisible(visible)
+        if visible:
+            self._panel.raise_()
+
     def set_pages_toggle(self, available, showing_pages):
         """Show the 📄 pages ⇄ folder switch (only while a document is open)."""
         self._pages_btn.blockSignals(True)
@@ -600,6 +606,26 @@ class ThumbGrid(QAbstractScrollArea):
             self._update_status()
             return
         self._slideshow_step(first=True)
+
+    def show_next(self):
+        """Middle click: frame the next picture (a clip starts playing) — the
+        next in order, or a random one when the viewer's 🔀 is on. During a
+        slideshow it skips ahead and the show carries on."""
+        if self._slideshow_btn.isChecked():
+            self._slideshow.stop()
+            self._slideshow_step()
+            return
+        n = self._placed
+        if not n:
+            return
+        random_order = self.slideshow_settings()[1]
+        if random_order and n > 1:
+            i = random.choice([k for k in range(n) if k != self._selected])
+        else:
+            i = (max(0, self._selected) + 1) % n
+        self.focus_item(i)
+        if self._playing is None or self._playing['path'] != self._items[i]:
+            self.toggle_playback(i)
 
     def toggle_slideshow(self):
         """Tab / ▶: start or stop the slideshow."""
@@ -1459,6 +1485,7 @@ class ThumbGrid(QAbstractScrollArea):
         pan['last'] = pos
         if not pan['moved'] and (pos - pan['start']).manhattanLength() > 3:
             pan['moved'] = True
+            self.stop_slideshow()
             self._forget_focus()
         self._set_offset(self._ox() - d.x(), self._oy() - d.y())
         pan['samples'].append((time.monotonic(), pos.x(), pos.y()))
@@ -1673,9 +1700,10 @@ class ThumbGrid(QAbstractScrollArea):
 
     def mousePressEvent(self, event):
         self.setFocus()
-        # The user takes over — except a left click, which during a slideshow
-        # may just jump the show to another picture (decided on release).
-        if event.button() != Qt.LeftButton:
+        # The user takes over — except a left click (may jump the show to
+        # another picture) and a middle click (next picture), both decided on
+        # release; a middle drag stops it once it moves (see _drag_pan).
+        if event.button() == Qt.RightButton:
             self.stop_slideshow()
         pos = event.position().toPoint()
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
@@ -1719,8 +1747,11 @@ class ThumbGrid(QAbstractScrollArea):
 
     def mouseReleaseEvent(self, event):
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
+            clicked = self._pan is not None and not self._pan['moved']
             if self._pan is not None:
                 self._end_pan()
+            if clicked and event.button() == Qt.MiddleButton:
+                self.show_next()        # middle click = next picture, as in the viewer
             return
         if event.button() != Qt.LeftButton:
             return

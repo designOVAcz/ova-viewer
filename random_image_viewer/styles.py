@@ -16,7 +16,8 @@ QPushButton, QToolButton {
     padding: 0 2px;
 }
 QPushButton:hover, QToolButton:hover { background: #2e3034; }
-QPushButton:checked, QToolButton:checked { background: #424242; color: #fff; }
+QPushButton:checked, QToolButton:checked { background: rgba(255, 255, 255, 102); border: 1px solid rgba(255, 255, 255, 140); color: #fff; }
+QPushButton:checked:hover, QToolButton:checked:hover { background: rgba(255, 255, 255, 125); }
 QListWidget::item:selected { background: #354e6e; color: #fff; }
 QCheckBox:checked { color: #424242; }
 QSlider::groove:horizontal {

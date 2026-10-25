@@ -2,7 +2,7 @@ import time
 
 from PySide6.QtWidgets import QLabel, QApplication, QMenu
 from PySide6.QtGui import (QPainter, QColor, QPen, QAction, QTabletEvent, QMovie,
-                           QPolygon, QRegion)
+                           QPolygon, QRegion, QCursor)
 from PySide6.QtCore import Qt, QTimer, QSize, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink, QAudioOutput
 
@@ -74,7 +74,7 @@ class ImageLabel(QLabel):
 
     _FILL_FRAME = 1.0 / 60.0
 
-    def set_fill_overlay(self, points, color, appended=False, open_path=False):
+    def set_fill_overlay(self, points, color, appended=False, open_path=False, stroke_width=0):
         """Show *points* (widget coordinates) as a filled shape over the image.
 
         ``appended`` means the caller only added one vertex to the same outline
@@ -83,13 +83,16 @@ class ImageLabel(QLabel):
         differ, which for a resized rectangle is a couple of thin strips.
         ``open_path`` marks a polygon still being placed: its edges and first
         corner are outlined as well, so the repaint covers its bounding box.
+        ``stroke_width`` > 0 shows a polyline instead: the edges drawn in that
+        width, nothing filled — exactly how the finished line will look.
         """
         previous = self._fill_overlay
         pts = points if appended else list(points)
-        self._fill_overlay = (pts, QColor(color), open_path) if pts else None
+        self._fill_overlay = (pts, QColor(color), open_path, stroke_width) if pts else None
         if open_path or (previous and previous[2]):
-            changed = self._outline_region(previous[0] if previous else None).united(
-                self._outline_region(pts))
+            changed = self._outline_region(
+                previous[0] if previous else None, previous[3] if previous else 0).united(
+                self._outline_region(pts, stroke_width))
         elif appended and len(pts) >= 3:
             changed = QRegion(QPolygon([pts[0], pts[-2], pts[-1]]))
         else:
@@ -104,11 +107,12 @@ class ImageLabel(QLabel):
     _CORNER_RING = 5
 
     @classmethod
-    def _outline_region(cls, pts):
-        """Bounding box of an open outline, padded for its corner ring."""
+    def _outline_region(cls, pts, stroke_width=0):
+        """Bounding box of an open outline, padded for its corner ring (and
+        for half the line width of a polyline)."""
         if not pts:
             return QRegion()
-        pad = cls._CORNER_RING + 3
+        pad = cls._CORNER_RING + 3 + int(stroke_width) // 2 + 1
         return QRegion(QPolygon(pts).boundingRect().adjusted(-pad, -pad, pad, pad))
 
     def clear_fill_overlay(self):
@@ -120,9 +124,9 @@ class ImageLabel(QLabel):
         if self._fill_timer is not None:
             self._fill_timer.stop()
         if overlay:
-            pts, _colour, open_path = overlay
+            pts, _colour, open_path, stroke_width = overlay
             if open_path:
-                region = region.united(self._outline_region(pts))
+                region = region.united(self._outline_region(pts, stroke_width))
             elif len(pts) >= 3:
                 region = region.united(QRegion(QPolygon(pts)))
         if not region.isEmpty():
@@ -165,7 +169,7 @@ class ImageLabel(QLabel):
         overlay = getattr(self, '_fill_overlay', None)
         if not overlay:
             return
-        points, color, open_path = overlay
+        points, color, open_path, stroke_width = overlay
         if len(points) < (2 if open_path else 3):
             return
         painter = QPainter(self)
@@ -173,6 +177,18 @@ class ImageLabel(QLabel):
         # The same colour and smoothing the committed fill gets, so letting go
         # of the mouse changes nothing on screen.
         painter.setRenderHint(QPainter.Antialiasing, True)
+        if stroke_width:
+            # A polyline being placed: just its edges, in the real line width.
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(color, stroke_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline(QPolygon(points))
+            first = points[0]
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+            painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
+            painter.end()
+            return
         if len(points) >= 3:
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
@@ -793,7 +809,7 @@ class ImageLabel(QLabel):
         # placed that corner, so this must not add another.
         viewer = self.parent_viewer
         if (event.button() == Qt.LeftButton and viewer is not None
-                and getattr(viewer, 'fill_mode', None) == 'polygon'
+                and getattr(viewer, 'fill_mode', None) in viewer._CLICK_SHAPES
                 and viewer._placing_polygon()):
             viewer.finish_polygon()
             event.accept()
@@ -1012,7 +1028,7 @@ class ImageLabel(QLabel):
                     # PEN PRESSURE: Store current pressure for real-time painting
                     if self.parent_viewer and self.parent_viewer.pen_pressure_enabled:
                         self.parent_viewer._current_pressure = pressure
-                if getattr(self.parent_viewer, 'fill_mode', None) == 'polygon':
+                if getattr(self.parent_viewer, 'fill_mode', None) in self.parent_viewer._CLICK_SHAPES:
                     # Corners are placed click by click (see polygon_click)
                     self.parent_viewer.polygon_click(original_x, original_y, event.position())
                 elif getattr(self.parent_viewer, 'fill_mode', None):
@@ -1025,7 +1041,7 @@ class ImageLabel(QLabel):
     def mouseMoveEvent(self, event):
         # A polygon being placed: the loose edge follows the pointer, whether
         # or not a button is held (right-drag panning still falls through).
-        if self.parent_viewer and getattr(self.parent_viewer, 'fill_mode', None) == 'polygon':
+        if self.parent_viewer and getattr(self.parent_viewer, 'fill_mode', None) in self.parent_viewer._CLICK_SHAPES:
             self.parent_viewer.polygon_hover(event.position())
             if event.buttons() & Qt.LeftButton:
                 event.accept()
@@ -1252,8 +1268,30 @@ class ImageLabel(QLabel):
 
         return (0 <= rel_x <= zoomed_width and 0 <= rel_y <= zoomed_height)
 
+    # A pen (Windows Ink) does not always make Windows ask the window which
+    # cursor to show, the way a mouse does: once the system arrow has been
+    # shown (window frame, another window) it stays, over a brush ring or
+    # crosshair too. Re-applying our cursor while the pen hovers fixes that.
+    _CURSOR_REASSERT_S = 0.15
+
+    def _reassert_cursor_for_pen(self):
+        if self.cursor().shape() == Qt.ArrowCursor:
+            return                      # the system arrow is right anyway
+        now = time.monotonic()
+        if now - getattr(self, '_cursor_reassert_t', 0.0) < self._CURSOR_REASSERT_S:
+            return
+        self._cursor_reassert_t = now
+        cur = QCursor(self.cursor())
+        # Setting the same cursor again is a no-op in Qt; switching away and
+        # back makes it hand the cursor to Windows (SetCursor) right now.
+        self.setCursor(Qt.ArrowCursor if cur.shape() != Qt.ArrowCursor else Qt.CrossCursor)
+        self.setCursor(cur)
+
     def tabletEvent(self, event):
         """Handle tablet events ONLY for pen pressure during active drawing"""
+        if (event.type() in (QTabletEvent.TabletMove, QTabletEvent.TabletEnterProximity)
+                and self.rect().contains(event.position().toPoint())):
+            self._reassert_cursor_for_pen()
         if not (self.parent_viewer and self.parent_viewer.free_draw_mode):
             event.ignore()
             return
@@ -1380,7 +1418,11 @@ class ImageLabel(QLabel):
         if event.button() in (Qt.RightButton, Qt.LeftButton) and self.is_panning:
             self.is_panning = False
             self.last_pan_point = None
-            self.setCursor(Qt.ArrowCursor)
+            # Back to the active tool's cursor (not a plain arrow).
+            if self.parent_viewer is not None:
+                self.parent_viewer.apply_tool_cursor()
+            else:
+                self.setCursor(Qt.ArrowCursor)
             event.accept()
             return
 
@@ -1395,8 +1437,8 @@ class ImageLabel(QLabel):
         # Fill tools: commit the shape that was dragged out
         if (event.button() == Qt.LeftButton and self.parent_viewer and
                 getattr(self.parent_viewer, 'current_fill', None)):
-            # A polygon stays open between clicks; only drag shapes end here.
-            if self.parent_viewer.current_fill.get('shape') != 'polygon':
+            # A polygon / polyline stays open between clicks; only drag shapes end here.
+            if self.parent_viewer.current_fill.get('shape') not in self.parent_viewer._CLICK_SHAPES:
                 self.parent_viewer.end_fill()
             event.accept()
             return
@@ -1531,7 +1573,9 @@ class ImageLabel(QLabel):
         # UI visibility toggle
         ui_toggle_action = QAction("Show/Hide UI Elements", self)
         ui_toggle_action.setCheckable(True)
-        ui_toggle_action.setChecked(self.parent_viewer.main_toolbar.isVisible())
+        # Floating panels replaced the toolbar (now always hidden), so ask the
+        # viewer what is actually on screen — the same check Ctrl+U uses.
+        ui_toggle_action.setChecked(self.parent_viewer._ui_chrome_visible())
         ui_toggle_action.toggled.connect(self.parent_viewer.toggle_toolbar_visibility)
         menu.addAction(ui_toggle_action)
 
@@ -1541,6 +1585,11 @@ class ImageLabel(QLabel):
         always_on_top_action.setChecked(self.parent_viewer.always_on_top)
         always_on_top_action.toggled.connect(self.parent_viewer.toggle_always_on_top)
         menu.addAction(always_on_top_action)
+
+        # Log (moved here from the status bar, where ▣ now hides / shows panels)
+        log_action = QAction(self.parent_viewer.log_menu_text(), self)
+        log_action.triggered.connect(self.parent_viewer._show_log_window)
+        menu.addAction(log_action)
 
         menu.addSeparator()
 

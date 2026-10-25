@@ -6,6 +6,8 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Recent Updates
 
+- Added a 〽 polyline tool: click corners like polygon fill, but it draws straight lines instead of filling — double-click / Enter for an open line, click the first corner to close it.
+- ▣ in the status bar hides / shows all tool panels (frame and status bar stay); the log moved to the right-click menu.
 - `Tab` starts / stops the slideshow, and a running slideshow now carries on when you switch between the viewer and the grid (from the same picture, or the one you double-click).
 - Grid slideshow follows ⏭ autoplay-next (a GIF or video plays to its end before moving on), and while the camera flies to a picture the surrounding ones fade gently, so the one in focus stands out.
 - The thumbnail grid now shows the pages of an open PDF, EPUB or CBR/CBZ: click to frame a page, double-click to go to it, ▶ to fly through them; 📄 switches back to the whole folder.
@@ -55,6 +57,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 - 📝 **New sketch** — one click opens a blank mid-grey canvas sized to the drawing area with the free-draw tool already active, for quick notes and thumbnails; save it with 💾 like any other view
 - 📏 Vertical, horizontal, and free-angle line tools
 - ⬟ Fill tools: **lasso** (drag an outline), **polygon** (click corners joined by straight edges; double-click, Enter or click the first corner to fill), **rectangle**, **ellipse** and **triangle** (drag out the shape)
+- 〽 **Polyline** — the polygon tool without the fill: click corners joined by straight lines in the current colour and brush size; double-click / Enter finishes an open line, clicking the first corner closes it
 - 🧽 Eraser tool for removing parts of line and free-draw annotations
 - ✏️ Freehand draw with pressure-sensitive thickness (pen/stylus/tablet)
 - 👀 Live rubber-band preview for free-angle line placement

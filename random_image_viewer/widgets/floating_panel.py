@@ -227,7 +227,18 @@ class FloatingPanel(QWidget):
 
         # Content area with wrapping flow layout
         self._content = QWidget(self)
-        self._content.setStyleSheet("background: transparent;")
+        # A bare "background: transparent" here reaches every tool inside and
+        # used to wipe out the app's :checked / :hover backgrounds, so an
+        # active tool (thin glyphs like the line tools especially) looked off.
+        # Say it with selectors, and give active tools a clear highlight.
+        self._content.setStyleSheet(
+            "QWidget { background: transparent; }"
+            "QToolButton:hover, QPushButton:hover { background: rgba(255, 255, 255, 28); }"
+            "QToolButton:checked, QPushButton:checked {"
+            "  background: rgba(255, 255, 255, 102);"        # 40 % white
+            "  border: 1px solid rgba(255, 255, 255, 140); color: #fff; }"
+            "QToolButton:checked:hover, QPushButton:checked:hover {"
+            "  background: rgba(255, 255, 255, 125); }")
         self._content.setMouseTracking(True)
         self._flow = FlowLayout(self._content, margin=0, hspacing=4, vspacing=4)
         outer.addWidget(self._content)

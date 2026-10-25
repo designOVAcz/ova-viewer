@@ -12,6 +12,8 @@
 | `Ctrl+V` | Paste an image or a file path from the clipboard |
 | `Ctrl+G` | Go to image number / PDF page |
 | `Ctrl+U` | Hide / show all panels (minimal mode) |
+| ▣ in the status bar | Hide / show the tool panels only (frame and status bar stay) |
+| Right-click → Show Log | Live log (marked "new errors" / "new warnings" when something needs a look) |
 | `Ctrl+Shift+R` | Reset tool panels to the default stack |
 | `Delete` | Move the current file to the Recycle Bin |
 | `Tab` | Start / stop the slideshow (⚡ auto-advance in the viewer, ▶ in the grid) — a running slideshow carries on when you switch between viewer and grid |
@@ -41,6 +43,7 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Mouse wheel | Smooth scroll (`Shift` + wheel: sideways) |
 | Right button held + mouse wheel, `Ctrl` + wheel, `Ctrl++` / `Ctrl+-` | Zoom in / out around the pointer |
 | Right-drag (or middle-drag) | Pan in any direction; flick and let go to glide |
+| Middle-click | Next picture (framed; random with 🔀); during a slideshow it skips ahead and the show carries on |
 | `Ctrl+0` | Zoom back to fit the width |
 | ▶ in the GRID panel | Slideshow: frame one picture after another (GIFs / videos play); seconds and order follow ⚡ and 🔀, and with ⏭ autoplay-next on a GIF / video plays to its end before the show moves on. Click another picture to jump the show there and carry on from it. ▶ again (or a drag, wheel, key or a click on the empty background) stops it on the last picture / clip — click that picture to fly back to the overview |
 | `Esc` | Back to the viewer |
@@ -62,6 +65,18 @@ changing the image, so a stray scroll cannot throw the drawing away.
 | Double-click / `Enter` / click the first corner | Fill the polygon |
 | `Backspace` | Remove the last corner |
 | `Esc` | Cancel the polygon |
+
+### Polyline 〽
+
+Polygon fill without the fill: straight lines in the current colour, transparency and brush size.
+
+| Input | Action |
+|---|---|
+| Click | Place a corner |
+| Double-click / `Enter` | Finish as an open line |
+| Click the first corner | Close it into an outline |
+| `Backspace` / `Ctrl+Z` | Remove the last corner |
+| `Esc` | Cancel the polyline |
 
 ## Zoom & View
 

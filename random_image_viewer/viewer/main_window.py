@@ -979,14 +979,29 @@ class RandomImageViewer(QMainWindow):
         painter.setPen(pen)
 
     def _paint_one_fill(self, painter, fill, to_display, antialias=True):
-        """Paint a single filled shape (lasso / rectangle / ellipse)."""
+        """Paint a single filled shape (lasso / rectangle / ellipse), or a
+        polyline (the polygon tool's outline-only sibling)."""
         points = fill.get('points') or []
-        if len(points) < 3:
-            return
         color = QColor(fill.get('color', self.line_color))
         alpha = fill.get('alpha')
         if alpha is not None:
             color.setAlpha(int(alpha))
+        if fill.get('shape') == 'polyline':
+            if len(points) < 2:
+                return
+            painter.setRenderHint(QPainter.Antialiasing, antialias)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(color, fill.get('thickness') or self.line_thickness,
+                                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            corners = [QPoint(*to_display(x, y)) for x, y in points]
+            if fill.get('closed'):
+                painter.drawPolygon(corners)
+            else:
+                painter.drawPolyline(corners)
+            painter.setRenderHint(QPainter.Antialiasing, False)
+            return
+        if len(points) < 3:
+            return
         painter.setRenderHint(QPainter.Antialiasing, antialias)
         painter.setPen(Qt.NoPen)
         painter.setBrush(color)
@@ -1202,7 +1217,7 @@ class RandomImageViewer(QMainWindow):
         # Filled shapes (lasso / rectangle / ellipse), each an outline in image
         # coordinates. Painted by _paint_marks in creation order like any mark.
         self.drawn_fills = []
-        self.fill_mode = None          # None | 'lasso' | 'polygon' | 'rect' | 'ellipse' | 'triangle'
+        self.fill_mode = None          # None | 'lasso' | 'polygon' | 'polyline' | 'rect' | 'ellipse' | 'triangle'
         self.current_fill = None       # shape being dragged out / polygon being placed
         self._polygon_hover_pos = None # last pointer position while placing a polygon
         self._fill_to_screen = None     # image -> widget mapping, fixed for one drag
@@ -1588,19 +1603,31 @@ class RandomImageViewer(QMainWindow):
         )
         self.panel_reset_btn.clicked.connect(self._reset_panel_layout)
 
-        # Log button: opens a live view of everything the app prints, plus Qt
-        # and FFmpeg warnings (the exe has no console). Turns orange/red when
-        # a warning/error arrives that has not been looked at yet.
-        self.log_btn = QToolButton()
-        self.log_btn.setText("≡")
-        self.log_btn.setFixedSize(16, 16)
-        self.log_btn.setCursor(Qt.PointingHandCursor)
-        self.log_btn.clicked.connect(self._show_log_window)
+        # Panels button: hide / show every tool panel at once (on by default).
+        # Unlike minimal mode it leaves the frame and status bar alone, so this
+        # button is always there to bring them back.
+        self.panels_btn = QToolButton()
+        self.panels_btn.setText("▣")
+        self.panels_btn.setFont(QFont("Segoe UI Symbol", 9))   # Segoe UI has no ▣
+        self.panels_btn.setCheckable(True)
+        self.panels_btn.setChecked(True)
+        self.panels_btn.setFixedSize(16, 16)
+        self.panels_btn.setCursor(Qt.PointingHandCursor)
+        self.panels_btn.setToolTip("Hide / show the tool panels")
+        self.panels_btn.setStyleSheet(
+            "QToolButton { border: none; padding: 0px; margin: 0px;"
+            " color: #888; background: transparent; }"
+            "QToolButton:checked { color: #c7ccd1; background: transparent; }"
+            "QToolButton:hover { color: #fff; }")
+        self.panels_btn.toggled.connect(self.set_panels_visible)
+
+        # Log: a live view of everything the app prints, plus Qt and FFmpeg
+        # warnings (the exe has no console). Opened from the right-click menu,
+        # which also says when a warning / error has not been looked at yet.
         self._log_window = None
         self._log_unseen_level = log_capture.LEVEL_INFO
         self._log_bridge = LogBridge(self)
         self._log_bridge.lineAdded.connect(self._on_log_line)
-        self._update_log_button()
 
         # Wrap in a container that vertically centers the button so its glyph
         # lines up with the status-bar text instead of hugging the top edge.
@@ -1608,7 +1635,7 @@ class RandomImageViewer(QMainWindow):
         _reset_wrap_layout = QHBoxLayout(_reset_wrap)
         _reset_wrap_layout.setContentsMargins(0, 0, 6, 0)
         _reset_wrap_layout.setSpacing(4)
-        _reset_wrap_layout.addWidget(self.log_btn, 0, Qt.AlignVCenter)
+        _reset_wrap_layout.addWidget(self.panels_btn, 0, Qt.AlignVCenter)
         _reset_wrap_layout.addWidget(self.panel_reset_btn, 0, Qt.AlignVCenter)
         self.statusBar().addPermanentWidget(_reset_wrap)
 
@@ -1742,8 +1769,9 @@ class RandomImageViewer(QMainWindow):
         """Emergency exit from fullscreen or minimal mode"""
         print("EMERGENCY: Escape shortcut activated")
         if self._placing_polygon():
+            label = "Polyline" if self.current_fill.get('shape') == 'polyline' else "Polygon"
             self.cancel_fill()
-            self.status.showMessage("Polygon cancelled")
+            self.status.showMessage(f"{label} cancelled")
             return
         if self._grid_visible():
             self.grid_view_btn.setChecked(False)
@@ -1805,6 +1833,8 @@ class RandomImageViewer(QMainWindow):
         self.hline_tool_btn = QToolButton(); self.hline_tool_btn.setText("━"); self.hline_tool_btn.setToolTip("Draw Horizontal Lines"); self.hline_tool_btn.setCheckable(True); self.hline_tool_btn.setFixedSize(24,24); self.hline_tool_btn.toggled.connect(self.toggle_hline_drawing); toolbar.addWidget(self.hline_tool_btn)
         add_spacer(2)
         self.free_line_tool_btn = QToolButton(); self.free_line_tool_btn.setText("╱"); self.free_line_tool_btn.setToolTip("Draw Free Lines (2 clicks per line)"); self.free_line_tool_btn.setCheckable(True); self.free_line_tool_btn.setFixedSize(24,24); self.free_line_tool_btn.toggled.connect(self.toggle_free_line_drawing); toolbar.addWidget(self.free_line_tool_btn)
+        add_spacer(2)
+        self.polyline_btn = QToolButton(); self.polyline_btn.setText("〽"); self.polyline_btn.setToolTip("Polyline: click to place corners joined by straight lines (like Polygon Fill, without the fill) — double-click or Enter to finish, click the first corner to close it; Backspace removes the last corner, Esc cancels"); self.polyline_btn.setCheckable(True); self.polyline_btn.setFixedSize(24,24); self.polyline_btn.toggled.connect(lambda c: self.toggle_fill_tool('polyline', c)); toolbar.addWidget(self.polyline_btn)
         add_spacer(2)
         self.lasso_fill_btn = QToolButton(); self.lasso_fill_btn.setText("⬟"); self.lasso_fill_btn.setToolTip("Lasso Fill: drag an outline, it fills with the current color on release"); self.lasso_fill_btn.setCheckable(True); self.lasso_fill_btn.setFixedSize(24,24); self.lasso_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('lasso', c)); toolbar.addWidget(self.lasso_fill_btn)
         add_spacer(2)
@@ -2147,7 +2177,7 @@ class RandomImageViewer(QMainWindow):
             # LINE / COLOR panel, a trip away from the brush every time.
             ("DRAW", [
                 'free_draw_tool_btn', 'brush_size_widget',
-                'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn',
+                'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn', 'polyline_btn',
                 '__sep__',
                 'lasso_fill_btn', 'polygon_fill_btn',
                 'rect_fill_btn', 'ellipse_fill_btn', 'triangle_fill_btn',
@@ -2236,9 +2266,11 @@ class RandomImageViewer(QMainWindow):
             return
         pdf_w = getattr(self, '_pdf_nav_widget', None)
         vid_w = getattr(self, '_video_controls_widget', None)
-        visible = bool((pdf_w is not None and pdf_w.isVisible()) or
-                       (vid_w is not None and vid_w.isVisible()))
-        if visible:
+        # isHidden(), not isVisible(): the controls' own state, which still
+        # counts while the panel holding them is hidden.
+        visible = bool((pdf_w is not None and not pdf_w.isHidden()) or
+                       (vid_w is not None and not vid_w.isHidden()))
+        if visible and not getattr(self, '_panels_hidden', False):
             panel.relayout()
             panel.show()
             panel.raise_()
@@ -2339,29 +2371,44 @@ class RandomImageViewer(QMainWindow):
         self._log_window.raise_()
         self._log_window.activateWindow()
         self._log_unseen_level = log_capture.LEVEL_INFO
-        self._update_log_button()
 
     def _on_log_line(self, _line, level):
         if self._log_window is not None and self._log_window.isVisible():
             return
         if level > self._log_unseen_level:
             self._log_unseen_level = level
-            self._update_log_button()
 
-    def _update_log_button(self):
-        color = {log_capture.LEVEL_WARNING: "#e0a030",
-                 log_capture.LEVEL_ERROR: "#ff5f56"}.get(
-                     self._log_unseen_level, "#888")
-        self.log_btn.setStyleSheet(
-            "QToolButton { border: none; padding: 0px; margin: 0px;"
-            f" color: {color}; font-size: 14px; }}"
-            "QToolButton:hover { color: #fff; }")
-        tip = "Show log (what happens under the hood)"
+    def log_menu_text(self):
+        """Right-click menu label for the log, flagging what has not been seen."""
+        text = "Show Log"
         if self._log_unseen_level == log_capture.LEVEL_ERROR:
-            tip += " – new errors"
+            text += " — new errors"
         elif self._log_unseen_level == log_capture.LEVEL_WARNING:
-            tip += " – new warnings"
-        self.log_btn.setToolTip(tip)
+            text += " — new warnings"
+        return text
+
+    def set_panels_visible(self, visible):
+        """▣ in the status bar: hide or show every tool panel (frame and status
+        bar stay, unlike minimal mode)."""
+        self._panels_hidden = not visible
+        btn = getattr(self, 'panels_btn', None)
+        if btn is not None and btn.isChecked() != visible:
+            btn.blockSignals(True)
+            btn.setChecked(visible)
+            btn.blockSignals(False)
+        grid = getattr(self, '_thumb_grid', None)
+        if grid is not None:
+            grid.set_panel_visible(visible)
+        if not getattr(self, '_using_floating_panels', False):
+            self.main_toolbar.setVisible(visible)
+            return
+        for p in getattr(self, '_floating_panels', []):
+            if p is getattr(self, '_context_panel', None):
+                continue
+            p.setVisible(visible)
+            if visible:
+                p.raise_()
+        self._refresh_context_panel()
 
     def _reset_panel_layout(self):
         """Snap all tool panels into the default right-side vertical stack.
@@ -6337,6 +6384,13 @@ class RandomImageViewer(QMainWindow):
         """Toggle visibility of toolbars, status bar, and window decorations for immersive viewing."""
         if checked:
             # Show all UI elements
+            self._panels_hidden = False
+            if hasattr(self, 'panels_btn'):
+                self.panels_btn.blockSignals(True)
+                self.panels_btn.setChecked(True)
+                self.panels_btn.blockSignals(False)
+            if getattr(self, '_thumb_grid', None) is not None:
+                self._thumb_grid.set_panel_visible(True)
             if getattr(self, '_using_floating_panels', False):
                 for p in getattr(self, '_floating_panels', []):
                     if p is getattr(self, '_context_panel', None):
@@ -6362,6 +6416,8 @@ class RandomImageViewer(QMainWindow):
             if getattr(self, '_using_floating_panels', False):
                 for p in getattr(self, '_floating_panels', []):
                     p.hide()
+            if getattr(self, '_thumb_grid', None) is not None:
+                self._thumb_grid.set_panel_visible(False)
             self.main_toolbar.hide()
             self.slider_toolbar.hide()
             
@@ -6376,47 +6432,63 @@ class RandomImageViewer(QMainWindow):
             self.status.showMessage("Immersive mode - Right-click to restore UI")
             QTimer.singleShot(2000, lambda: self.status.hide() if not self._ui_chrome_visible() else None)  # Hide status after 2 seconds
 
+    # Drawing tools: one active at a time. Every tool's toggle calls
+    # _deactivate_tools(keep=<itself>), so picking any tool switches all the
+    # others off — free draw included, which some tools used to leave on.
+    _TOOL_BUTTONS = {'line': 'line_tool_btn', 'hline': 'hline_tool_btn',
+                     'free_line': 'free_line_tool_btn', 'free_draw': 'free_draw_tool_btn'}
+
+    def _deactivate_tools(self, keep=None):
+        """Silently switch off every drawing tool except *keep* ('line',
+        'hline', 'free_line', 'free_draw', 'eraser', 'color_snap', 'fill')."""
+        if keep != 'line':
+            self.line_drawing_mode = False
+        if keep != 'hline':
+            self.horizontal_line_drawing_mode = False
+        if keep != 'free_line' and self.free_line_drawing_mode:
+            self.free_line_drawing_mode = False
+            if self.current_line_start is not None:
+                self.current_line_start = None
+                self._clear_line_preview()
+        if keep not in ('line', 'hline', 'free_line'):
+            self.current_line_start = None
+        if keep != 'free_draw' and self.free_draw_mode:
+            self.free_draw_mode = False
+            self.current_stroke = None
+            self.is_drawing = False
+            if hasattr(self, 'image_label'):
+                self.image_label.setAttribute(Qt.WA_TabletTracking, False)
+        for name, attr in self._TOOL_BUTTONS.items():
+            btn = getattr(self, attr, None)
+            if name != keep and btn is not None and btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+        if keep != 'eraser':
+            self._disable_eraser_silent()
+        if keep != 'color_snap':
+            self._disable_color_snap_silent()
+        if keep != 'fill':
+            self._disable_fill_tools_silent()
+
     def toggle_line_drawing(self, checked):
         self.line_drawing_mode = checked
         if checked:
-            # Disable other line modes when this one is activated
-            self.horizontal_line_drawing_mode = False
-            self.free_line_drawing_mode = False
-            self.current_line_start = None
-            self.hline_tool_btn.setChecked(False)
-            self.free_line_tool_btn.setChecked(False)
-            self._disable_eraser_silent()
-            self._disable_color_snap_silent()
+            self._deactivate_tools(keep='line')
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
 
     def toggle_hline_drawing(self, checked):
         self.horizontal_line_drawing_mode = checked
         if checked:
-            # Disable other line modes when this one is activated
-            self.line_drawing_mode = False
-            self.free_line_drawing_mode = False
-            self.current_line_start = None
-            self.line_tool_btn.setChecked(False)
-            self.free_line_tool_btn.setChecked(False)
-            self._disable_eraser_silent()
-            self._disable_color_snap_silent()
+            self._deactivate_tools(keep='hline')
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
 
     def toggle_free_line_drawing(self, checked):
         self.free_line_drawing_mode = checked
         if checked:
-            # Disable other line modes when this one is activated
-            self.line_drawing_mode = False
-            self.horizontal_line_drawing_mode = False
-            self.free_draw_mode = False
-            self.line_tool_btn.setChecked(False)
-            self.hline_tool_btn.setChecked(False)
-            if hasattr(self, 'free_draw_tool_btn'):
-                self.free_draw_tool_btn.setChecked(False)
-            self._disable_eraser_silent()
-            self._disable_color_snap_silent()
+            self._deactivate_tools(keep='free_line')
         if not checked:
             # Reset current line start when mode is deactivated
             had_pending = self.current_line_start is not None
@@ -6432,14 +6504,20 @@ class RandomImageViewer(QMainWindow):
     # rotates and flips through the same mapper as every other mark.
     _ELLIPSE_SEGMENTS = 64
 
-    _FILL_BUTTONS = ('lasso_fill_btn', 'polygon_fill_btn', 'rect_fill_btn',
+    _FILL_BUTTONS = ('lasso_fill_btn', 'polygon_fill_btn', 'polyline_btn', 'rect_fill_btn',
                      'ellipse_fill_btn', 'triangle_fill_btn')
+
+    # Shapes placed corner by corner with clicks rather than dragged out. A
+    # polyline is a polygon fill without the fill: the same clicks, keys and
+    # preview, finished as a line in the current colour and brush size.
+    _CLICK_SHAPES = ('polygon', 'polyline')
 
     def toggle_fill_tool(self, mode, checked):
         """Arm one of the fill tools, or disarm it."""
         buttons = {
             'lasso': getattr(self, 'lasso_fill_btn', None),
             'polygon': getattr(self, 'polygon_fill_btn', None),
+            'polyline': getattr(self, 'polyline_btn', None),
             'rect': getattr(self, 'rect_fill_btn', None),
             'ellipse': getattr(self, 'ellipse_fill_btn', None),
             'triangle': getattr(self, 'triangle_fill_btn', None),
@@ -6448,28 +6526,16 @@ class RandomImageViewer(QMainWindow):
             # A polygon still being placed belongs to the tool being left.
             self.cancel_fill()
             self.fill_mode = mode
-            # Fill tools are mutually exclusive with each other and with the
-            # line/draw tools, same as those are with one another.
+            # Fill tools are mutually exclusive with each other and with every
+            # other drawing tool.
             for key, btn in buttons.items():
                 if key != mode and btn is not None and btn.isChecked():
                     btn.blockSignals(True)
                     btn.setChecked(False)
                     btn.blockSignals(False)
-            self.line_drawing_mode = False
-            self.horizontal_line_drawing_mode = False
-            self.free_line_drawing_mode = False
-            self.free_draw_mode = False
-            for name in ('line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn',
-                         'free_draw_tool_btn'):
-                btn = getattr(self, name, None)
-                if btn is not None and btn.isChecked():
-                    btn.blockSignals(True)
-                    btn.setChecked(False)
-                    btn.blockSignals(False)
-            self._disable_eraser_silent()
-            self._disable_color_snap_silent()
-            if mode == 'polygon':
-                self.status.showMessage(self._POLYGON_HINT)
+            self._deactivate_tools(keep='fill')
+            if mode in self._CLICK_SHAPES:
+                self.status.showMessage(self._click_shape_hint(mode))
             else:
                 self.status.showMessage(
                     f"{mode.capitalize()} fill: drag to lay down a filled shape")
@@ -6601,8 +6667,8 @@ class RandomImageViewer(QMainWindow):
     def add_fill_point(self, x, y):
         """Extend the shape being dragged."""
         fill = self.current_fill
-        if not fill or fill['shape'] == 'polygon':
-            return      # a polygon is placed by clicks, see polygon_click
+        if not fill or fill['shape'] in self._CLICK_SHAPES:
+            return      # a polygon / polyline is placed by clicks, see polygon_click
         # Zooming or panning mid-drag invalidates the cached mapping.
         remapped = self._fill_view_signature() != self._fill_view_sig
         if remapped:
@@ -6635,7 +6701,12 @@ class RandomImageViewer(QMainWindow):
             self.image_label.clear_fill_overlay()
             return
         points = fill.get('points') or []
-        if len(points) < 3 or self._outline_area(points) < 4.0:
+        if fill.get('shape') == 'polyline':
+            if len(points) < 2 or self._polyline_length(points) < 2.0:
+                self.image_label.clear_fill_overlay()
+                self.status.showMessage("Polyline needs at least 2 corners \u2014 nothing was drawn")
+                return
+        elif len(points) < 3 or self._outline_area(points) < 4.0:
             # Nothing was ever painted into the picture; just drop the preview.
             self.image_label.clear_fill_overlay()
             if fill.get('shape') == 'polygon':
@@ -6645,6 +6716,11 @@ class RandomImageViewer(QMainWindow):
             return
         record = {'shape': fill['shape'], 'points': points,
                   'color': self._fill_preview_color()}
+        if fill['shape'] == 'polyline':
+            # Its own width and open / closed state, so later brush changes
+            # never restyle it (as with strokes).
+            record['thickness'] = max(1, int(self.line_thickness))
+            record['closed'] = bool(fill.get('closed'))
         self.drawn_fills.append(record)
         self._undo_stack.append('fill')
         # A cached LUT composite can have the marks baked in; it is stale now.
@@ -6653,8 +6729,13 @@ class RandomImageViewer(QMainWindow):
         if not self._commit_fill_to_view(record):
             self._refresh_marks()
         self.image_label.clear_fill_overlay()
-        self.status.showMessage(
-            f"{fill['shape'].capitalize()} fill added \u2014 Ctrl+Z to undo")
+        if fill['shape'] == 'polyline':
+            self.status.showMessage(
+                f"{'Closed' if record['closed'] else 'Open'} polyline added "
+                f"({len(points)} corners) \u2014 Ctrl+Z to undo")
+        else:
+            self.status.showMessage(
+                f"{fill['shape'].capitalize()} fill added \u2014 Ctrl+Z to undo")
 
     def _commit_fill_to_view(self, fill):
         """Paint just the new fill onto what is already on screen.
@@ -6718,11 +6799,32 @@ class RandomImageViewer(QMainWindow):
     _POLYGON_HINT = ("Polygon fill: click to place corners \u2014 double-click, Enter or "
                      "click the first corner to fill; Backspace removes the last corner, "
                      "Esc cancels")
+    _POLYLINE_HINT = ("Polyline: click to place corners \u2014 double-click or Enter to finish, "
+                      "click the first corner to close it; Backspace removes the last corner, "
+                      "Esc cancels")
     _POLYGON_CLOSE_PX = 8     # a click this close to the first corner closes it
 
+    def _click_shape_hint(self, shape):
+        return self._POLYLINE_HINT if shape == 'polyline' else self._POLYGON_HINT
+
+    def _click_shape_progress(self, points):
+        """Status text while corners are being placed."""
+        n = len(points)
+        if self.current_fill.get('shape') == 'polyline':
+            return (f"Polyline: {n} corner{'s' if n != 1 else ''} \u2014 double-click or "
+                    "Enter to finish, click the first corner to close")
+        return (f"Polygon fill: {n} corners \u2014 double-click, Enter or "
+                "click the first corner to fill")
+
+    @staticmethod
+    def _polyline_length(points):
+        import math
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+
     def _placing_polygon(self):
+        """True while a polygon or polyline is being placed click by click."""
         fill = getattr(self, 'current_fill', None)
-        return bool(fill) and fill.get('shape') == 'polygon'
+        return bool(fill) and fill.get('shape') in self._CLICK_SHAPES
 
     def _set_polygon_keys(self, enabled):
         for shortcut in getattr(self, '_polygon_shortcuts', ()):
@@ -6737,11 +6839,14 @@ class RandomImageViewer(QMainWindow):
             self.start_fill(x, y)
             self._set_polygon_keys(True)
             self._update_polygon_preview(pos)
-            self.status.showMessage(self._POLYGON_HINT)
+            self.status.showMessage(self._click_shape_hint(self.fill_mode))
             return
         self._sync_polygon_screen()
         points = self.current_fill['points']
         if len(points) >= 3 and self._near_first_corner(pos):
+            # Back on the first corner: a polygon fills, a polyline closes.
+            if self.current_fill.get('shape') == 'polyline':
+                self.current_fill['closed'] = True
             self.finish_polygon()
             return
         last = points[-1]
@@ -6751,9 +6856,7 @@ class RandomImageViewer(QMainWindow):
         if self._fill_to_screen is not None:
             self._fill_screen_pts.append(self._fill_to_screen(x, y))
         self._update_polygon_preview(pos)
-        self.status.showMessage(
-            f"Polygon fill: {len(points)} corners \u2014 double-click, Enter or "
-            "click the first corner to fill")
+        self.status.showMessage(self._click_shape_progress(points))
 
     def polygon_hover(self, pos):
         """Pointer moved while placing a polygon: the loose edge follows it."""
@@ -6783,10 +6886,13 @@ class RandomImageViewer(QMainWindow):
         if self._polygon_hover_pos is not None:
             hx, hy = self._polygon_hover_pos
             pts.append(QPoint(int(round(hx)), int(round(hy))))
-        self.image_label.set_fill_overlay(pts, self._fill_preview_color(), open_path=True)
+        width = max(1, int(self.line_thickness)) if self.current_fill.get('shape') == 'polyline' else 0
+        self.image_label.set_fill_overlay(pts, self._fill_preview_color(), open_path=True,
+                                          stroke_width=width)
 
     def finish_polygon(self):
-        """Fill the polygon placed so far (double-click, Enter, first corner)."""
+        """Fill the polygon / draw the polyline placed so far (double-click,
+        Enter, first corner)."""
         if not self._placing_polygon():
             return False
         self.end_fill()
@@ -6797,15 +6903,16 @@ class RandomImageViewer(QMainWindow):
         if not self._placing_polygon():
             return False
         points = self.current_fill['points']
+        label = "Polyline" if self.current_fill.get('shape') == 'polyline' else "Polygon"
         if len(points) <= 1:
             self.cancel_fill()
-            self.status.showMessage("Polygon cancelled")
+            self.status.showMessage(f"{label} cancelled")
             return True
         points.pop()
         self._rebuild_fill_screen()
         self._update_polygon_preview()
         self.status.showMessage(
-            f"Polygon fill: {len(points)} corner{'s' if len(points) != 1 else ''} "
+            f"{label}: {len(points)} corner{'s' if len(points) != 1 else ''} "
             "\u2014 last corner removed")
         return True
 
@@ -6852,16 +6959,7 @@ class RandomImageViewer(QMainWindow):
         """Toggle free draw mode (continuous drawing)"""
         self.free_draw_mode = checked
         if checked:
-            self._disable_fill_tools_silent()
-            # Disable other line modes when this one is activated
-            self.line_drawing_mode = False
-            self.horizontal_line_drawing_mode = False
-            self.free_line_drawing_mode = False
-            self.line_tool_btn.setChecked(False)
-            self.hline_tool_btn.setChecked(False)
-            self.free_line_tool_btn.setChecked(False)
-            self._disable_eraser_silent()
-            self._disable_color_snap_silent()
+            self._deactivate_tools(keep='free_draw')
             # Enable tablet tracking for pressure sensitivity, but handle events carefully
             if hasattr(self, 'image_label'):
                 self.image_label.setAttribute(Qt.WA_TabletTracking, True)
@@ -6881,18 +6979,7 @@ class RandomImageViewer(QMainWindow):
         """Toggle the eraser tool (partial pixel-erase of the drawing layer)."""
         self.eraser_mode = bool(checked)
         if self.eraser_mode:
-            # Disable all other drawing/line modes
-            self.line_drawing_mode = False
-            self.horizontal_line_drawing_mode = False
-            self.free_line_drawing_mode = False
-            self.free_draw_mode = False
-            self.current_line_start = None
-            for btn_name in ('line_tool_btn', 'hline_tool_btn',
-                             'free_line_tool_btn', 'free_draw_tool_btn'):
-                btn = getattr(self, btn_name, None)
-                if btn is not None and btn.isChecked():
-                    btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
-            self._disable_color_snap_silent()
+            self._deactivate_tools(keep='eraser')
             # Tablet tracking not required; eraser is mouse-driven
             if hasattr(self, 'image_label'):
                 self.image_label.setAttribute(Qt.WA_TabletTracking, False)
@@ -6916,6 +7003,21 @@ class RandomImageViewer(QMainWindow):
         """Update eraser diameter (1-30 screen px) and refresh the cursor."""
         self.eraser_size = int(value)
         self._update_eraser_cursor()
+
+    def _brush_cursor(self):
+        """Free draw: a ring the size of the brush (a small one for thin
+        brushes), black and white so it shows on any picture."""
+        d = max(6, min(128, int(self.line_thickness)))
+        pix = QPixmap(d + 3, d + 3)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor(0, 0, 0, 210), 1))
+        p.drawEllipse(1, 1, d, d)
+        p.setPen(QPen(QColor(255, 255, 255, 230), 1))
+        p.drawEllipse(2, 2, d - 2, d - 2)
+        p.end()
+        return QCursor(pix)          # hot spot in the centre: the stroke's centre
 
     def _update_eraser_cursor(self):
         """Show a round cursor sized to the eraser while active, else default."""
@@ -7196,17 +7298,7 @@ class RandomImageViewer(QMainWindow):
         self.color_snap_mode = bool(checked)
         if self.color_snap_mode:
             # Mutually exclude with all drawing tools
-            self.line_drawing_mode = False
-            self.horizontal_line_drawing_mode = False
-            self.free_line_drawing_mode = False
-            self.free_draw_mode = False
-            for btn_name in ('line_tool_btn', 'hline_tool_btn',
-                             'free_line_tool_btn', 'free_draw_tool_btn', 'eraser_tool_btn'):
-                btn = getattr(self, btn_name, None)
-                if btn is not None and btn.isChecked():
-                    btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
-            self._disable_eraser_silent()
-            self._disable_fill_tools_silent()
+            self._deactivate_tools(keep='color_snap')
             if self._color_snap_preview is None:
                 self._color_snap_preview = ColorSnapPreview(self)
             # Show floating palette panel (re-open if user previously closed it)
@@ -7560,33 +7652,46 @@ class RandomImageViewer(QMainWindow):
 
     def _update_cursor_and_status(self):
         """Update cursor and status message based on active drawing modes"""
+        self.apply_tool_cursor()
         if getattr(self, 'eraser_mode', False):
-            self._update_eraser_cursor()
             self.status.showMessage("Eraser: drag over lines/drawings to erase them (the image stays intact)")
         elif getattr(self, 'color_snap_mode', False):
-            self.image_label.setCursor(Qt.CrossCursor)
             self.status.showMessage("Color Snap: hover over image and click to pick a color (toggle button to exit)")
         elif self.free_draw_mode:
-            self.image_label.setCursor(Qt.CrossCursor)
             self.status.showMessage("Free draw mode - Drag mouse to draw continuous lines")
         elif self.free_line_drawing_mode:
-            self.image_label.setCursor(Qt.CrossCursor)
             if self.current_line_start is None:
                 self.status.showMessage("Free line drawing mode - Click first point to start line")
             else:
                 self.status.showMessage("Free line drawing mode - Click second point to complete line")
         elif self.line_drawing_mode and self.horizontal_line_drawing_mode:
-            self.image_label.setCursor(Qt.CrossCursor)
             self.status.showMessage("Drawing mode active - Click to draw both vertical and horizontal lines")
         elif self.line_drawing_mode:
-            self.image_label.setCursor(Qt.CrossCursor)
             self.status.showMessage("Vertical line drawing mode active - Click on image to draw vertical lines")
         elif self.horizontal_line_drawing_mode:
-            self.image_label.setCursor(Qt.CrossCursor)
             self.status.showMessage("Horizontal line drawing mode active - Click on image to draw horizontal lines")
+        elif getattr(self, 'fill_mode', None):
+            pass        # the fill tool has just shown its own hint — keep it
         else:
-            self.image_label.setCursor(Qt.ArrowCursor)
             self.status.showMessage("")
+
+    def apply_tool_cursor(self):
+        """The canvas cursor for the active tool: brush ring for free draw,
+        eraser ring, crosshair for the line / fill / snap tools, arrow with no
+        tool. Also called after a pan, which shows a hand while dragging."""
+        label = getattr(self, 'image_label', None)
+        if label is None:
+            return
+        if getattr(self, 'eraser_mode', False):
+            self._update_eraser_cursor()
+        elif self.free_draw_mode:
+            label.setCursor(self._brush_cursor())
+        elif (getattr(self, 'color_snap_mode', False) or self.free_line_drawing_mode
+                or self.line_drawing_mode or self.horizontal_line_drawing_mode
+                or getattr(self, 'fill_mode', None)):
+            label.setCursor(Qt.CrossCursor)
+        else:
+            label.setCursor(Qt.ArrowCursor)
 
     def toggle_pen_pressure(self, checked):
         """Toggle pen pressure sensitivity"""
@@ -7688,6 +7793,8 @@ class RandomImageViewer(QMainWindow):
         self.line_thickness = max(1, min(self._BRUSH_MAX, int(value)))
         if getattr(self, 'line_thickness_label', None) is not None:
             self.line_thickness_label.setText(f"{self.line_thickness}px")
+        if getattr(self, 'free_draw_mode', False) and hasattr(self, 'image_label'):
+            self.image_label.setCursor(self._brush_cursor())   # the ring follows the size
         # Clear LUT cache since line appearance changed
         if hasattr(self, '_lut_process_cache'):
             self._lut_process_cache.clear()
@@ -12420,6 +12527,9 @@ class RandomImageViewer(QMainWindow):
                                                    self.autoplay_next_enabled)
                 grid.track(self.image_label)
                 self._thumb_grid = grid
+                # Panels hidden (▣ off or minimal mode): the GRID panel starts hidden too.
+                grid.set_panel_visible(self._ui_chrome_visible()
+                                       and not getattr(self, '_panels_hidden', False))
             # A running ⚡ slideshow carries on in the grid (and must not keep
             # changing the picture underneath it).
             carry = self._auto_advance_active
@@ -13098,7 +13208,8 @@ class RandomImageViewer(QMainWindow):
         """Enable/disable line/free-draw toolbar buttons (used in spread mode)."""
         for name in (
             "line_tool_btn", "hline_tool_btn", "free_line_tool_btn",
-            "free_draw_tool_btn", "lasso_fill_btn", "polygon_fill_btn", "rect_fill_btn", "ellipse_fill_btn",
+            "free_draw_tool_btn", "lasso_fill_btn", "polygon_fill_btn", "polyline_btn",
+            "rect_fill_btn", "ellipse_fill_btn",
             "triangle_fill_btn",
             "antialiasing_btn", "pen_pressure_btn",
             "brush_size_widget", "line_transparency_slider",
