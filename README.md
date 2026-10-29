@@ -6,6 +6,7 @@ A fast, feature-rich media viewer for Windows built with PySide6. View images, P
 
 ## Recent Updates
 
+- Film playback: the **s / fps** button next to the ⚡ seconds switches the slideshow to frames per second (1–60; scrolling steps 12, 15, 24, 25, 30 …). ⚡ then plays the folder's pictures in alphabetical order as a film, decoding the next frames ahead at screen size on background threads. 🔁 loops it, otherwise it stops on the last frame; pause (click the ring) shows the frame at full quality with every effect. Random order switches back to seconds.
 - Added a 〽 polyline tool: click corners like polygon fill, but it draws straight lines instead of filling — double-click / Enter for an open line, click the first corner to close it.
 - ▣ in the status bar hides / shows all tool panels (frame and status bar stay); the log moved to the right-click menu.
 - `Tab` starts / stops the slideshow, and a running slideshow now carries on when you switch between the viewer and the grid (from the same picture, or the one you double-click).

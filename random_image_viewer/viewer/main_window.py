@@ -46,6 +46,8 @@ from random_image_viewer.epub_utils import is_epub_file, EpubDocument
 from random_image_viewer.cbr_utils import is_cbr_file, CbrDocument
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
 from random_image_viewer.widgets.circular_countdown import CircularCountdown
+from random_image_viewer.widgets.fps_spin_box import FpsSpinBox
+from random_image_viewer.services.frame_cache import FrameCache
 from random_image_viewer.widgets.image_label import ImageLabel
 from random_image_viewer.widgets.enhancement_widget import ResponsiveEnhancementWidget
 from random_image_viewer.widgets.color_snap_preview import ColorSnapPreview
@@ -1386,7 +1388,23 @@ class RandomImageViewer(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
-        
+
+        # Frame playback: ⚡ in fps units plays the folder's pictures, in
+        # alphabetical order, as a film (see _start_frame_playback).
+        self._fps_mode = False
+        self._frame_cache = None            # FrameCache, made on first use
+        self._frame_paths = []              # the pictures being played, in order
+        self._frame_index = -1              # index into _frame_paths on screen
+        self._frame_count = 0               # frames advanced since play started (never wraps)
+        self._frame_anchor = (0.0, 0)       # (clock time, _frame_count) the film is timed from
+        self._frame_box = QSize()           # size frames are decoded at
+        self._frame_shown_path = None
+        self._frame_last_pixmap = None      # last frame after effects, before fitting
+        self._frame_status_time = 0.0
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setTimerType(Qt.PreciseTimer)
+        self._frame_timer.timeout.connect(self._on_frame_tick)
+
         # Sorting mode for navigation
         self.random_mode = True  # Default to random mode
         
@@ -1540,7 +1558,7 @@ class RandomImageViewer(QMainWindow):
         image_layout = QVBoxLayout(image_widget)
         image_layout.setContentsMargins(6, 6, 6, 6)
 
-        self.image_label = ImageLabel("Open a folder to start")
+        self.image_label = ImageLabel("Open a folder to start\n(double-click here, or drop a folder)")
         self.image_label.parent_viewer = self
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setScaledContents(False)
@@ -1986,7 +2004,12 @@ class RandomImageViewer(QMainWindow):
         # Arrows hidden by stylesheet: Qt's Windows 11 style draws them side by
         # side and they ate the whole box (NoButtons blanks the text instead).
         # Wheel, Up/Down keys and typing still work.
-        self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.timer_spin.setAlignment(Qt.AlignCenter); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(52); self.timer_spin.setToolTip("Slideshow interval (1-3600 s) — type, scroll or use ↑/↓"); self.timer_spin.valueChanged.connect(self.update_timer_interval); toolbar.addWidget(self.timer_spin)
+        self.timer_spin = QSpinBox(); self.timer_spin.setRange(1,3600); self.timer_spin.setValue(self.timer_interval); self.timer_spin.setSuffix(" s"); self.timer_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.timer_spin.setAlignment(Qt.AlignCenter); self.timer_spin.setFixedHeight(24); self.timer_spin.setFixedWidth(52); self.timer_spin.setToolTip("Slideshow interval (1-3600 s) — type, scroll or use ↑/↓"); self.timer_spin.valueChanged.connect(self.update_timer_interval)
+        # The fps box takes the seconds box's place while the unit is fps.
+        self.fps_spin = FpsSpinBox(); self.fps_spin.setValue(24); self.fps_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.fps_spin.setAlignment(Qt.AlignCenter); self.fps_spin.setFixedHeight(24); self.fps_spin.setFixedWidth(60); self.fps_spin.setToolTip("Film playback speed (1-60 fps) — scroll or ↑/↓ for 12, 15, 24, 25, 30 …, or type any value"); self.fps_spin.valueChanged.connect(self._on_fps_changed); self.fps_spin.hide()
+        self.timer_spin_box = QWidget(); _spin_row = QHBoxLayout(self.timer_spin_box); _spin_row.setContentsMargins(0, 0, 0, 0); _spin_row.setSpacing(0); _spin_row.addWidget(self.timer_spin); _spin_row.addWidget(self.fps_spin); toolbar.addWidget(self.timer_spin_box)
+        add_spacer(2)
+        self.timer_unit_btn = QToolButton(); self.timer_unit_btn.setCheckable(True); self.timer_unit_btn.setText("s"); self.timer_unit_btn.setToolTip("Slideshow unit: seconds per picture. Click for fps — plays the folder's pictures in alphabetical order as a film"); self.timer_unit_btn.setFixedSize(28,24); self.timer_unit_btn.toggled.connect(self.toggle_fps_mode); toolbar.addWidget(self.timer_unit_btn)
         add_spacer(2)
         self.circle_timer = CircularCountdown(self.timer_spin.value()); self.circle_timer.set_parent_viewer(self); toolbar.addWidget(self.circle_timer)
         add_spacer(2)
@@ -2166,7 +2189,7 @@ class RandomImageViewer(QMainWindow):
             ("FILE / NAV", [
                 'open_btn', 'add_mode_btn', 'new_canvas_btn', 'delete_file_btn', 'save_btn',
                 'prev_btn', 'next_btn', 'sort_order_button', 'type_filter_btn',
-                'grid_view_btn', 'timer_button', 'timer_spin', 'circle_timer', 'autoplay_next_btn',
+                'grid_view_btn', 'timer_button', 'timer_spin_box', 'timer_unit_btn', 'circle_timer', 'autoplay_next_btn',
                 'loop_btn',
             ]),
             # Everything for drawing lives in this one panel, one row per job,
@@ -6145,6 +6168,11 @@ class RandomImageViewer(QMainWindow):
         
         # Handle image display resize using smart caching system
         if self.current_image:
+            # A playing film refits its last frame; the next tick decodes at
+            # the new size.
+            if self._frame_timer.isActive():
+                self._refit_sequence_frame()
+                return
             # If an animated GIF is playing, update the QMovie source size
             # so frames are rendered at an appropriate resolution.
             # The frame callback (_on_gif_frame_changed) handles the rest.
@@ -6303,6 +6331,15 @@ class RandomImageViewer(QMainWindow):
             subprocess.Popen(["xdg-open", folder])
 
     def _reset_timer(self):
+        if self._fps_mode:
+            self.timer.stop()
+            self.circle_timer.set_remaining_time(0)
+            if self._auto_advance_active and self.images:
+                self._start_frame_playback()
+            else:
+                self._stop_frame_playback()
+            return
+        self._stop_frame_playback()
         if self._auto_advance_active and self._auto_advance_has_content():
             self.timer.stop()
             self.timer_remaining = self.timer_spin.value()
@@ -6348,7 +6385,9 @@ class RandomImageViewer(QMainWindow):
         if self._auto_advance_active:
             self._timer_paused = not self._timer_paused
             self.circle_timer.set_paused(self._timer_paused)
-            
+            if self._fps_mode:
+                self._on_frame_pause_changed()
+
             # Update tooltip to show current state
             if self._timer_paused:
                 self.circle_timer.setToolTip("Timer Paused - Click to Resume")
@@ -6365,9 +6404,248 @@ class RandomImageViewer(QMainWindow):
         if self.random_mode:
             self.sort_order_button.setToolTip("Order: Random")
             self.status.showMessage("Image order set to Random")
+            # A film only plays in order: random goes back to seconds.
+            if self._fps_mode:
+                self.timer_unit_btn.setChecked(False)
         else:
             self.sort_order_button.setToolTip("Order: Alphabetical")
             self.status.showMessage("Image order set to Alphabetical")
+
+    # ── Frame playback (⚡ in fps) ────────────────────────────────
+    #
+    # The folder's pictures, in alphabetical order, played as a film. Frames
+    # are decoded ahead at screen size by a FrameCache; a precise timer shows
+    # whichever frame the clock has reached. Only the cheap adjustments (LUT,
+    # grayscale / contrast / gamma, curves, rotation / flips) run per frame;
+    # pausing or stopping redraws the frame through the full display path,
+    # with every effect, marks and full resolution.
+
+    def toggle_fps_mode(self, checked):
+        """Switch the slideshow box between seconds per picture and fps."""
+        self._fps_mode = bool(checked)
+        self.timer_unit_btn.setText("fps" if self._fps_mode else "s")
+        self.timer_spin.setVisible(not self._fps_mode)
+        self.fps_spin.setVisible(self._fps_mode)
+        if self._fps_mode:
+            self.timer_unit_btn.setToolTip(
+                "Slideshow unit: fps — the folder's pictures play in alphabetical order "
+                "as a film. Click for seconds per picture")
+            if self.random_mode:
+                self.sort_order_button.setChecked(False)
+            self.status.showMessage(
+                f"Film playback: ⚡ plays the pictures in order at {self.fps_spin.value()} fps", 4000)
+        else:
+            self.timer_unit_btn.setToolTip(
+                "Slideshow unit: seconds per picture. Click for fps — plays the folder's "
+                "pictures in alphabetical order as a film")
+        self._timer_paused = False
+        self.circle_timer.set_paused(False)
+        self._reset_timer()
+
+    def _on_fps_changed(self, fps):
+        if self._frame_timer.isActive():
+            # Re-time from the frame on screen so the speed changes, not the place.
+            self._frame_anchor = (time.perf_counter(), self._frame_count)
+            self._frame_timer.setInterval(max(1, int(1000 / fps / 2)))
+            self._frame_cache.seek(self._frame_index, fps)
+
+    def _frame_playback_active(self):
+        return self._fps_mode and bool(self._frame_paths)
+
+    def _frame_target_box(self):
+        """Size to decode frames at: the canvas, turned with a 90° rotation."""
+        box = self.image_label.size()
+        if self.rotation_angle % 180 == 90:
+            box = box.transposed()
+        return box
+
+    def _start_frame_playback(self):
+        from random_image_viewer.services.thumbnails import PAGE_SEP, item_kind
+        paths = [p for p in self.images if PAGE_SEP not in p and item_kind(p) == 'image']
+        if not paths:
+            self._stop_frame_playback()
+            self.status.showMessage("Film playback: no pictures to play here", 3000)
+            return
+        # Start on the picture on screen, or the first one after it.
+        start = 0
+        current = self.current_image
+        if current in paths:
+            start = paths.index(current)
+        elif current in self.images:
+            pos = self.images.index(current)
+            start = next((paths.index(p) for p in self.images[pos:] if p in paths), 0)
+
+        # Leave any document / clip; frames paint straight onto the canvas.
+        self._close_pdf()
+        self._close_epub()
+        self._close_cbr()
+        self._stop_current_animation()
+        self._stop_current_video()
+
+        if self._frame_cache is None:
+            self._frame_cache = FrameCache()
+        self._frame_paths = paths
+        self._frame_box = self._frame_target_box()
+        self._frame_cache.reset(paths, self._frame_box, self.loop_media_enabled)
+        self._frame_index = start
+        self._frame_count = 0
+        self._frame_shown_path = None
+        self._frame_cache.seek(start, self.fps_spin.value())
+        if not self._timer_paused:
+            self._resume_frame_clock()
+        # Paused: the first frame still shows once it is decoded.
+        else:
+            self.current_image = paths[start]
+            self.display_image(paths[start])
+            self._frame_shown_path = paths[start]
+
+    def _resume_frame_clock(self):
+        """(Re)start the film from the frame on screen."""
+        self._frame_anchor = (time.perf_counter(), self._frame_count)
+        # Tick at twice the frame rate so a frame is never shown a tick late.
+        self._frame_timer.setInterval(max(1, int(1000 / self.fps_spin.value() / 2)))
+        self._frame_timer.start()
+
+    def _stop_frame_playback(self):
+        """Stop the film and redraw the frame on screen at full quality."""
+        was_playing = bool(self._frame_paths)
+        self._frame_timer.stop()
+        self._frame_paths = []
+        self._frame_last_pixmap = None
+        if self._frame_cache is not None:
+            self._frame_cache.clear()
+        if was_playing and self._frame_shown_path:
+            self._show_frame_full_quality()
+        self._frame_shown_path = None
+
+    def _show_frame_full_quality(self):
+        path = self.current_image
+        if not path:
+            return
+        self.display_image(path)
+        self.add_to_history(path)
+        self.update_image_info(path)
+        self.set_status_path(path)
+
+    def _on_frame_pause_changed(self):
+        if not self._frame_playback_active():
+            return
+        if self._timer_paused:
+            self._frame_timer.stop()
+            self._show_frame_full_quality()
+            # Full quality is on screen now; the next tick must not re-sync to it.
+            self._frame_shown_path = self.current_image
+        else:
+            self._resume_frame_clock()
+
+    def _on_frame_tick(self):
+        paths = self._frame_paths
+        cache = self._frame_cache
+        if not paths or cache is None:
+            self._frame_timer.stop()
+            return
+        n = len(paths)
+        loop = self.loop_media_enabled
+        cache.set_loop(loop)
+
+        # The viewer moved on its own (arrow keys, history): carry on from there.
+        if self._frame_shown_path is not None and self.current_image != self._frame_shown_path:
+            if self.current_image not in paths:
+                self.timer_button.setChecked(False)
+                return
+            self._frame_index = paths.index(self.current_image)
+            self._frame_shown_path = self.current_image
+            self._frame_anchor = (time.perf_counter(), self._frame_count)
+            cache.seek(self._frame_index, self.fps_spin.value())
+
+        # The canvas changed size: decode at the new size from here on.
+        box = self._frame_target_box()
+        if box != self._frame_box:
+            self._frame_box = box
+            cache.reset(paths, box, loop)
+            cache.seek(self._frame_index, self.fps_spin.value())
+
+        fps = self.fps_spin.value()
+        now = time.perf_counter()
+        first = self._frame_shown_path is None
+        if first:
+            steps = 0                       # show the start frame itself
+        else:
+            t0, count0 = self._frame_anchor
+            steps = count0 + int((now - t0) * fps) - self._frame_count
+            if steps <= 0:
+                return
+            if steps > cache.ahead():
+                # Far behind (the window was busy): don't leap, re-time instead.
+                steps = 1
+                self._frame_anchor = (now, self._frame_count + 1)
+            if not loop:
+                steps = min(steps, n - 1 - self._frame_index)
+                if steps <= 0:
+                    self.timer_button.setChecked(False)
+                    self.status.showMessage("Film playback: end of the sequence (\U0001f501 loops it)", 4000)
+                    return
+
+        # Show the frame the clock has reached, or else the newest decoded one
+        # before it (dropping frames to keep time). With none ready, hold and
+        # re-time the film from here: a slow disk slows it down, never jumps it.
+        for k in (range(steps, 0, -1) if steps else (0,)):
+            index = (self._frame_index + k) % n
+            image = cache.frame(index)
+            if image is not None:
+                break
+        else:
+            self._frame_anchor = (now, self._frame_count)
+            return
+
+        self._frame_index = index
+        self._frame_count += k
+        cache.seek(index, fps)
+        if not image.isNull():              # unreadable file: skip the frame
+            self._paint_sequence_frame(paths[index], image)
+        self.current_image = self._frame_shown_path = paths[index]
+
+        if now - self._frame_status_time > 0.25:
+            self._frame_status_time = now
+            self.set_status_path(paths[index])
+            self.status.showMessage(
+                f"▶ {os.path.basename(paths[index])} · {index + 1}/{n} · {fps} fps")
+
+    def _paint_sequence_frame(self, path, image):
+        pixmap = QPixmap.fromImage(image)
+        if self.lut_enabled and self.current_lut and self.lut_strength > 0:
+            pixmap = self._apply_lut_frame(pixmap)
+        if self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
+            pixmap = self.apply_fast_enhancements(pixmap.copy())
+        if self.curves_enabled:
+            pixmap = self.apply_curves(pixmap)
+        if self.rotation_angle != 0 or self.flipped_h or self.flipped_v:
+            pixmap = self._apply_cached_transforms(pixmap)
+        # Zoom helpers measure against this, as with video frames.
+        self.original_pixmap = pixmap
+        self._frame_last_pixmap = pixmap
+        self._show_sequence_pixmap(pixmap, path)
+
+    def _show_sequence_pixmap(self, pixmap, path):
+        """Fit *pixmap* to the canvas. A frame decoded at canvas size needs no
+        rescale at 100 % zoom, only centring — one blit per frame."""
+        size = self.image_label.size()
+        if (self.image_label.zoom_factor == 1.0
+                and pixmap.size().scaled(size, Qt.KeepAspectRatio) == pixmap.size()):
+            final = QPixmap(size)
+            final.fill(Qt.black)
+            painter = QPainter(final)
+            painter.drawPixmap((size.width() - pixmap.width()) // 2 + int(self.image_label.pan_offset_x),
+                               (size.height() - pixmap.height()) // 2 + int(self.image_label.pan_offset_y),
+                               pixmap)
+            painter.end()
+        else:
+            final = self._scale_pixmap(pixmap, path)
+        self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(final))
+
+    def _refit_sequence_frame(self):
+        if self._frame_last_pixmap is not None and self._frame_shown_path:
+            self._show_sequence_pixmap(self._frame_last_pixmap, self._frame_shown_path)
 
     def _ui_chrome_visible(self):
         """Return whether the tool UI (floating panels or toolbar) is visible."""
@@ -11144,6 +11422,11 @@ class RandomImageViewer(QMainWindow):
         if not self.current_image:
             return
 
+        # A playing film: refit the frame on screen, the next one follows suit.
+        if self._frame_timer.isActive():
+            self._refit_sequence_frame()
+            return
+
         # For animated GIFs the frame callback already handles zoom via _scale_pixmap;
         # nothing extra to do here — next frame will pick up the new zoom factor.
         if self.image_label.is_animation_playing():
@@ -11157,11 +11440,14 @@ class RandomImageViewer(QMainWindow):
         if getattr(self, '_pdf_doc', None) is not None:
             self._maybe_schedule_pdf_hires()
 
-        # The fast zoom path reuses a cached pre-posterize image, which would
-        # drop the value filter or edge detection on resize/zoom. When either
-        # is on, fall back to the full display path so the effect is preserved.
+        # The fast zoom path reuses a cached image from before the effects
+        # below, which would drop them on pan / zoom / resize. With any of them
+        # on, use the full display path — its enhancement cache keeps the
+        # finished effect, so the heavy work still runs once per setting.
         if (getattr(self, 'value_filter_enabled', False) or getattr(self, 'edge_detection_enabled', False)
                 or getattr(self, 'color_groups_enabled', False)
+                or getattr(self, 'object_groups_enabled', False)
+                or getattr(self, 'form_lines_enabled', False)
                 or getattr(self, 'curves_enabled', False)
                 or getattr(self, 'erase_strokes', None) or getattr(self, 'current_erase_stroke', None)):
             self.display_image(self.current_image)
@@ -11831,6 +12117,9 @@ class RandomImageViewer(QMainWindow):
         worker = getattr(self, '_thumb_worker', None)
         if worker is not None:
             worker.stop()
+        self._frame_timer.stop()
+        if self._frame_cache is not None:
+            self._frame_cache.stop()
         grid = getattr(self, '_thumb_grid', None)
         if grid is not None:
             grid.shutdown()

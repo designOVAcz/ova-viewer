@@ -821,10 +821,13 @@ class ImageLabel(QLabel):
             return
         # Double-click on the picture opens the thumbnail grid (like G) — only
         # with no drawing / colour-snap tool engaged, so marking stays as it was.
+        # With nothing open yet (the start screen) it opens a folder instead.
         if (event.button() == Qt.LeftButton and viewer is not None
-                and (viewer.images or viewer._open_document() is not None)
                 and self._no_tool_engaged()):
-            viewer.grid_view_btn.setChecked(True)
+            if viewer.images or viewer._open_document() is not None:
+                viewer.grid_view_btn.setChecked(True)
+            else:
+                viewer.choose_folder()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
