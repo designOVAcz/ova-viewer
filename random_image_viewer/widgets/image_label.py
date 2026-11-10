@@ -3,10 +3,9 @@ import time
 from PySide6.QtWidgets import QLabel, QApplication, QMenu
 from PySide6.QtGui import (QPainter, QColor, QPen, QAction, QTabletEvent, QMovie,
                            QPolygon, QRegion, QCursor)
-from PySide6.QtCore import Qt, QTimer, QSize, QEvent
+from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPointF, QRectF, QRect
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink, QAudioOutput
 
-from random_image_viewer.image_utils import safe_load_pixmap
 
 
 class ImageLabel(QLabel):
@@ -164,8 +163,69 @@ class ImageLabel(QLabel):
             grown = grown.united(region.translated(dx, dy))
         return grown
 
+    def _paint_crop_frame(self, frame):
+        """Dim everything outside the crop frame and draw the frame itself."""
+        painter = QPainter(self)
+        painter.setClipRegion(QRegion(self.rect()).subtracted(QRegion(frame.toAlignedRect())))
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 160))
+        painter.setClipping(False)
+        painter.setBrush(Qt.NoBrush)
+        # Thirds, for placing a subject; black under white reads on any picture.
+        painter.setPen(QPen(QColor(255, 255, 255, 70), 1))
+        for i in (1, 2):
+            x = frame.left() + frame.width() * i / 3
+            y = frame.top() + frame.height() * i / 3
+            painter.drawLine(QPointF(x, frame.top()), QPointF(x, frame.bottom()))
+            painter.drawLine(QPointF(frame.left(), y), QPointF(frame.right(), y))
+        painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+        painter.drawRect(frame)
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.drawRect(frame)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255))
+        for corner in (frame.topLeft(), frame.topRight(), frame.bottomLeft(), frame.bottomRight()):
+            painter.drawRect(QRectF(corner.x() - 3, corner.y() - 3, 6, 6))
+        painter.end()
+
     def paintEvent(self, event):
-        super().paintEvent(event)
+        viewer = self.parent_viewer
+        live = viewer.live_stroke_overlay() if viewer is not None else None
+        pm = self.pixmap()
+        if live is not None and pm is not None and not pm.isNull():
+            # ✏ The stroke being drawn, straight over the view - only the
+            # bit that changed is painted, view and stroke both, so the pen
+            # feels immediate. (QLabel's own paint scales the whole picture
+            # up to the screen on every paint: ~4 ms even for a 5 px dab.)
+            image, opacity, mode = live
+            dpr = pm.devicePixelRatio() or 1.0
+            size = pm.size() / dpr
+            x0 = (self.width() - size.width()) // 2
+            y0 = (self.height() - size.height()) // 2
+            area = event.rect().intersected(QRect(x0, y0, size.width(), size.height()))
+            painter = QPainter(self)
+            painter.setClipRegion(event.region())
+            if not area.isEmpty():
+                src = QRectF((area.x() - x0) * dpr, (area.y() - y0) * dpr,
+                             area.width() * dpr, area.height() * dpr)
+                painter.drawPixmap(QRectF(area), pm, src)
+                if opacity < 1.0:
+                    painter.setOpacity(opacity)
+                if mode is not None:
+                    painter.setCompositionMode(mode)
+                k = image.width() / max(1.0, size.width())     # stroke pixels per label px
+                painter.drawImage(QRectF(area), image,
+                                  QRectF((area.x() - x0) * k, (area.y() - y0) * k,
+                                         area.width() * k, area.height() * k))
+            painter.end()
+        else:
+            super().paintEvent(event)
+        frame = viewer._crop_screen_rect() if viewer is not None else None
+        if frame is not None:
+            self._paint_crop_frame(frame)
+        if viewer is not None and (viewer._sel is not None or viewer._sel_lasso):
+            painter = QPainter(self)
+            viewer.paint_selection_overlay(painter)     # ⬚ the selection and its frame
+            painter.end()
         overlay = getattr(self, '_fill_overlay', None)
         if not overlay:
             return
@@ -242,6 +302,9 @@ class ImageLabel(QLabel):
                 except RuntimeError:
                     pass
             self.setMovie(None)
+            # Close the file now: deleteLater only gets to it later, and an
+            # open file cannot be moved to the Recycle Bin.
+            self._current_movie.setFileName("")
             self._current_movie.deleteLater()
             self._current_movie = None
 
@@ -262,13 +325,11 @@ class ImageLabel(QLabel):
                 and self.parent_viewer.current_image):
             return None, None
         try:
-            original_pixmap, error = safe_load_pixmap(self.parent_viewer.current_image)
-            if error or original_pixmap.isNull():
-                return None, None
+            original_size = self.parent_viewer.loaded_image_size()
         except Exception:
             return None, None
-
-        original_size = original_pixmap.size()
+        if original_size is None or original_size.isEmpty():
+            return None, None
         rotation = self.parent_viewer.rotation_angle
         if rotation == 90 or rotation == 270:
             display_reference_size = QSize(original_size.height(), original_size.width())
@@ -353,7 +414,8 @@ class ImageLabel(QLabel):
 
         Same math as _map_label_pos_to_original but with NO per-event image
         reload — used on the eraser hot path so high-frequency tablet events
-        don't freeze the UI. Returns (x, y) or (None, None) if outside image.
+        don't freeze the UI. Returns (x, y), which lie outside the picture for a
+        position on the background around it, or (None, None) if unmappable.
         """
         draw_x = cache['draw_x']
         draw_y = cache['draw_y']
@@ -361,8 +423,6 @@ class ImageLabel(QLabel):
         zoomed_height = cache['zoomed_height']
         rel_x = pos.x() - draw_x
         rel_y = pos.y() - draw_y
-        if not (0 <= rel_x <= zoomed_width and 0 <= rel_y <= zoomed_height):
-            return None, None
         original_size = cache['original_size']
         rotation = cache['rotation']
         if rotation == 90 or rotation == 270:
@@ -574,6 +634,8 @@ class ImageLabel(QLabel):
             self._stop_dub_audio()
             self._media_player.setVideoOutput(None)
             self._media_player.setAudioOutput(None)
+            from PySide6.QtCore import QUrl
+            self._media_player.setSource(QUrl())    # closes the file (see stop_animation)
             self._media_player.deleteLater()
             if self._video_sink is not None:
                 self._video_sink.deleteLater()
@@ -648,6 +710,9 @@ class ImageLabel(QLabel):
         This touch path covers real touchscreens / trackpads that send raw touch.
         """
         t = event.type()
+        if t in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd,
+                 QEvent.Type.NativeGesture):
+            self._log_input(event)
         if t == QEvent.Type.TouchBegin:
             # Accepting TouchBegin is required — Qt will not deliver TouchUpdate/End
             # unless the widget explicitly claims the sequence here.  Accepting also
@@ -658,6 +723,35 @@ class ImageLabel(QLabel):
             self._handle_touch_event(event)
             return True
         return super().event(event)
+
+    _INPUT_LOG_MAX = 60     # lines per second at most, so a gesture cannot flood the log
+
+    def _log_input(self, event):
+        """One short line per wheel / touch / gesture event while zoomed in,
+        to the log (right-click → Show Log): what a tablet's two-finger
+        gestures actually send - which differs by driver and its settings -
+        so a pan that only works one way can be pinned down."""
+        if self.zoom_factor <= 1.0:
+            return
+        now = time.monotonic()
+        second, count = getattr(self, '_input_log_slot', (0, 0))
+        if int(now) != second:
+            second, count = int(now), 0
+        if count >= self._INPUT_LOG_MAX:
+            return
+        self._input_log_slot = (second, count + 1)
+        t = event.type()
+        if t == QEvent.Type.Wheel:
+            a, px = event.angleDelta(), event.pixelDelta()
+            print(f"[input] wheel angle=({a.x()},{a.y()}) pixel=({px.x()},{px.y()}) "
+                  f"mods={int(event.modifiers().value) if hasattr(event.modifiers(), 'value') else int(event.modifiers())} "
+                  f"phase={event.phase().name} device={event.device().name() if event.device() else '?'}")
+        elif t == QEvent.Type.NativeGesture:
+            print(f"[input] gesture {event.gestureType().name} value={event.value():.3f}")
+        else:
+            pts = event.points()
+            pos = " ".join(f"({p.position().x():.0f},{p.position().y():.0f})" for p in pts[:2])
+            print(f"[input] touch {t.name} points={len(pts)} {pos}")
 
     def wheelEvent(self, event):
         """Handle mouse wheel events for image navigation (when not zoomed) or zooming (when zoomed)"""
@@ -675,6 +769,11 @@ class ImageLabel(QLabel):
             #     wheel with variable delta_x / delta_y values.
             delta_y = event.angleDelta().y()
             delta_x = event.angleDelta().x()
+            # High-resolution scrolling (touch, precision pads) may only fill
+            # in pixel deltas, the horizontal part in particular.
+            if delta_x == 0 and delta_y == 0:
+                delta_x, delta_y = event.pixelDelta().x(), event.pixelDelta().y()
+            self._log_input(event)
 
             # Zoom mode: Ctrl+wheel (incl. Wacom pinch) OR right-click+wheel
             zoom_mode = (event.modifiers() & Qt.ControlModifier) or (event.buttons() & Qt.RightButton)
@@ -710,9 +809,15 @@ class ImageLabel(QLabel):
             # via this path. For full 2D panning, disable the Wacom Scroll/Zoom
             # gestures so raw QTouchEvents reach _handle_touch_event() instead.
             if self.zoom_factor > 1.0 and not zoom_mode:
+                if time.monotonic() - getattr(self, '_touch_pan_t', 0.0) < 0.25:
+                    # Two fingers on the tablet already pan (read straight from
+                    # its touch surface); the driver's scroll for the same
+                    # gesture would move the picture twice.
+                    return
                 pan_factor = 0.5
-                # Some drivers report horizontal scroll as Shift+vertical wheel.
-                if delta_x == 0 and (event.modifiers() & Qt.ShiftModifier):
+                # Some drivers report horizontal scroll as Shift+vertical wheel,
+                # others as Alt+vertical wheel.
+                if delta_x == 0 and (event.modifiers() & (Qt.ShiftModifier | Qt.AltModifier)):
                     delta_x, delta_y = delta_y, 0
 
                 # Natural ("content follows fingers") direction: invert the deltas.
@@ -757,13 +862,17 @@ class ImageLabel(QLabel):
                     self.pan_offset_x *= zoom_ratio
                     self.pan_offset_y *= zoom_ratio
 
+                # Zooming out stops once at the fit (100 %), so it is easy to
+                # land on; the next step goes smaller - the picture as a
+                # thumbnail, down to min_zoom.
+                if old_zoom > 1.0 > new_zoom:
+                    new_zoom = 1.0
                 self.zoom_factor = new_zoom
 
-                # Reset pan when back to 100% or below
+                # At the fit or smaller the picture sits centred
                 if self.zoom_factor <= 1.0:
                     self.pan_offset_x = 0
                     self.pan_offset_y = 0
-                    self.zoom_factor = 1.0
 
                 # ZOOM OPTIMIZATION: Use debounced update to prevent excessive processing
                 # during rapid wheel scrolling
@@ -808,6 +917,17 @@ class ImageLabel(QLabel):
         # Double-click fills a polygon. The first click of the pair already
         # placed that corner, so this must not add another.
         viewer = self.parent_viewer
+        # ⬚ Double-click inside the frame applies the transform.
+        if (event.button() == Qt.LeftButton and viewer is not None and viewer.select_mode
+                and viewer.select_double_click(event.position())):
+            event.accept()
+            return
+        # Double-click inside the crop frame cuts it.
+        if (event.button() == Qt.LeftButton and viewer is not None
+                and viewer.crop_mode and viewer._crop_part_at(event.position()) == 'move'):
+            viewer.apply_crop()
+            event.accept()
+            return
         if (event.button() == Qt.LeftButton and viewer is not None
                 and getattr(viewer, 'fill_mode', None) in viewer._CLICK_SHAPES
                 and viewer._placing_polygon()):
@@ -841,12 +961,27 @@ class ImageLabel(QLabel):
             or viewer.free_line_drawing_mode or viewer.free_draw_mode
             or getattr(viewer, 'eraser_mode', False)
             or getattr(viewer, 'fill_mode', None)
-            or getattr(viewer, 'color_snap_mode', False))
+            or getattr(viewer, 'color_snap_mode', False)
+            or viewer.crop_mode or viewer.select_mode)
 
     def mousePressEvent(self, event):
         # Handle middle-click for next image
         if event.button() == Qt.MiddleButton and self.parent_viewer:
             self.parent_viewer.show_next_image()
+            event.accept()
+            return
+
+        # ✂ Crop: the left button drags the frame
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.crop_mode):
+            self.parent_viewer.crop_press(event.position())
+            event.accept()
+            return
+
+        # ⬚ Select: a lasso, or grabbing the frame
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.select_mode):
+            self.parent_viewer.select_press(event.position())
             event.accept()
             return
 
@@ -892,7 +1027,7 @@ class ImageLabel(QLabel):
                 if ox is None:
                     super().mousePressEvent(event)
                     return
-                color = self.parent_viewer._sample_color_at(ox, oy)
+                color = self.parent_viewer._sample_screen_color(click_pos)
                 if color is not None:
                     self.parent_viewer.commit_color_snap(color)
                 event.accept()
@@ -909,10 +1044,11 @@ class ImageLabel(QLabel):
             if not is_any_drawing_mode:
                 super().mousePressEvent(event)
                 return
+            self.parent_viewer.reveal_active_layer()
 
-            # Get click position and verify it's over image (prevents accidental toolbar toggles drawing)
+            # Get click position and verify it's on the canvas (prevents accidental toolbar toggles drawing)
             click_pos = event.position()
-            if not self._is_position_over_image(click_pos):
+            if not self._is_position_on_canvas(click_pos):
                 # If we are currently drawing a free stroke and click outside, finalize the stroke
                 if (self.parent_viewer.free_draw_mode and self.parent_viewer.is_drawing_free_stroke):
                     self.parent_viewer.end_free_draw_stroke()
@@ -935,16 +1071,10 @@ class ImageLabel(QLabel):
                 if pressure != 1.0:
                     print(f"PEN PRESSURE: Pressure varies from default! This means your tablet is working.")
 
-            # Get original image for coordinate reference
-            try:
-                original_pixmap, error = safe_load_pixmap(self.parent_viewer.current_image)
-                if error or original_pixmap.isNull():
-                    return
-            except Exception:
-                return
-
             # Use the original unrotated size for coordinate transformation
-            original_size = original_pixmap.size()
+            original_size = self.parent_viewer.loaded_image_size()
+            if original_size is None:
+                return
 
             # For rotated images, we need to consider the displayed dimensions
             # The displayed image might have swapped width/height due to rotation
@@ -973,8 +1103,9 @@ class ImageLabel(QLabel):
             rel_x = click_pos.x() - draw_x
             rel_y = click_pos.y() - draw_y
 
-            # Check if click is within the zoomed image bounds
-            if (0 <= rel_x <= zoomed_width and 0 <= rel_y <= zoomed_height):
+            # Marks may lie outside the picture, on the background around it:
+            # they keep their place relative to it through zoom, pan and turns.
+            if zoomed_width > 0 and zoomed_height > 0:
                 # Convert to display coordinate space using correct scale factors for rotation
                 if rotation == 90 or rotation == 270:
                     scale_x = zoomed_width / original_size.height()
@@ -1023,6 +1154,11 @@ class ImageLabel(QLabel):
                 if self.parent_viewer.horizontal_line_drawing_mode:
                     self.parent_viewer.add_hline(original_y)
                 if self.parent_viewer.free_line_drawing_mode:
+                    # Where a line starts, so lifting the pen after a drag can end
+                    # it there (no second click); a plain click still starts the
+                    # click-click line.
+                    starting = getattr(self.parent_viewer, 'current_line_start', None) is None
+                    self._line_press_pos = QPointF(event.position()) if starting else None
                     self.parent_viewer.add_free_line_point(original_x, original_y)
                 if self.parent_viewer.free_draw_mode:
                     print(f"Mouse press in free draw mode at ({original_x:.1f}, {original_y:.1f})")
@@ -1042,6 +1178,19 @@ class ImageLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # ✂ Crop: the frame follows a drag; hovering shows what would be grabbed.
+        # (Right-drag panning still falls through.)
+        if (self.parent_viewer and self.parent_viewer.crop_mode
+                and not self.is_panning):
+            self.parent_viewer.crop_move(event.position())
+            event.accept()
+            return
+        if (self.parent_viewer and self.parent_viewer.select_mode
+                and not self.is_panning):
+            self.parent_viewer.select_move(event.position(), event.buttons(), event.modifiers())
+            event.accept()
+            return
+
         # A polygon being placed: the loose edge follows the pointer, whether
         # or not a button is held (right-drag panning still falls through).
         if self.parent_viewer and getattr(self.parent_viewer, 'fill_mode', None) in self.parent_viewer._CLICK_SHAPES:
@@ -1128,8 +1277,8 @@ class ImageLabel(QLabel):
         if (self.parent_viewer and self.parent_viewer.free_draw_mode and
             self.parent_viewer.is_drawing_free_stroke and event.buttons() & Qt.LeftButton and
             self.pixmap() and not self.pixmap().isNull()):
-            # Abort drawing if cursor left the image bounds; finalize stroke so pen can interact with UI
-            if not self._is_position_over_image(event.position()):
+            # Abort drawing if cursor left the canvas; finalize stroke so pen can interact with UI
+            if not self._is_position_on_canvas(event.position()):
                 self.parent_viewer.end_free_draw_stroke()
                 super().mouseMoveEvent(event)
                 return
@@ -1168,8 +1317,8 @@ class ImageLabel(QLabel):
             rel_x = click_pos.x() - cache['draw_x']
             rel_y = click_pos.y() - cache['draw_y']
 
-            # INSTANT BOUNDS CHECK: Pre-calculated dimensions
-            if (0 <= rel_x <= cache['zoomed_width'] and 0 <= rel_y <= cache['zoomed_height']):
+            # The stroke may run on past the picture, onto the background
+            if cache['zoomed_width'] > 0 and cache['zoomed_height'] > 0:
                 # PRE-COMPUTED SCALE FACTORS: No division during drawing
                 rotation = cache['rotation']
                 original_size = cache['original_size']
@@ -1213,8 +1362,9 @@ class ImageLabel(QLabel):
 
         super().mouseMoveEvent(event)
 
-    def _is_position_over_image(self, pos):
-        """Check if a position is over the actual image content (not just the widget)"""
+    def _is_position_on_canvas(self, pos):
+        """Check if a position is on the canvas: the picture or the background
+        around it, with no UI element in front of it"""
         if not self.pixmap() or self.pixmap().isNull():
             return False
 
@@ -1256,6 +1406,13 @@ class ImageLabel(QLabel):
                 self.parent_viewer.status.geometry().contains(main_window_point)):
                 return False
 
+        return True
+
+    def _is_position_over_image(self, pos):
+        """Check if a position is over the actual image content (not just the widget)"""
+        if not self._is_position_on_canvas(pos):
+            return False
+
         # If no UI element detected, check if position is within actual image bounds
         label_size = self.size()
 
@@ -1284,6 +1441,10 @@ class ImageLabel(QLabel):
         if now - getattr(self, '_cursor_reassert_t', 0.0) < self._CURSOR_REASSERT_S:
             return
         self._cursor_reassert_t = now
+        if not _system_cursor_showing(self.cursor().shape()):
+            # Ours is on screen: switching away and back now would only make
+            # it blink (it did, several times a second while the pen hovered).
+            return
         cur = QCursor(self.cursor())
         # Setting the same cursor again is a no-op in Qt; switching away and
         # back makes it hand the cursor to Windows (SetCursor) right now.
@@ -1292,15 +1453,29 @@ class ImageLabel(QLabel):
 
     def tabletEvent(self, event):
         """Handle tablet events ONLY for pen pressure during active drawing"""
-        if (event.type() in (QTabletEvent.TabletMove, QTabletEvent.TabletEnterProximity)
-                and self.rect().contains(event.position().toPoint())):
+        # Only with the canvas itself under the pen: a tool panel or palette
+        # lying over it gets these events passed on too, and pushing the
+        # canvas cursor to Windows there hid the normal arrow over it.
+        hover = (event.type() in (QTabletEvent.TabletMove, QTabletEvent.TabletEnterProximity)
+                 and self.rect().contains(event.position().toPoint()))
+        if hover:
+            above = QApplication.widgetAt(event.globalPosition().toPoint())
+            hover = above is None or above is self     # not a panel lying on it
+        if hover:
             self._reassert_cursor_for_pen()
+        if self.parent_viewer is not None:
+            # Which way the pen leans turns a textured brush's stamps. The
+            # mouse events that follow carry no tilt, so it is kept here.
+            self.parent_viewer._tablet_tilt = (event.xTilt(), event.yTilt())
+            self.parent_viewer._tablet_tilt_time = time.monotonic()
+            if hover and not self.parent_viewer.is_drawing_free_stroke:
+                self.parent_viewer.refresh_texture_cursor()   # hovering: turn with the lean
         if not (self.parent_viewer and self.parent_viewer.free_draw_mode):
             event.ignore()
             return
 
         if (self.parent_viewer.is_drawing_free_stroke and
-            self._is_position_over_image(event.position())):
+            self._is_position_on_canvas(event.position())):
 
             if event.type() == QTabletEvent.TabletMove:
                 pressure = event.pressure()
@@ -1372,6 +1547,8 @@ class ImageLabel(QLabel):
                     scale      = curr_dist / prev_dist
                     old_zoom   = self.zoom_factor
                     new_zoom   = max(self.min_zoom, min(self.max_zoom, old_zoom * scale))
+                    if old_zoom > 1.0 > new_zoom:
+                        new_zoom = 1.0                  # stop at the fit once (see wheelEvent)
                     zoom_ratio = new_zoom / old_zoom
 
                     # Scale anchored to current midpoint
@@ -1382,7 +1559,6 @@ class ImageLabel(QLabel):
                     self.zoom_factor  = new_zoom
 
                     if self.zoom_factor <= 1.0:
-                        self.zoom_factor  = 1.0
                         self.pan_offset_x = 0
                         self.pan_offset_y = 0
 
@@ -1428,6 +1604,33 @@ class ImageLabel(QLabel):
                 self.setCursor(Qt.ArrowCursor)
             event.accept()
             return
+
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.crop_mode):
+            self.parent_viewer.crop_release()
+            event.accept()
+            return
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.select_mode):
+            self.parent_viewer.select_release()
+            event.accept()
+            return
+
+        # 📏 A straight line dragged out ends where the pen lifts.
+        press = getattr(self, '_line_press_pos', None)
+        if (event.button() == Qt.LeftButton and press is not None and self.parent_viewer
+                and getattr(self.parent_viewer, 'free_line_drawing_mode', False)
+                and getattr(self.parent_viewer, 'current_line_start', None) is not None):
+            self._line_press_pos = None
+            moved = event.position() - press
+            geom = getattr(self.parent_viewer, '_line_preview_geom', None)
+            if geom and (moved.x() ** 2 + moved.y() ** 2) >= 36:      # dragged 6 px or more
+                x, y = self._map_pos_with_cache(event.position(), geom)
+                if x is not None:
+                    self.parent_viewer.add_free_line_point(x, y)
+                    event.accept()
+                    return
+            # Hardly moved: a click - the line waits for its second click.
 
         # Handle free draw mode mouse release
         if (event.button() == Qt.LeftButton and self.parent_viewer and
@@ -1626,3 +1829,35 @@ class ImageLabel(QLabel):
         self.zoom_factor = 1.0
         self.pan_offset_x = 0
         self.pan_offset_y = 0
+
+
+_SYSTEM_CURSORS = None
+
+
+def _system_cursor_showing(own_shape):
+    """True when Windows shows one of its stock cursors (arrow, I-beam, the
+    frame's resize arrows ...) rather than this widget's own. Off Windows,
+    or if it cannot be asked, True: the reassert then runs as it always did."""
+    global _SYSTEM_CURSORS
+    import sys
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.GetCursor.restype = ctypes.c_void_p
+        user32.LoadCursorW.restype = ctypes.c_void_p
+        user32.LoadCursorW.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        if _SYSTEM_CURSORS is None:
+            ids = {32512: Qt.ArrowCursor, 32513: Qt.IBeamCursor, 32514: Qt.WaitCursor,
+                   32515: Qt.CrossCursor, 32642: Qt.SizeFDiagCursor, 32643: Qt.SizeBDiagCursor,
+                   32644: Qt.SizeHorCursor, 32645: Qt.SizeVerCursor, 32646: Qt.SizeAllCursor,
+                   32649: Qt.PointingHandCursor, 32650: Qt.BusyCursor}
+            _SYSTEM_CURSORS = {user32.LoadCursorW(None, ctypes.c_void_p(i)): shape
+                               for i, shape in ids.items()}
+        shown = user32.GetCursor()
+        if shown not in _SYSTEM_CURSORS:
+            return False                # a custom cursor: ours
+        return _SYSTEM_CURSORS[shown] != own_shape
+    except Exception:
+        return True

@@ -4,7 +4,7 @@ import time
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPixmap, QPainter, QFont, QIcon, QImageReader, QImage
-from PySide6.QtCore import Qt, QSize, QObject, Signal
+from PySide6.QtCore import Qt, QSize, QRect, QObject, Signal
 
 from random_image_viewer.constants import (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS,
                                            PLAYLIST_EXTENSIONS, ANIMATED_EXTENSIONS)
@@ -256,6 +256,34 @@ def safe_load_pixmap(file_path):
     """Safely load a pixmap with error handling for large images"""
     # Use the smart loader for better performance
     return smart_load_pixmap(file_path)
+
+
+def read_image_region(file_path, left, top, right, bottom):
+    """Decode part of a picture at its real resolution, unlike the viewer's
+    loaders, which cap the long edge. The edges are 0..1 fractions of the
+    file's size. Returns a QImage, null if the file cannot be read."""
+    def pixel_box(width, height):
+        x0, y0 = int(left * width), int(top * height)
+        x1, y1 = min(width, round(right * width)), min(height, round(bottom * height))
+        return x0, y0, max(x0 + 1, x1), max(y0 + 1, y1)
+
+    reader = QImageReader(file_path)
+    size = reader.size()
+    if reader.canRead() and size.isValid():
+        x0, y0, x1, y1 = pixel_box(size.width(), size.height())
+        # Formats that support it decode only this region.
+        reader.setClipRect(QRect(x0, y0, x1 - x0, y1 - y0))
+        image = reader.read()
+        if not image.isNull():
+            return image
+    try:
+        from PIL import Image
+        with Image.open(file_path) as pil_img:
+            region = pil_img.crop(pixel_box(*pil_img.size)).convert('RGBA')
+            data = region.tobytes('raw', 'RGBA')
+            return QImage(data, region.width, region.height, QImage.Format_RGBA8888).copy()
+    except Exception:
+        return QImage()
 
 
 def natural_sort_key(text):

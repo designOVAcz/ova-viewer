@@ -1,5 +1,7 @@
 ﻿import sys
 import os
+import json
+import math
 import random
 import time
 import subprocess
@@ -16,14 +18,15 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QVBoxLayout, QWidget,
     QListWidget, QListWidgetItem, QSplitter, QSpinBox, QCheckBox,
     QStatusBar, QToolBar, QToolButton, QSizePolicy, QSlider, QHBoxLayout,
-    QStyle, QStyleOptionSlider, QGridLayout, QMenu, QColorDialog, QComboBox,
+    QStyle, QStyleOptionSlider, QGridLayout, QMenu, QComboBox,
     QGraphicsOpacityEffect, QFrame
 )
 from PySide6.QtGui import (
     QPixmap, QPainter, QColor, QPen, QFont, QIcon, QColorTransform,
-    QMouseEvent, QImageReader, QTransform, QAction, QShortcut, QImage, QTabletEvent, QCursor
+    QMouseEvent, QImageReader, QTransform, QAction, QShortcut, QImage, QTabletEvent, QCursor,
+    QPolygonF
 )
-from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QEvent, QPropertyAnimation, QEasingCurve, QThread, QPoint, Signal
+from PySide6.QtCore import Qt, QTimer, QSize, QElapsedTimer, QRect, QRectF, QPointF, QEvent, QPropertyAnimation, QEasingCurve, QThread, QPoint, Signal, QObject
 from PySide6.QtWidgets import QLayout, QWidgetAction
 
 from random_image_viewer.constants import (IMAGE_EXTENSIONS, MEDIA_EXTENSIONS, DOCUMENT_EXTENSIONS,
@@ -36,7 +39,7 @@ from random_image_viewer.platform_utils import (  # noqa: F401
 )
 from random_image_viewer.styles import get_adaptive_stylesheet
 from random_image_viewer.image_utils import (
-    get_image_file_size, smart_load_pixmap, safe_load_pixmap,
+    get_image_file_size, smart_load_pixmap, safe_load_pixmap, read_image_region,
     natural_sort_key, get_images_in_folder, get_playlist_items_in_folder,
     emoji_icon, is_animated_image, is_video_file, PlaylistScanner,
     find_subtitle_file, find_dub_audio_file, parse_srt, load_thumbnail_pixmap
@@ -47,6 +50,11 @@ from random_image_viewer.cbr_utils import is_cbr_file, CbrDocument
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
 from random_image_viewer.widgets.circular_countdown import CircularCountdown
 from random_image_viewer.widgets.fps_spin_box import FpsSpinBox
+from random_image_viewer.widgets.layer_window import LayerWindow
+from random_image_viewer.drawing.layers import Layer, BLEND_MODES, MARK_FIELDS
+from random_image_viewer.drawing import brushes
+from random_image_viewer.drawing import transform as mark_transform
+from random_image_viewer.widgets.brush_window import BrushWindow
 from random_image_viewer.services.frame_cache import FrameCache
 from random_image_viewer.widgets.image_label import ImageLabel
 from random_image_viewer.widgets.enhancement_widget import ResponsiveEnhancementWidget
@@ -73,12 +81,95 @@ class Stroke(list):
     ``list`` keeps it a plain sequence of points for every other consumer.
     """
 
-    __slots__ = ('thickness', 'color')
+    __slots__ = ('thickness', 'color', 'texture', 'stamps', 'flat', 'render', 'history', 'erase')
 
-    def __init__(self, points=(), thickness=None, color=None):
+    def __init__(self, points=(), thickness=None, color=None, texture=None, stamps=None,
+                 flat=False):
         super().__init__(points)
+        # (view transform, image, top-left): the stroke as drawn live, reused
+        # while the view is unchanged (see RandomImageViewer._paint_layer_marks).
+        self.render = None
+        # 🕘 History: the tint (0..1) - the stroke paints the picture back.
+        self.history = None
+        # 🧽 Erase: the stroke rubs paint out of its layer (only the layer's
+        # own image - never the picture or the layers under it).
+        self.erase = False
         self.thickness = thickness
         self.color = color
+        # A textured brush: the PNG and the stamps laid while drawing (see
+        # brushes.StampTrail), and whether they build up (see FlatStroke).
+        # The points stay for anything reading the path.
+        self.texture = texture
+        self.stamps = stamps
+        self.flat = flat
+
+
+def _shift_between(a, b, tol=1e-6):
+    """QPoint that moves what transform *a* laid to where *b* lays it, when
+    the two differ only by a whole-pixel offset (a pan); else None."""
+    lin_a, lin_b = (a.m11(), a.m12(), a.m21(), a.m22()), (b.m11(), b.m12(), b.m21(), b.m22())
+    if any(abs(x - y) > tol * max(1.0, abs(x), abs(y)) for x, y in zip(lin_a, lin_b)):
+        return None
+    dx, dy = b.dx() - a.dx(), b.dy() - a.dy()
+    if abs(dx - round(dx)) > 1e-3 or abs(dy - round(dy)) > 1e-3:
+        return None
+    return QPoint(round(dx), round(dy))
+
+
+def _same_transform(a, b, tol=1e-6):
+    """True when QTransforms *a* and *b* are equal, give or take float noise."""
+    return all(abs(x - y) <= tol * max(1.0, abs(x), abs(y)) for x, y in zip(
+        (a.m11(), a.m12(), a.m21(), a.m22(), a.dx(), a.dy()),
+        (b.m11(), b.m12(), b.m21(), b.m22(), b.dx(), b.dy())))
+
+
+class _BusyLine(QWidget):
+    """A thin line along the bottom of the status bar: work under way in
+    the background (marks being laid again after a zoom), filled as far as
+    it got. Not in the bar's layout - it lies over its bottom edge."""
+
+    HEIGHT = 3
+    FILL = QColor(240, 160, 48)             # the app's amber: it has to be seen
+
+    def __init__(self, bar):
+        super().__init__(bar)
+        self._bar = bar
+        self._fraction = 0.0
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setToolTip("")
+        self.hide()
+
+    def show_progress(self, fraction):
+        self._fraction = max(0.0, min(1.0, fraction))
+        bar = self._bar
+        self.setGeometry(0, bar.height() - self.HEIGHT, bar.width(), self.HEIGHT)
+        self.raise_()
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(255, 255, 255, 40))
+        p.fillRect(0, 0, round(self.width() * self._fraction), self.height(), self.FILL)
+        p.end()
+
+
+class _PenProximityWatch(QObject):
+    """Keeps viewer._pen_near: True from the pen coming near the tablet
+    until it leaves (Qt sends the application these, not a widget)."""
+
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self._viewer = viewer
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.TabletEnterProximity:
+            self._viewer._pen_near = True
+        elif t == QEvent.TabletLeaveProximity:
+            self._viewer._pen_near = False
+        return False
 
 
 class RulerLine(float):
@@ -824,8 +915,8 @@ class RandomImageViewer(QMainWindow):
 
         return to_display
 
-    def _ordered_marks(self):
-        """Yield ``(kind, payload)`` for every mark in the order it was made.
+    def _ordered_marks(self, layer):
+        """Yield ``(kind, payload)`` for every mark of *layer* in the order it was made.
 
         ``_undo_stack`` already records the kind of each mark chronologically
         (it is what Ctrl+Z walks), so replaying it alongside a per-kind cursor
@@ -834,18 +925,21 @@ class RandomImageViewer(QMainWindow):
         entry — whatever is left over is emitted afterwards in list order, so
         nothing is silently dropped.
         """
+        marks = layer.marks
         buckets = {
-            'line': list(self.drawn_lines),
-            'hline': list(self.drawn_horizontal_lines),
-            'free_line': list(self.drawn_free_lines),
-            'free_stroke': list(self.drawn_free_strokes),
-            'fill': list(getattr(self, 'drawn_fills', [])),
+            'line': list(marks['drawn_lines']),
+            'hline': list(marks['drawn_horizontal_lines']),
+            'free_line': list(marks['drawn_free_lines']),
+            'free_stroke': list(marks['drawn_free_strokes']),
+            'fill': list(marks['drawn_fills']),
+            'image': list(marks['drawn_images']),
+            'erase': list(marks['erase_strokes']),
         }
         cursor = {k: 0 for k in buckets}
-        for kind in getattr(self, '_undo_stack', []):
+        for kind in marks['_undo_stack']:
             items = buckets.get(kind)
             if items is None:
-                continue  # 'erase' and anything else this painter does not draw
+                continue  # anything this painter does not draw
             i = cursor[kind]
             if i < len(items):
                 cursor[kind] = i + 1
@@ -855,14 +949,427 @@ class RandomImageViewer(QMainWindow):
                 yield kind, item
 
     def _paint_marks(self, painter, canvas_width, canvas_height, original_size,
-                     scale_x, scale_y, offset_x=0, offset_y=0):
-        """Paint every annotation onto *painter*, in the order it was drawn.
+                     scale_x, scale_y, offset_x=0, offset_y=0, which=None):
+        """Paint every visible layer onto *painter*, bottom to top.
+
+        Each layer goes through a transparent image of the painter's device,
+        which is then blended on as one piece. On screen that image is kept (see
+        _layer_image), so a drawing costs the same however much of it there is.
+        A caller that paints scaled (the crop does) gets a one-off image with
+        its transform, or none where the layer needs none. *which*: only the
+        layers it accepts (a callable) - those under or over the effects.
+        """
+        view = (canvas_width, canvas_height, original_size, scale_x, scale_y, offset_x, offset_y)
+        # The canvas under the picture, where the hidden picture would be -
+        # under every layer. Effects treat it like the picture.
+        sheet = self._under_sheet_layer()
+        if sheet is not None and (which is None or which(sheet)) and not self._export_no_paper:
+            self._paint_layer_fill(painter, sheet, view)
+        if not self.lines_visible:
+            return
+        on_screen = painter.worldTransform().isIdentity() and not self._exporting
+        for layer in self.layers:
+            if not layer.visible or not layer.has_content():
+                continue
+            if which is not None and not which(layer):     # see _fx_composite
+                continue
+            erasing = layer is self.active_layer and self.current_erase_stroke
+            rubbing = (self._live_rub_image(painter.device()) if on_screen
+                       and layer is self.active_layer else None)
+            if not on_screen and layer.is_plain() and not erasing:
+                self._paint_layer_marks(painter, self._ordered_marks(layer), *view)
+                continue
+            device = painter.device()
+            if on_screen:
+                image = self._layer_image(layer, device, view)
+            else:
+                image = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
+                image.fill(Qt.transparent)
+                layer_painter = QPainter(image)
+                layer_painter.setWorldTransform(painter.worldTransform())
+                if layer.fill is not None and not self._export_no_paper:
+                    self._paint_layer_fill(layer_painter, layer, view)
+                self._paint_layer_marks(layer_painter, self._ordered_marks(layer), *view)
+                layer_painter.end()
+            if erasing:
+                # Live, so on a copy: the stroke is not a mark until it ends.
+                image = image.copy()
+                layer_painter = QPainter(image)
+                layer_painter.setWorldTransform(painter.worldTransform())
+                self._paint_erase_stroke(
+                    layer_painter, self.current_erase_stroke,
+                    self._mark_display_mapper(original_size, scale_x, scale_y, offset_x, offset_y),
+                    scale_x)
+                layer_painter.end()
+            if rubbing is not None:
+                # 🧽 An erase brush stroke being drawn: what it has laid so
+                # far (screen space, like the view) takes this layer's paint
+                # away - on a copy, it is not a mark until the pen lifts.
+                image = image.copy()
+                layer_painter = QPainter(image)
+                layer_painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+                layer_painter.drawImage(0, 0, rubbing)
+                layer_painter.end()
+            painter.save()
+            painter.resetTransform()
+            painter.setOpacity(layer.opacity / 100)
+            # With the picture hidden there is only the flat background to blend
+            # with, and a black one would swallow a Multiply layer whole.
+            if self.image_visible:
+                painter.setCompositionMode(BLEND_MODES[layer.blend])
+            painter.drawImage(0, 0, image)
+            painter.restore()
+
+    def _under_sheet_layer(self):
+        """The canvas under the picture as a sheet to paint (layer-like:
+        a fill, effects on), or None while it does not show - none set, or
+        the picture is shown over it."""
+        if (getattr(self, 'under_canvas', None) is None or self.image_visible
+                or not self.under_canvas_visible):
+            return None
+        sheet = self._under_sheet
+        sheet.fill = self.under_canvas
+        return sheet
+
+    def set_under_canvas(self, on):
+        """📄 Canvas's tick in 📚: show or hide the sheet under the picture
+        (made by new sketch). It shows while the picture is hidden."""
+        self.under_canvas_visible = bool(on)
+        self._refresh_layer_window()
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
+        if on and self.image_visible:
+            self.status.showMessage("Canvas under the picture - untick 🖼 Picture to draw on it", 4000)
+
+    def _paint_layer_fill(self, painter, layer, view):
+        """A canvas layer's paper: its colour over the whole picture, as the
+        picture lies in *view* (turned, flipped, zoomed) - not past its edges."""
+        from PySide6.QtGui import QPolygonF
+        _w, _h, original_size, scale_x, scale_y, offset_x, offset_y = view
+        if self.rotation_angle in (90, 270):
+            unrot_w, unrot_h = original_size.height(), original_size.width()
+        else:
+            unrot_w, unrot_h = original_size.width(), original_size.height()
+        to_display = self._mark_display_mapper(original_size, scale_x, scale_y, offset_x, offset_y)
+        sheet = self._picture_to_display(to_display, unrot_w, unrot_h).map(
+            QPolygonF(QRectF(0, 0, unrot_w, unrot_h)))
+        painter.save()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(layer.fill)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.drawPolygon(sheet)
+        painter.restore()
+
+    def _layer_view_transform(self, view):
+        """Picture -> device for *view* (a _paint_marks view tuple)."""
+        _w, _h, original_size, scale_x, scale_y, offset_x, offset_y = view
+        if self.rotation_angle in (90, 270):
+            unrot_w, unrot_h = original_size.height(), original_size.width()
+        else:
+            unrot_w, unrot_h = original_size.width(), original_size.height()
+        return self._picture_to_display(
+            self._mark_display_mapper(original_size, scale_x, scale_y, offset_x, offset_y),
+            unrot_w, unrot_h)
+
+    def _update_zoom_readout(self):
+        """The status bar's zoom: the picture as shown, in % of its real size."""
+        label = getattr(self, 'zoom_label', None)
+        pic = getattr(self, 'original_pixmap', None)
+        if label is None:
+            return
+        if pic is None or pic.isNull() or not self.current_image:
+            label.setText("")
+            return
+        fitted = pic.size().scaled(self.image_label.size(), Qt.KeepAspectRatio)
+        percent = fitted.width() / max(1, pic.width()) * self.image_label.zoom_factor * 100
+        # Large pictures are held smaller than the file: count against the
+        # file's own size, read from its header once.
+        kept = getattr(self, '_real_size', None)
+        if kept is None or kept[0] != self.current_image:
+            from PySide6.QtGui import QImageReader
+            real = QImageReader(self.current_image).size()
+            kept = self._real_size = (self.current_image, real if real.isValid() else None)
+        real = kept[1]
+        if real is not None and max(real.width(), real.height()) > 0:
+            percent *= max(pic.width(), pic.height()) / max(real.width(), real.height())
+        label.setText(f"{percent:.0f}%" if percent >= 10 else f"{percent:.1f}%")
+
+    @staticmethod
+    def _marks_follow_pen(marks):
+        """True when any of *marks* ((kind, mark) pairs) has no colour or
+        size of its own and is painted with the pen's current ones (bare
+        numbers and dicts from older code)."""
+        for kind, mark in marks:
+            if kind in ('line', 'hline', 'free_stroke'):
+                if not (getattr(mark, 'color', None) and getattr(mark, 'thickness', None)):
+                    return True
+            elif kind in ('free_line', 'fill'):
+                if not isinstance(mark, dict) or 'color' not in mark or not mark.get('thickness'):
+                    return True
+        return False
+
+    def _layer_raster_key(self, width, height, view, count, marks=None):
+        """(key, fixed) of a layer's image: everything it depends on, and
+        the part of it that a zoom / pan / turn leaves alone.
+
+        The pen's colour and size are in it only when a mark is painted with
+        them (*marks*: the layer's (kind, mark) pairs; None: assume so) -
+        every stroke carries its own, so changing the brush size or colour
+        used to lay the whole drawing again at the next redraw (~1 s with a
+        few dozen textured strokes) for the very same pixels."""
+        pen = ((self.line_color.rgba(), self.line_thickness)
+               if marks is None or self._marks_follow_pen(marks) else ())
+        key = (width, height, view[0], view[1], view[2].width(), view[2].height(), *view[3:],
+               self.rotation_angle, self.flipped_h, self.flipped_v,
+               *pen, self.line_antialiasing, self.pen_pressure_enabled, self.guides_visible)
+        # A zoom, pan, quarter turn, flip or resize only moves the pixels:
+        # view_tf carries all of them (see _layer_image).
+        fixed = (*pen, self.line_antialiasing, self.pen_pressure_enabled, self.guides_visible, count)
+        return key, fixed
+
+    _SETTLE_SLICE_S = 0.025     # work per turn of the event loop while settling
+    _BUSY_AFTER_S = 0.15        # settling longer than this shows the busy line
+
+    def _settle_view(self):
+        """The view has stopped moving: lay the marks properly for it - a
+        slice at a time, between which the app keeps answering (the moved and
+        scaled images stay on screen meanwhile). Laid in one go, a few dozen
+        textured strokes froze it for most of a second after every zoom."""
+        self._settle_job = job = object()
+        started = time.perf_counter()
+        wanted = dict(self._settle_wanted)
+        self._settle_wanted.clear()
+        work = []
+        for layer in self.layers:
+            got = wanted.get(id(layer))
+            if got is None or not layer.visible or not layer.has_content():
+                continue
+            width, height, view = got
+            marks = list(self._ordered_marks(layer))
+            image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+            image.fill(Qt.transparent)
+            if layer.fill is not None:
+                paper = QPainter(image)
+                self._paint_layer_fill(paper, layer, view)
+                paper.end()
+            work.append([layer, image, marks, 0, width, height, view])
+        total = sum(len(item[2]) for item in work) or 1
+        busy = getattr(self, '_busy_line', None)
+
+        def finish():
+            self._settle_job = None             # done: nothing under way any more
+            for layer, image, marks, _done, width, height, view in work:
+                key, fixed = self._layer_raster_key(width, height, view, len(marks), marks)
+                layer.raster = {'key': key, 'image': image, 'count': len(marks),
+                                'last': marks[-1][1] if marks else None,
+                                'fixed': fixed, 'view_tf': self._layer_view_transform(view)}
+            self._view_in_motion = False
+            if busy is not None and busy.isVisible():
+                busy.show_progress(1.0)
+            if self.current_image:
+                self._smart_zoom_display(settled=True)
+            if busy is not None:
+                busy.hide()
+
+        def step():
+            if self._settle_job is not job:
+                return                          # moved again: a new settle follows
+            start = time.perf_counter()
+            for item in work:
+                layer, image, marks, done, width, height, view = item
+                while done < len(marks):
+                    if self._keeps_step_at(done, len(marks)):
+                        # Kept for undo: the next few undos are a copy.
+                        self._keep_raster_step(
+                            layer, self._layer_raster_key(width, height, view, len(marks), marks)[0],
+                            marks, done, image)
+                    painter = QPainter(image)
+                    self._paint_layer_marks(painter, marks[done:done + 1], *view)
+                    painter.end()
+                    done += 1
+                    item[3] = done
+                    if time.perf_counter() - start > self._SETTLE_SLICE_S:
+                        # Taking a while: the line at the bottom of the status
+                        # bar says so, and how far it got.
+                        if busy is not None and time.perf_counter() - started > self._BUSY_AFTER_S:
+                            busy.show_progress(sum(i[3] for i in work) / total)
+                        QTimer.singleShot(0, step)
+                        return
+            finish()
+
+        step()
+
+    def _layer_image(self, layer, device, view):
+        """*layer*'s marks as a transparent image, for this view.
+
+        Marks are only ever added or taken off the end (undo), so the last image
+        stays good until the view changes and just needs what is new painted
+        onto it. Finishing a line then costs that line, not the whole drawing.
+        """
+        marks = list(self._ordered_marks(layer))
+        key, fixed = self._layer_raster_key(device.width(), device.height(), view, len(marks), marks)
+        kept = layer.raster
+        if (getattr(self, '_view_in_motion', False) and kept is not None and kept['key'] != key
+                and kept.get('fixed') == fixed and kept.get('view_tf') is not None):
+            # Zooming / panning: the last image, moved and scaled to the new
+            # view - a few ms, where laying every mark again took most of a
+            # second with a few dozen textured strokes. The real one is made
+            # once the view comes to rest (see _settle_view).
+            back, ok = kept['view_tf'].inverted()
+            self._settle_wanted[id(layer)] = (device.width(), device.height(), view)
+            if ok:
+                quick = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
+                quick.fill(Qt.transparent)
+                qp = QPainter(quick)
+                qp.setTransform(back * self._layer_view_transform(view))
+                qp.drawImage(0, 0, kept['image'])
+                qp.end()
+                return quick
+        if (kept is not None and kept['key'] == key and kept['count'] <= len(marks)
+                and (not kept['count'] or marks[kept['count'] - 1][1] is kept['last'])):
+            image, done = kept['image'], kept['count']
+            if done < len(marks) and done:
+                # The image is painted on in place: keep it as it is now, so
+                # undoing what comes next is a copy, not the whole drawing.
+                self._keep_raster_step(layer, key, marks, done, image)
+        else:
+            step = self._raster_step_for(layer, key, marks)
+            if step is not None:
+                # Undo (or the drawing as it was a few marks ago): from the
+                # image kept before those marks, not from nothing.
+                image, done = step['image'].copy(), step['count']
+            else:
+                image = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
+                image.fill(Qt.transparent)
+                done = 0
+                if layer.fill is not None:
+                    paper = QPainter(image)
+                    self._paint_layer_fill(paper, layer, view)
+                    paper.end()
+        if done < len(marks):
+            self._lay_marks(layer, image, marks, done, view, key)
+        layer.raster = {'key': key, 'image': image, 'count': len(marks),
+                        'last': marks[-1][1] if marks else None,
+                        'fixed': fixed, 'view_tf': self._layer_view_transform(view)}
+        return image
+
+    _RASTER_STEPS = 12                  # images kept per layer for undo ...
+    _RASTER_STEPS_BYTES = 200 << 20     # ... and at most this much memory for all of them
+    _STEPS_NEAR_END = 4                 # a whole-drawing lay keeps the images before its last few marks
+    _STEPS_EVERY = 8                    # ... and one every this many marks further back
+
+    def _keeps_step_at(self, done, total):
+        """Whether laying a whole drawing keeps its image at *done* of
+        *total* marks: so undo after a zoom or turn is a copy plus a few
+        marks, however far back it goes (within _RASTER_STEPS)."""
+        left = total - done
+        return done > 0 and left > 0 and (left <= self._STEPS_NEAR_END or left % self._STEPS_EVERY == 0)
+
+    def _keep_raster_step(self, layer, key, marks, count, image):
+        """Keep *image* - *layer*'s first *count* marks, for *key* - for undo."""
+        steps = [s for s in layer.raster_steps if s['key'] == key and s['count'] != count]
+        steps.append({'key': key, 'count': count, 'last': marks[count - 1][1], 'image': image.copy()})
+        steps.sort(key=lambda s: s['count'])
+        steps = steps[-self._RASTER_STEPS:]
+        layer.raster_steps = steps
+        total = sum(s['image'].sizeInBytes() for layer_ in self.layers for s in layer_.raster_steps)
+        while total > self._RASTER_STEPS_BYTES and steps:
+            total -= steps.pop(0)['image'].sizeInBytes()    # the oldest go first
+
+    def _raster_step_for(self, layer, key, marks):
+        """The kept image with the most of *marks* in it (all of them still
+        there, nothing after them yet), or None."""
+        best = None
+        for step in layer.raster_steps:
+            count = step['count']
+            if (step['key'] == key and 0 < count <= len(marks)
+                    and marks[count - 1][1] is step['last']
+                    and (best is None or count > best['count'])):
+                best = step
+        return best
+
+    _BUSY_SYNC_S = 0.3      # work that keeps the app busy longer than this shows the busy line
+
+    def _lay_marks(self, layer, image, marks, done, view, key):
+        """Paint marks[done:] onto *image*. A long run (a whole drawing after
+        a zoom or undo) goes a mark at a time: it keeps the images before
+        its last few marks (the next undos are a copy), and once it has
+        taken a while the busy line at the bottom shows how far it got."""
+        todo = len(marks) - done
+        if todo <= 2:
+            painter = QPainter(image)
+            self._paint_layer_marks(painter, marks[done:], *view)
+            painter.end()
+            return
+        started = time.perf_counter()
+        busy = getattr(self, '_busy_line', None)
+        shown = False
+        try:
+            for i in range(done, len(marks)):
+                if i > done and self._keeps_step_at(i, len(marks)):
+                    self._keep_raster_step(layer, key, marks, i, image)
+                painter = QPainter(image)
+                self._paint_layer_marks(painter, marks[i:i + 1], *view)
+                painter.end()
+                if busy is not None and time.perf_counter() - started > self._BUSY_SYNC_S:
+                    busy.show_progress((i + 1 - done) / todo)
+                    busy.repaint()              # the app is busy: draw it now
+                    shown = True
+        finally:
+            if shown and getattr(self, '_settle_job', None) is None:
+                busy.hide()
+
+    def _brush_erasing(self):
+        """True while the brush is in 🧽 Erase mode."""
+        return getattr(self, 'brush_settings', {}).get('mode') == 'erase'
+
+    def _live_rub_image(self, device):
+        """The 🧽 erase brush stroke being drawn, as laid on screen so far -
+        for _paint_marks to take out of the active layer - or None."""
+        if not (getattr(self, 'is_drawing_free_stroke', False) and self._brush_erasing()):
+            return None
+        image = getattr(self, '_stroke_image', None)
+        if image is None or image.isNull() or device is None:
+            return None
+        if image.width() != device.width() or image.height() != device.height():
+            return None
+        return image
+
+    def _paint_erase_stroke(self, painter, stroke, to_display, scale_x):
+        """Clear an erase stroke's band out of a layer's own image.
+
+        A round-cap pen is solid and safe against self-overlap (back-and-forth
+        drags), and being painted in draw order, whatever is drawn afterwards
+        stays on top of the hole.
+        """
+        if not stroke:
+            return
+        from PySide6.QtGui import QPolygonF
+        pts = [QPointF(*to_display(x, y)) for x, y, _ in stroke]
+        radius = max(1.0, max(r for _, _, r in stroke) * scale_x)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setCompositionMode(QPainter.CompositionMode_Clear)
+        if len(pts) == 1:
+            # Single tap: a dot
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(Qt.black)
+            painter.drawEllipse(pts[0], radius, radius)
+        else:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(Qt.black, radius * 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline(QPolygonF(pts))
+        painter.restore()
+
+    def _paint_layer_marks(self, painter, marks, canvas_width, canvas_height, original_size,
+                           scale_x, scale_y, offset_x=0, offset_y=0):
+        """Paint ``(kind, mark)`` pairs onto *painter*, in the order they were drawn.
 
         Draw order is chronological rather than grouped by type, so a fill laid
         down after a line covers it, and a line drawn after a fill sits on top.
         """
-        if not self.lines_visible:
-            return
         to_display = self._mark_display_mapper(
             original_size, scale_x, scale_y, offset_x, offset_y)
         rot = self.rotation_angle
@@ -873,13 +1380,33 @@ class RandomImageViewer(QMainWindow):
         else:
             unrot_w, unrot_h = original_size.width(), original_size.height()
         pen = QPen(self.line_color, self.line_thickness, Qt.SolidLine)
+        hidden = self._sel_hidden       # ⬚ marks being transformed show on their own
+        guide_off = self._studio_guide_offset()
+        if guide_off:
+            marks = self._with_studio_guides(marks, guide_off, hidden)
 
-        for kind, mark in self._ordered_marks():
+        guides = self.guides_visible
+        for kind, mark in marks:
+            if hidden and id(mark) in hidden:
+                continue
+            if not guides and self._is_guide(kind, mark):
+                continue                # 👁 off: the guides alone are hidden
+            if (kind == 'free_stroke' and getattr(mark, 'erase', False)
+                    and painter.compositionMode() != QPainter.CompositionMode_DestinationOut):
+                # 🧽 An erase stroke: laid exactly like any brush stroke, but
+                # what it lays takes paint away (its alpha: soft tips, low
+                # opacity and light pressure rub out less).
+                painter.save()
+                painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+                self._paint_layer_marks(painter, ((kind, mark),), canvas_width, canvas_height,
+                                        original_size, scale_x, scale_y, offset_x, offset_y)
+                painter.restore()
+                continue
             if kind in ('line', 'hline'):
                 # Ruler lines carry the size and colour they were placed with
                 # (see RulerLine); bare numbers from older code follow the pen.
                 line_pen = QPen(getattr(mark, 'color', None) or self.line_color,
-                                getattr(mark, 'thickness', None) or self.line_thickness,
+                                (getattr(mark, 'thickness', None) or self.line_thickness) * self._export_pen_scale,
                                 Qt.SolidLine)
             if kind == 'line':
                 # A ruler line spans the whole picture, so it has no second
@@ -945,12 +1472,32 @@ class RandomImageViewer(QMainWindow):
                         and max(sy_, ey_) >= -tolerance and min(sy_, ey_) <= canvas_height + tolerance):
                     painter.setRenderHint(QPainter.Antialiasing, True)
                     painter.setPen(QPen(mark.get('color') or self.line_color,
-                                        mark.get('thickness') or self.line_thickness,
+                                        (mark.get('thickness') or self.line_thickness) * self._export_pen_scale,
                                         Qt.SolidLine))
                     painter.drawLine(sx_, sy_, ex_, ey_)
                     painter.setRenderHint(QPainter.Antialiasing, False)
 
             elif kind == 'free_stroke':
+                if getattr(mark, 'stamps', None):
+                    view = self._picture_to_display(to_display, unrot_w, unrot_h)
+                    render = getattr(mark, 'render', None)
+                    on_screen = painter.worldTransform().isIdentity() and not self._exporting
+                    shift = _shift_between(render[0], view) if render is not None and on_screen else None
+                    if shift is not None:
+                        # The stroke as last laid, at this scale and turn: the
+                        # same pixels, at most moved (a pan) - no laying it all
+                        # again. Just drawn, it is the live render itself.
+                        painter.drawImage(render[2] + shift, render[1])
+                        continue
+                    tint = getattr(mark, 'history', None)
+                    picture = self._history_picture() if tint is not None else None
+                    made = brushes.paint_stamps(
+                        painter, brushes.load_texture(mark.texture), mark.stamps,
+                        view, (canvas_width, canvas_height), flat=getattr(mark, 'flat', False),
+                        history=(picture, tint) if picture is not None else None)
+                    if made is not None and made[2] and on_screen:
+                        mark.render = (QTransform(view), made[0], made[1])
+                    continue
                 if len(mark) < 2:
                     continue
                 # Honour the antialiasing toggle for brush strokes. The old
@@ -958,27 +1505,119 @@ class RandomImageViewer(QMainWindow):
                 # on once anything was rotated; this keeps one answer.
                 # Size and colour come from the stroke itself when it carries
                 # them, so editing the brush never restyles older strokes.
-                base = getattr(mark, 'thickness', None) or self.line_thickness
+                base = (getattr(mark, 'thickness', None) or self.line_thickness) * self._export_pen_scale
                 ink = getattr(mark, 'color', None) or self.line_color
                 smooth = bool(self.line_antialiasing) and base > 1
                 painter.setRenderHint(QPainter.Antialiasing, smooth)
                 painter.setRenderHint(QPainter.SmoothPixmapTransform, smooth)
+                # Runs of one width go down as one polyline, a C++ call instead
+                # of one per segment. See-through ink stays segment by segment,
+                # as the live preview draws it, where the overlaps show.
+                opaque = ink.alpha() == 255
+                run = [QPoint(*to_display(mark[0][0], mark[0][1]))]
+                run_width = None
                 for i in range(len(mark) - 1):
                     a, b = mark[i], mark[i + 1]
-                    ax, ay, ap = (a if len(a) == 3 else (a[0], a[1], 1.0))
-                    bx, by, bp = (b if len(b) == 3 else (b[0], b[1], 1.0))
+                    ap = a[2] if len(a) == 3 else 1.0
+                    bp = b[2] if len(b) == 3 else 1.0
                     thickness = self._pressure_to_thickness((ap + bp) / 2.0, base)
-                    painter.setPen(QPen(ink, thickness, Qt.SolidLine,
-                                        Qt.RoundCap, Qt.RoundJoin))
-                    dax, day = to_display(ax, ay)
-                    dbx, dby = to_display(bx, by)
-                    painter.drawLine(dax, day, dbx, dby)
+                    if len(run) > 1 and (thickness != run_width or not opaque):
+                        painter.setPen(QPen(ink, run_width, Qt.SolidLine,
+                                            Qt.RoundCap, Qt.RoundJoin))
+                        painter.drawPolyline(run)
+                        run = run[-1:]
+                    run_width = thickness
+                    run.append(QPoint(*to_display(b[0], b[1])))
+                painter.setPen(QPen(ink, run_width, Qt.SolidLine,
+                                    Qt.RoundCap, Qt.RoundJoin))
+                painter.drawPolyline(run)
                 painter.setRenderHint(QPainter.Antialiasing, False)
 
             elif kind == 'fill':
                 self._paint_one_fill(painter, mark, to_display)
 
+            elif kind == 'image':
+                self._paint_snapshot(painter, mark, to_display, unrot_w, unrot_h)
+
+            elif kind == 'erase':
+                self._paint_erase_stroke(painter, mark, to_display, scale_x)
+
         painter.setPen(pen)
+
+    def _studio_guide_offset(self):
+        """◧ Studio: where the picture starts on the sheet (picture px), for
+        the guides copied onto the canvas - None when there are none to copy
+        (Studio off, or laying marks for a file: the copies are a drawing
+        aid, the saved picture keeps only what was drawn)."""
+        if not self.studio_mode or self._exporting or not self.current_image:
+            return None
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return None
+        return self._studio_offset(base)
+
+    @staticmethod
+    def _with_studio_guides(marks, off, hidden=None):
+        """*marks*, each guide drawn on the picture followed by a copy at the
+        same place on the canvas: vertical ruler lines, free lines and
+        polylines - lines to measure against while painting what you see.
+        Horizontal ruler lines span both sides already. A guide reaching
+        onto the canvas is left as it is. Copies, made as they are painted:
+        moving, undoing or hiding the guide takes its copy with it."""
+        def shifted(p):
+            if isinstance(p, QPointF):
+                return QPointF(p.x() - off, p.y())
+            return (p[0] - off, *p[1:])
+
+        def x_of(p):
+            return p.x() if isinstance(p, QPointF) else p[0]
+
+        for kind, mark in marks:
+            yield kind, mark
+            if hidden and id(mark) in hidden:
+                continue
+            if kind == 'line':
+                if float(mark) >= off:
+                    yield kind, (RulerLine(float(mark) - off, getattr(mark, 'thickness', None),
+                                           getattr(mark, 'color', None))
+                                 if isinstance(mark, RulerLine) else mark - off)
+            elif kind == 'free_line':
+                if min(x_of(mark['start']), x_of(mark['end'])) >= off:
+                    copy = dict(mark)
+                    copy['start'], copy['end'] = shifted(mark['start']), shifted(mark['end'])
+                    yield kind, copy
+            elif kind == 'fill' and mark.get('shape') == 'polyline':
+                points = mark.get('points') or []
+                if points and min(x_of(p) for p in points) >= off:
+                    copy = dict(mark)
+                    copy['points'] = [shifted(p) for p in points]
+                    yield kind, copy
+
+    @staticmethod
+    def _picture_to_display(to_display, unrot_w, unrot_h):
+        """*to_display* as a QTransform, so it can be inverted and carry
+        whole images. It is affine (scale, flip, quarter turns, offset), so
+        where it sends three corners of the picture pins it down."""
+        x0, y0 = to_display(0, 0)
+        xw, yw = to_display(unrot_w, 0)
+        xh, yh = to_display(0, unrot_h)
+        return QTransform((xw - x0) / unrot_w, (yw - y0) / unrot_w,
+                          (xh - x0) / unrot_h, (yh - y0) / unrot_h, x0, y0)
+
+    def _paint_snapshot(self, painter, snap, to_display, unrot_w, unrot_h):
+        """A 📸 snapshot: its image stretched between where its top-left,
+        top-right and bottom-left corners now land."""
+        image = snap['image']
+        t = self._picture_to_display(to_display, unrot_w, unrot_h)
+        p0, p1, p2 = (t.map(QPointF(x, y)) for x, y in snap['corners'])
+        w, h = image.width(), image.height()
+        painter.save()
+        painter.setTransform(QTransform((p1.x() - p0.x()) / w, (p1.y() - p0.y()) / w,
+                                        (p2.x() - p0.x()) / h, (p2.y() - p0.y()) / h,
+                                        p0.x(), p0.y()), True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawImage(0, 0, image)
+        painter.restore()
 
     def _paint_one_fill(self, painter, fill, to_display, antialias=True):
         """Paint a single filled shape (lasso / rectangle / ellipse), or a
@@ -993,7 +1632,7 @@ class RandomImageViewer(QMainWindow):
                 return
             painter.setRenderHint(QPainter.Antialiasing, antialias)
             painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(color, fill.get('thickness') or self.line_thickness,
+            painter.setPen(QPen(color, (fill.get('thickness') or self.line_thickness) * self._export_pen_scale,
                                 Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             corners = [QPoint(*to_display(x, y)) for x, y in points]
             if fill.get('closed'):
@@ -1034,9 +1673,9 @@ class RandomImageViewer(QMainWindow):
             if getattr(self, 'line_transparency', 255) < 255:
                 self.display_image(self.current_image)
                 return
-            # 🧽 Eraser active: the fast overlay path paints onto the already-drawn
-            # pixmap and cannot reveal the clean image. Use the full erase-aware path.
-            if self.erase_strokes or self.current_erase_stroke:
+            # Erased marks, layer opacity and blend modes: the fast overlay path
+            # paints onto the already-drawn pixmap, so they would pile up.
+            if not self._layers_plain() or self.current_erase_stroke:
                 self.display_image(self.current_image)
                 return
             # Get currently displayed pixmap (may already have LUT/enhancements applied)
@@ -1236,8 +1875,24 @@ class RandomImageViewer(QMainWindow):
         # For each committed erase stroke, snapshot how many free strokes/lines existed
         # at that moment. Drawings added AFTER the most recent erase are kept visible
         # inside erase holes, so you can draw again over an erased area.
-        self._erase_state_marks = []  # Parallel to erase_strokes: [{'free_strokes': n, 'free_lines': n}]
         self._undo_stack = []  # Chronological record: 'line'|'hline'|'free_line'|'free_stroke'|'erase'
+
+        # Marks live in layers, bottom to top. The lists above are always the
+        # active layer's own lists (see _bind_layer).
+        self.layers = [Layer("Layer 1")]
+        self._layer_count = 1               # for naming new layers
+        self._bind_layer(self.layers[0])
+        self._layer_window = None
+        self._layer_window_pos = None
+        self.canvas_color = QColor(self._settings.value("canvas_color", "#000000"))
+        if not self.canvas_color.isValid():
+            self.canvas_color = QColor(Qt.black)
+        self._canvas_popup = None
+        self._canvas_popup_pos = None
+        self._layer_redraw_timer = QTimer(self)
+        self._layer_redraw_timer.setSingleShot(True)
+        self._layer_redraw_timer.setInterval(30)
+        self._layer_redraw_timer.timeout.connect(self._redraw_layers)
         self.current_erase_stroke = None  # Stroke being drawn
         self.is_erasing = False  # Track if currently erasing
         self.eraser_cache = None  # Precomputed coord-mapping geometry during a stroke
@@ -1257,9 +1912,34 @@ class RandomImageViewer(QMainWindow):
         self.line_preview_timer.setInterval(16)
         self.line_preview_timer.timeout.connect(self._flush_line_preview)
         self.current_stroke = None  # NEW: Current stroke being drawn
+        self._stroke_base = None    # the view under the stroke being drawn
+        self._fx_live = None        # (under, over) for a stroke drawn under the effects
+        self._view_in_motion = False    # zoom / pan under way: marks follow cheaply
+        self._touch_pan = None          # Wacom two-finger pan, see _start_touch_pan
+        QTimer.singleShot(0, self._start_touch_pan)
+        self._settle_wanted = {}        # layer id -> (w, h, view) to lay once it rests
+        self._settle_job = None
+        self._blend_under = None    # Blend: what is under the stroke, as Sample reads it
         self.is_drawing = False  # NEW: Track if currently drawing a stroke
         self.lines_visible = True  # New: Toggle line visibility
         self.image_visible = True  # New: Toggle image visibility
+        # The canvas under the picture (a QColor, or None): the sheet that
+        # shows where the picture is while the picture is hidden - the
+        # stack is Background, Canvas, Picture, then the layers. Goes with
+        # the drawing (see clear_lines).
+        self.under_canvas = None
+        self.under_canvas_visible = True    # its tick in 📚 (it is there once made)
+        # ◧ Studio: a blank canvas the picture's size beside it, on the left,
+        # to paint a copy of what is on the right (see _studio_sheet). It
+        # stays on from picture to picture until switched off.
+        self.studio_mode = False
+        self._studio_kept = None    # (picture's cacheKey, sheet, picture's x on it)
+        # The picture layer's own look (🖼 Picture in 📚): mixed into the
+        # canvas under it, or the background, like any layer into its below.
+        self.picture_opacity = 100
+        self.picture_blend = 'Normal'
+        self._under_sheet = Layer("Canvas")
+        self._sketch_hid_picture = False    # new sketch hid it: shown again with the drawing gone
         self.line_thickness = 5  # Default line thickness (increased for better pen pressure visibility)
         self.line_color = QColor("#FFFFFF")  # Default white color
         self.line_transparency = 255  # Line transparency (0=fully transparent, 255=fully opaque)
@@ -1270,6 +1950,26 @@ class RandomImageViewer(QMainWindow):
         self._current_pressure = 1.0  # 🎨 NEW: Current pressure value for real-time painting
         self._tablet_pressure = 1.0  # 🎨 NEW: Stored tablet pressure for mouse event compatibility
         self._last_pressure = 1.0  # 🎨 NEW: Last pressure for smoothing interpolation
+        self._tablet_tilt = None    # (xTilt, yTilt) of the last tablet event ...
+        self._tablet_tilt_time = 0.0   # ... and when, so a mouse later doesn't inherit it
+        # 🖌 Brush tip: Round, or a PNG texture with its settings (remembered)
+        self.brush_settings = dict(brushes.DEFAULT_SETTINGS)
+        try:
+            self.brush_settings.update(json.loads(self._settings.value("brush_settings", "{}")))
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.brush_textures = [p for p in json.loads(self._settings.value("brush_textures", "[]"))
+                                   if os.path.isfile(p)]
+        except (TypeError, ValueError):
+            self.brush_textures = []
+        if (self.brush_settings['texture'] and self.brush_settings['texture'] not in (brushes.BRISTLES, brushes.DUST, brushes.SPRAY, brushes.RAKE)
+                and not os.path.isfile(self.brush_settings['texture'])):
+            self.brush_settings['texture'] = ''
+        self._brush_window = None
+        self._brush_window_pos = None
+        self._stamp_trail = None    # the textured stroke being drawn
+        self._flat_live = None      # its buffers, when it does not build up
         # Fixed overlay tools (non-interactive, passive overlays over the image)
         self.crosshair_overlay = False  # Draw cross lines at image center
         self.grid_overlay = False       # Draw 3x3 grid over the image
@@ -1389,6 +2089,13 @@ class RandomImageViewer(QMainWindow):
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
 
+        # ✂ Crop: the frame is kept as 0..1 fractions of the picture as shown,
+        # so it follows zoom, pan and window resizes untouched.
+        self.crop_mode = False
+        self._crop_sel = None               # QRectF, or None with no frame yet
+        self._crop_path = None              # the picture the frame was drawn on
+        self._crop_drag = None              # (grabbed part, frame at press, press pos)
+
         # Frame playback: ⚡ in fps units plays the folder's pictures, in
         # alphabetical order, as a film (see _start_frame_playback).
         self._fps_mode = False
@@ -1406,7 +2113,7 @@ class RandomImageViewer(QMainWindow):
         self._frame_timer.timeout.connect(self._on_frame_tick)
 
         # Sorting mode for navigation
-        self.random_mode = True  # Default to random mode
+        self.random_mode = False  # Default to alphabetical order
         
         # Store original window flags for UI toggle
         self.original_window_flags = None
@@ -1590,6 +2297,48 @@ class RandomImageViewer(QMainWindow):
         # widgets upward; disabling it lets them sit vertically centered.
         self.status.setSizeGripEnabled(False)
 
+        # Left end: ⟲ (fit the picture to the window) and the zoom in % of
+        # the picture's real size. Then the messages - in a label of their
+        # own: a status bar hides whatever sits on its left while it shows a
+        # message, and the app shows one at nearly every step.
+        zoom_box = QWidget()
+        zoom_row = QHBoxLayout(zoom_box)
+        zoom_row.setContentsMargins(4, 0, 6, 0)
+        zoom_row.setSpacing(2)
+        self.zoom_reset_btn = QToolButton()
+        self.zoom_reset_btn.setText("⟲")
+        self.zoom_reset_btn.setAutoRaise(True)
+        self.zoom_reset_btn.setToolTip("Fit the picture to the window (Ctrl+0)")
+        self.zoom_reset_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_reset_btn.clicked.connect(lambda: self.reset_zoom())
+        zoom_row.addWidget(self.zoom_reset_btn)
+        self.zoom_label = QLabel("")
+        self.zoom_label.setToolTip("Zoom: the picture shown at this % of its real size")
+        self.zoom_label.setStyleSheet("QLabel { color: #b8bcc0; font-size: 10px; min-width: 38px; }")
+        zoom_row.addWidget(self.zoom_label)
+        self.status.addWidget(zoom_box)
+        self._status_text = QLabel("")
+        self._status_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status.addWidget(self._status_text, 1)
+        self._busy_line = _BusyLine(self.status)
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._status_text.clear)
+
+        def show_message(text, timeout=0):
+            self._status_text.setText(text)
+            if timeout:
+                self._status_timer.start(int(timeout))
+            else:
+                self._status_timer.stop()
+
+        def clear_message():
+            self._status_timer.stop()
+            self._status_text.clear()
+        self.status.showMessage = show_message
+        self.status.clearMessage = clear_message
+        self.status.currentMessage = lambda: self._status_text.text()
+
         # Build/startup readout for developers: deliberately small and dim so
         # it reads as instrumentation rather than UI. Filled in by
         # report_startup_ready() once the window is interactive (the version
@@ -1598,6 +2347,16 @@ class RandomImageViewer(QMainWindow):
         self.startup_label.setStyleSheet(
             "QLabel { color: #5f6368; font-size: 10px; padding-right: 8px; }")
         self.statusBar().addPermanentWidget(self.startup_label)
+
+        # Which layer the brush is on: a small chip by the file name (click:
+        # 📚), shown once there is more than one layer to mix up.
+        self.layer_chip = QToolButton()
+        self.layer_chip.setAutoRaise(True)
+        self.layer_chip.setCursor(Qt.PointingHandCursor)
+        self.layer_chip.clicked.connect(
+            lambda: self.layers_btn.click() if hasattr(self, 'layers_btn') else None)
+        self.layer_chip.hide()
+        self.statusBar().addPermanentWidget(self.layer_chip)
 
         self.path_label = QLabel()
 
@@ -1763,6 +2522,20 @@ class RandomImageViewer(QMainWindow):
         self.i_shortcut = QShortcut("I", self)
         self.i_shortcut.activated.connect(self._shortcut_color_snap)
 
+        # Brush size: [ smaller, ] bigger (held down it keeps going)
+        self._size_shortcuts = []
+        for key, sign in (("[", -1), ("]", 1)):
+            sc = QShortcut(key, self)
+            sc.activated.connect(lambda s=sign: self.step_brush_size(s))
+            self._size_shortcuts.append(sc)
+
+        # Brush mode: 1 Paint, 2 Blend, 3 Smudge, 4 History, 5 Pick blend, 6 Erase
+        self._mode_shortcuts = []
+        for i, mode in enumerate(brushes.MODES, 1):
+            sc = QShortcut(str(i), self)
+            sc.activated.connect(lambda m=mode: self.set_brush_mode(m))
+            self._mode_shortcuts.append(sc)
+
         # Slideshow on / off: the grid's ▶ in the grid, ⚡ auto-advance otherwise
         self.tab_shortcut = QShortcut("Tab", self)
         self.tab_shortcut.activated.connect(self.toggle_slideshow)
@@ -1781,11 +2554,49 @@ class RandomImageViewer(QMainWindow):
             sc.setEnabled(False)
             self._polygon_shortcuts.append(sc)
 
+        self.l_shortcut = QShortcut("L", self)
+        self.l_shortcut.activated.connect(lambda: self.layers_btn.toggle())
+
+        self.c_shortcut = QShortcut("C", self)
+        self.c_shortcut.activated.connect(lambda: self.crop_btn.toggle())
+
+        # ⬚ Select + transform on / off; Ctrl+A takes every mark on the layer
+        self.v_shortcut = QShortcut("V", self)
+        self.v_shortcut.activated.connect(lambda: self.select_tool_btn.toggle())
+        self.ctrl_a_shortcut = QShortcut("Ctrl+A", self)
+        self.ctrl_a_shortcut.activated.connect(self.select_all_marks)
+
+        # Enter applies a crop; only enabled while a frame is on the picture.
+        self._crop_shortcuts = []
+        for key in ("Return", "Enter"):
+            sc = QShortcut(key, self)
+            sc.activated.connect(self.apply_crop)
+            sc.setEnabled(False)
+            self._crop_shortcuts.append(sc)
+        # ... and a transform, while one is under way (never both at once:
+        # the crop tool and ⬚ exclude each other).
+        self._sel_shortcuts = []
+        for key in ("Return", "Enter"):
+            sc = QShortcut(key, self)
+            sc.activated.connect(self.commit_selection)
+            sc.setEnabled(False)
+            self._sel_shortcuts.append(sc)
+
         print("Global shortcuts set up successfully")
 
     def emergency_exit_fullscreen(self):
         """Emergency exit from fullscreen or minimal mode"""
         print("EMERGENCY: Escape shortcut activated")
+        if self._sel is not None or self._sel_lasso is not None:
+            self._sel_lasso = None
+            self.cancel_selection()
+            self.image_label.update()
+            self.status.showMessage("Transform cancelled")
+            return
+        if self.crop_mode:
+            self.crop_btn.setChecked(False)
+            self.status.showMessage("Crop cancelled")
+            return
         if self._placing_polygon():
             label = "Polyline" if self.current_fill.get('shape') == 'polyline' else "Polygon"
             self.cancel_fill()
@@ -1842,7 +2653,10 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.new_canvas_btn = QToolButton(); self.new_canvas_btn.setText("📝"); self.new_canvas_btn.setToolTip("New sketch: blank mid-grey canvas with the free-draw tool ready \u2014 save it with 💾"); self.new_canvas_btn.setFixedSize(24,24); self.new_canvas_btn.clicked.connect(self.new_draw_canvas); toolbar.addWidget(self.new_canvas_btn)
         add_spacer(2)
-        self.save_btn = save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view to Downloads (includes LUT, enhancements and lines)"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self.save_current_view); toolbar.addWidget(save_btn)
+        self.studio_btn = QToolButton(); self.studio_btn.setText("◧"); self.studio_btn.setToolTip("Studio: a blank grey canvas the size of the picture beside it, on the left, with the brush ready — paint what you see on the right. Stays on from picture to picture; 💾 saves both side by side"); self.studio_btn.setCheckable(True); self.studio_btn.setFixedSize(24,24); self.studio_btn.toggled.connect(self.toggle_studio_mode); toolbar.addWidget(self.studio_btn)
+        add_spacer(2)
+        self.save_btn = save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view to Downloads (includes LUT, enhancements and lines). In ◧ Studio: choose the painting, the picture or both, at 1× / 2× / 4×. Right-click: those choices any time"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self._save_clicked); save_btn.setContextMenuPolicy(Qt.CustomContextMenu); save_btn.customContextMenuRequested.connect(lambda pos: self.show_save_menu(self.save_btn.mapToGlobal(pos))); toolbar.addWidget(save_btn)
+        self.crop_btn = QToolButton(); self.crop_btn.setText("✂"); self.crop_btn.setFont(QFont("Segoe UI Symbol", 11)); self.crop_btn.setToolTip("Crop (C): drag a frame, then Enter or double-click — what is inside stays. Saved as a new picture in Downloads, the original is kept"); self.crop_btn.setCheckable(True); self.crop_btn.setFixedSize(24,24); self.crop_btn.toggled.connect(self.toggle_crop_tool); toolbar.addWidget(self.crop_btn)
         add_section_divider()
 
         # ── SECTION: Draw Tools ──
@@ -1864,9 +2678,12 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.triangle_fill_btn = QToolButton(); self.triangle_fill_btn.setText("\u25b2"); self.triangle_fill_btn.setToolTip("Triangle Fill: drag out a filled triangle \u2014 drag down for one pointing up, drag up for one pointing down"); self.triangle_fill_btn.setCheckable(True); self.triangle_fill_btn.setFixedSize(24,24); self.triangle_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('triangle', c)); toolbar.addWidget(self.triangle_fill_btn)
         add_spacer(2)
+        self.layers_btn = QToolButton(); self.layers_btn.setText("📚"); self.layers_btn.setToolTip("Layers (L): opacity and blend mode for what you have already drawn"); self.layers_btn.setCheckable(True); self.layers_btn.setFixedSize(24,24); self.layers_btn.toggled.connect(self.toggle_layer_window); toolbar.addWidget(self.layers_btn)
+        self.snapshot_layer_btn = QToolButton(); self.snapshot_layer_btn.setText("📸"); self.snapshot_layer_btn.setToolTip("Snapshot to layer: what is on screen now (effects and marks too) onto a new layer, like 💾 saves it"); self.snapshot_layer_btn.setFixedSize(24,24); self.snapshot_layer_btn.clicked.connect(self.snapshot_to_layer); toolbar.addWidget(self.snapshot_layer_btn)
         self.free_draw_tool_btn = QToolButton(); self.free_draw_tool_btn.setText("✏"); self.free_draw_tool_btn.setToolTip("Free Draw Tool (drag to draw)"); self.free_draw_tool_btn.setCheckable(True); self.free_draw_tool_btn.setFixedSize(24,24); self.free_draw_tool_btn.toggled.connect(self.toggle_free_draw); toolbar.addWidget(self.free_draw_tool_btn)
         add_spacer(2)
-        self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Eraser (erase parts of lines/drawings, not the image)"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_eraser); toolbar.addWidget(self.eraser_tool_btn)
+        self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Erase with the brush (6): the brush rubs out what is drawn on the selected layer - with its tip, size, pressure and opacity, never the picture. Click again for the mode it was in"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_brush_erase); toolbar.addWidget(self.eraser_tool_btn)
+        self.select_tool_btn = QToolButton(); self.select_tool_btn.setText("⬚"); self.select_tool_btn.setToolTip("Select + transform (V): draw a lasso round marks on the selected layer (or click one, Ctrl+A for all), then drag inside to move, a corner to scale, outside to turn (Shift: 15° steps). Enter or double-click applies, Esc cancels, Ctrl+Z undoes. Strokes stay sharp at any size"); self.select_tool_btn.setCheckable(True); self.select_tool_btn.setFixedSize(24,24); self.select_tool_btn.toggled.connect(self.toggle_select_tool); toolbar.addWidget(self.select_tool_btn)
         add_spacer(2)
         # Matches the brush range: erasing a 400px stroke with a 30px eraser is hopeless.
         self.eraser_size_spin = QSpinBox(); self.eraser_size_spin.setRange(1,400); self.eraser_size_spin.setValue(self.eraser_size); self.eraser_size_spin.setSuffix("px"); self.eraser_size_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.eraser_size_spin.setAlignment(Qt.AlignCenter); self.eraser_size_spin.setFixedHeight(24); self.eraser_size_spin.setFixedWidth(58); self.eraser_size_spin.setToolTip("Eraser size (1-400px)"); self.eraser_size_spin.valueChanged.connect(self.update_eraser_size); toolbar.addWidget(self.eraser_size_spin)
@@ -1919,20 +2736,39 @@ class RandomImageViewer(QMainWindow):
         _bs.addWidget(self.line_thickness_label)
         self.brush_size_widget.setFixedHeight(24)
         toolbar.addWidget(self.brush_size_widget)
+        self.brush_texture_btn = QToolButton(); self.brush_texture_btn.setText("🖌"); self.brush_texture_btn.setCheckable(True); self.brush_texture_btn.setFixedSize(24,24); self.brush_texture_btn.toggled.connect(self.toggle_brush_window); toolbar.addWidget(self.brush_texture_btn)
+        self.brush_mode_btn = QToolButton(); self.brush_mode_btn.setFixedSize(24,24); self.brush_mode_btn.clicked.connect(self.cycle_brush_mode); toolbar.addWidget(self.brush_mode_btn)
+        self._update_brush_button()
+        self._update_brush_mode_button()
         add_spacer(4)
         trans_label = QLabel("T:")
         trans_label.setFixedWidth(12)
         trans_label.setStyleSheet("font-size: 9px; margin-right: 2px;")
         trans_label.setToolTip("Line Transparency")
         toolbar.addWidget(trans_label)
-        self.line_transparency_slider = QSlider(Qt.Horizontal)
+        # Opacity: jumps to where you click (a plain QSlider only paged
+        # towards it, so 5 % or 95 % took a long drag on a 60 px track), with
+        # the value shown alongside; wheel / arrow keys step by 5 %.
+        self.line_opacity_widget = QWidget()
+        _op = QHBoxLayout(self.line_opacity_widget)
+        _op.setContentsMargins(0, 0, 0, 0); _op.setSpacing(4)
+        self.line_transparency_slider = ClickableSlider(Qt.Horizontal)
         self.line_transparency_slider.setRange(0, 255)
+        self.line_transparency_slider.setSingleStep(13)
+        self.line_transparency_slider.setPageStep(26)
         self.line_transparency_slider.setValue(self.line_transparency)
-        self.line_transparency_slider.setFixedWidth(60)
-        self.line_transparency_slider.setFixedHeight(24)
-        self.line_transparency_slider.setToolTip("Line Transparency: 0=Transparent, 255=Opaque")
+        self.line_transparency_slider.setFixedWidth(84)
+        self.line_transparency_slider.setFixedHeight(20)
+        self.line_transparency_slider.setToolTip("Opacity of the next marks: click anywhere on the track to jump there")
         self.line_transparency_slider.valueChanged.connect(self.update_line_transparency)
-        toolbar.addWidget(self.line_transparency_slider)
+        _op.addWidget(self.line_transparency_slider)
+        self.line_opacity_label = QLabel(f"{round(self.line_transparency * 100 / 255)}%")
+        self.line_opacity_label.setFixedWidth(38)
+        self.line_opacity_label.setStyleSheet("font-size: 10px; color: #b8bcc0;")
+        self.line_opacity_label.setToolTip("Opacity of the next marks")
+        _op.addWidget(self.line_opacity_label)
+        self.line_opacity_widget.setFixedHeight(24)
+        toolbar.addWidget(self.line_opacity_widget)
         add_spacer(4)
         self.antialiasing_btn = QToolButton(); self.antialiasing_btn.setText("✨"); self.antialiasing_btn.setToolTip("Toggle Line Antialiasing (Smoother Lines)"); self.antialiasing_btn.setCheckable(True); self.antialiasing_btn.setChecked(self.line_antialiasing); self.antialiasing_btn.setFixedSize(24,24); self.antialiasing_btn.toggled.connect(self.toggle_line_antialiasing); toolbar.addWidget(self.antialiasing_btn)
         add_spacer(2)
@@ -1956,7 +2792,7 @@ class RandomImageViewer(QMainWindow):
         # ── SECTION: Visibility ──
         self.clear_lines_btn = clear_lines_btn = QToolButton(); clear_lines_btn.setText("🗑"); clear_lines_btn.setToolTip("Clear All Lines"); clear_lines_btn.setFixedSize(24,24); clear_lines_btn.clicked.connect(self.clear_lines); toolbar.addWidget(clear_lines_btn)
         add_spacer(2)
-        self.toggle_lines_btn = QToolButton(); self.toggle_lines_btn.setText("👁"); self.toggle_lines_btn.setToolTip("Toggle Line Visibility On/Off"); self.toggle_lines_btn.setCheckable(True); self.toggle_lines_btn.setChecked(True); self.toggle_lines_btn.setFixedSize(24,24); self.toggle_lines_btn.toggled.connect(self.toggle_line_visibility); toolbar.addWidget(self.toggle_lines_btn)
+        self.toggle_lines_btn = QToolButton(); self.toggle_lines_btn.setText("👁"); self.toggle_lines_btn.setToolTip("Hide guides (ruler lines, free lines, polylines) - what is painted stays"); self.toggle_lines_btn.setCheckable(True); self.toggle_lines_btn.setChecked(True); self.toggle_lines_btn.setFixedSize(24,24); self.toggle_lines_btn.toggled.connect(self.toggle_line_visibility); toolbar.addWidget(self.toggle_lines_btn)
         add_spacer(2)
         self.toggle_image_btn = QToolButton(); self.toggle_image_btn.setText("🖼"); self.toggle_image_btn.setToolTip("Toggle Image Visibility (keep lines visible)"); self.toggle_image_btn.setCheckable(True); self.toggle_image_btn.setChecked(True); self.toggle_image_btn.setFixedSize(24,24); self.toggle_image_btn.toggled.connect(self.toggle_image_visibility); toolbar.addWidget(self.toggle_image_btn)
         add_section_divider()
@@ -1991,7 +2827,7 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.next_btn = next_btn = QToolButton(); next_btn.setText("🎲"); next_btn.setToolTip("Show Next Image"); next_btn.setFixedSize(24,24); next_btn.clicked.connect(self._manual_next_image); toolbar.addWidget(next_btn)
         add_spacer(2)
-        self.sort_order_button = QToolButton(); self.sort_order_button.setCheckable(True); self.sort_order_button.setChecked(True); self.sort_order_button.setText("🔀"); self.sort_order_button.setToolTip("Toggle Random/Alphabetical Order"); self.sort_order_button.setFixedSize(24,24); self.sort_order_button.toggled.connect(self.toggle_sort_order); toolbar.addWidget(self.sort_order_button)
+        self.sort_order_button = QToolButton(); self.sort_order_button.setCheckable(True); self.sort_order_button.setChecked(False); self.sort_order_button.setText("🔀"); self.sort_order_button.setToolTip("Toggle Random/Alphabetical Order"); self.sort_order_button.setFixedSize(24,24); self.sort_order_button.toggled.connect(self.toggle_sort_order); toolbar.addWidget(self.sort_order_button)
         add_spacer(2)
         # File Types palette: per-extension checkboxes that filter what you browse
         self.type_filter_btn = QToolButton(); self.type_filter_btn.setText("🗂"); self.type_filter_btn.setToolTip("File Types: show only the file types you check (e.g. only MP4 or GIF)"); self.type_filter_btn.setCheckable(True); self.type_filter_btn.setFixedSize(24,24); self.type_filter_btn.toggled.connect(self._toggle_type_filter_window); toolbar.addWidget(self.type_filter_btn)
@@ -2187,7 +3023,7 @@ class RandomImageViewer(QMainWindow):
         # exist are added, so this is resilient to future changes.
         groups = [
             ("FILE / NAV", [
-                'open_btn', 'add_mode_btn', 'new_canvas_btn', 'delete_file_btn', 'save_btn',
+                'open_btn', 'add_mode_btn', 'new_canvas_btn', 'studio_btn', 'delete_file_btn', 'save_btn', 'crop_btn',
                 'prev_btn', 'next_btn', 'sort_order_button', 'type_filter_btn',
                 'grid_view_btn', 'timer_button', 'timer_spin_box', 'timer_unit_btn', 'circle_timer', 'autoplay_next_btn',
                 'loop_btn',
@@ -2199,7 +3035,7 @@ class RandomImageViewer(QMainWindow):
             # brush, eraser size by the eraser). Colour used to be a separate
             # LINE / COLOR panel, a trip away from the brush every time.
             ("DRAW", [
-                'free_draw_tool_btn', 'brush_size_widget',
+                'free_draw_tool_btn', 'brush_size_widget', 'brush_texture_btn', 'brush_mode_btn',
                 'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn', 'polyline_btn',
                 '__sep__',
                 'lasso_fill_btn', 'polygon_fill_btn',
@@ -2208,13 +3044,17 @@ class RandomImageViewer(QMainWindow):
                 'line_color_btn', '__quick_colors__', 'color_snap_btn',
                 'palette_extract_btn', 'palette_clear_btn',
                 '__sep__',
-                'line_transparency_slider', 'antialiasing_btn', 'pen_pressure_btn',
+                'line_opacity_widget', 'antialiasing_btn', 'pen_pressure_btn',
                 '__sep__',
-                'eraser_tool_btn', 'eraser_size_spin',
+                # ⌫ is the brush in 🧽 Erase mode (its size is the brush size),
+                # so the old eraser's own size box is not placed.
+                'eraser_tool_btn', 'select_tool_btn',
                 'undo_line_btn', 'clear_lines_btn',
                 '__sep__',
                 'crosshair_tool_btn', 'grid_tool_btn',
-                'toggle_lines_btn', 'toggle_image_btn',
+                # The picture is shown / hidden by its own row in 📚 Layers now,
+                # so its toolbar button (toggle_image_btn) is not placed.
+                'toggle_lines_btn', 'layers_btn', 'snapshot_layer_btn',
             ]),
             ("EFFECTS", [
                 'grayscale_toggle_btn', 'contrast_toggle_btn', 'gamma_toggle_btn',
@@ -2469,6 +3309,8 @@ class RandomImageViewer(QMainWindow):
             panel.raise_()
             y -= gap
         self._save_panel_layout()
+        # 🎨 Color, 🖌 Brush and 📚 Layers close (they open docked again).
+        self.dock_panels()
 
     def _update_toolbar_layout(self, width):
         """Move sliders between main toolbar and second row based on window width"""
@@ -3079,9 +3921,40 @@ class RandomImageViewer(QMainWindow):
 
         # Store as original_pixmap so zoom helpers work
         self.original_pixmap = frame_pixmap
+        self._show_video_frame()
 
+    def _scale_frame(self):
+        """The current video / GIF frame fitted to the label, or just the
+        background layer while the picture is hidden."""
+        if self.image_visible:
+            return self._scale_pixmap(self.original_pixmap, self.current_image)
+        blank_pixmap = QPixmap(self.image_label.size())
+        blank_pixmap.fill(self.canvas_color)
+        return blank_pixmap
+
+    def _paint_frame_marks(self, final):
+        """Marks on a scaled video / GIF frame, *final*. Each frame is painted
+        from scratch, so they go on every one of them."""
+        if self.lines_visible and self.has_marks():
+            tx = self._compute_line_transform()
+            if tx:
+                painter = QPainter(final)
+                self._paint_marks(painter, final.width(), final.height(),
+                                  self.original_pixmap.size(), tx['scale_x'], tx['scale_y'],
+                                  tx['draw_x'], tx['draw_y'])
+                painter.end()
+        return final
+
+    def _redraw_paused_video_frame(self):
+        """No new frame arrives while paused, so what changes on screen (marks,
+        zoom, pan) has to be put on the frozen one here."""
+        if self._video_last_scaled is not None and not self.image_label.is_video_playing():
+            self._show_video_frame()
+
+    def _show_video_frame(self):
+        """Put the current frame on screen with marks and subtitles."""
         # --- Scale / zoom / pan ---
-        final = self._scale_pixmap(frame_pixmap, self.current_image)
+        final = self._paint_frame_marks(self._scale_frame())
         final = self._apply_fixed_overlays_to_pixmap(final)
         # Keep a subtitle-free copy so toggling/seeking can redraw instantly
         self._video_last_scaled = final
@@ -3610,7 +4483,7 @@ class RandomImageViewer(QMainWindow):
         self.original_pixmap = frame_pixmap
 
         # --- Scale / zoom / pan ---
-        final = self._scale_pixmap(frame_pixmap, self.current_image)
+        final = self._paint_frame_marks(self._scale_frame())
         final = self._apply_fixed_overlays_to_pixmap(final)
         self.image_label.setPixmap(final)
 
@@ -3743,10 +4616,51 @@ class RandomImageViewer(QMainWindow):
             # numpy not available — return unprocessed frame
             return pixmap
 
+    _BUSY_DISPLAY_S = 0.25      # a redraw slower than this last time shows the busy line
+
     def display_image(self, img_path):
+        """Show *img_path* with the effects and marks (see _display_image_now).
+
+        When the last redraw was slow (heavy effects over painted layers, a
+        huge picture) the busy line at the bottom of the status bar is drawn
+        first - the app does not answer until it is done, so it is drawn
+        right away, not left to the event loop."""
+        busy = getattr(self, '_busy_line', None)
+        shown = False
+        # What this redraw costs depends on which effects are on: keep a
+        # cost for each mix, and a heavy effect never timed yet counts as slow
+        # (the first object groups / form lines took ~0.7 s with no sign).
+        heavy = self._display_cost_key()
+        costs = getattr(self, '_display_costs', None)
+        if costs is None or len(costs) > 512:       # a long slideshow: start over
+            costs = self._display_costs = {}
+        expected = costs.get(heavy, 1.0 if any(heavy[1:]) else getattr(self, '_display_cost', 0.0))
+        if busy is not None and not busy.isVisible() and expected > self._BUSY_DISPLAY_S:
+            busy.show_progress(1.0)
+            busy.repaint()
+            shown = True
+        t0 = time.perf_counter()
+        try:
+            return self._display_image_now(img_path)
+        finally:
+            self._display_cost = costs[heavy] = time.perf_counter() - t0
+            if shown and getattr(self, '_settle_job', None) is None:
+                busy.hide()
+
+    def _display_cost_key(self):
+        """Which slow effects are on (with the picture): what a redraw's cost
+        depends on most."""
+        return (self.current_image,
+                bool(getattr(self, 'object_groups_enabled', False)),
+                bool(getattr(self, 'form_lines_enabled', False)),
+                bool(getattr(self, 'color_groups_enabled', False)),
+                bool(getattr(self, 'edge_detection_enabled', False)))
+
+    def _display_image_now(self, img_path):
         # Video files: redirect to video display with full enhancement support
         if is_video_file(img_path):
             if self._video_playing and self.current_image == img_path:
+                self._redraw_paused_video_frame()
                 return
             self._display_video(img_path)
             return
@@ -3773,18 +4687,10 @@ class RandomImageViewer(QMainWindow):
         if hasattr(self, 'current_image') and self.current_image != img_path:
             self.clear_lut_cache()
         
-        # Create cache key including enhancement settings, rotation, flips, and line information
-        lines_info = ""
-        if self.lines_visible and (self.has_marks()):
-            # Include line count and visibility in cache key since LUT processing differs with/without lines
-            vlines = len(self.drawn_lines) if self.drawn_lines else 0
-            hlines = len(self.drawn_horizontal_lines) if self.drawn_horizontal_lines else 0
-            flines = len(self.drawn_free_lines) if self.drawn_free_lines else 0
-            strokes = len(self.drawn_free_strokes) if self.drawn_free_strokes else 0
-            lines_info = f"_lines_{vlines}_{hlines}_{flines}_{strokes}_{len(self.drawn_fills)}_{self.line_color.name()}_{self.line_thickness}"
-        
-        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}-{self.value_filter_opacity}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}-{self.color_groups_opacity}_o{int(self.object_groups_enabled)}-{self.object_groups_mode}-{self.object_groups_detail}-{self.object_groups_min_size}-{self.object_groups_opacity}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_opacity}-{self.edge_color.name() if self.edge_color else 'def'}_f{int(self.form_lines_enabled)}-{self.form_lines_mode}-{self.form_lines_density}-{self.form_lines_smooth}-{self.form_lines_opacity}-{int(self.form_lines_over_image)}_cv{self._curves_signature()}-{self.line_color.name()}{lines_info}"
-        
+        # Cache key: enhancement settings, rotation and flips. This cache holds the
+        # picture before marks go on, so a new mark leaves it good.
+        cache_key = f"{img_path}_{self.grayscale_value}_{self.contrast_value}_{self.gamma_value}_{self.rotation_angle}_{self.flipped_h}_{self.flipped_v}_{self.current_lut_name}_{self.lut_strength}_v{int(self.value_filter_enabled)}-{self.value_levels}-{self.value_filter_opacity}_c{int(self.color_groups_enabled)}-{self.color_groups_count}-{self.color_groups_field}-{self.color_groups_opacity}_o{int(self.object_groups_enabled)}-{self.object_groups_mode}-{self.object_groups_detail}-{self.object_groups_min_size}-{self.object_groups_opacity}_e{int(self.edge_detection_enabled)}-{self.edge_mode}-{self.edge_sensitivity}-{self.edge_opacity}-{self.edge_color.name() if self.edge_color else 'def'}_f{int(self.form_lines_enabled)}-{self.form_lines_mode}-{self.form_lines_density}-{self.form_lines_smooth}-{self.form_lines_opacity}-{int(self.form_lines_over_image)}_cv{self._curves_signature()}-{self.line_color.name()}_s{int(self.studio_mode)}"
+
         # Check enhanced cache first
         if cache_key in self.enhancement_cache:
             pixmap = self.enhancement_cache[cache_key]
@@ -3802,50 +4708,7 @@ class RandomImageViewer(QMainWindow):
                 # Cache the base pixmap
                 self._manage_cache(self.pixmap_cache, img_path, base_pixmap)
             
-            # SMART LUT PROCESSING: Use full quality when lines are present
-            if self.lut_enabled and self.current_lut and self.lut_strength > 0:
-                # Check if we have cached LUT result (with lines)
-                lut_cache_key = self._get_lut_cache_key()
-                if (hasattr(self, '_lut_process_cache') and 
-                    lut_cache_key in self._lut_process_cache):
-                    # Use cached full-quality LUT result
-                    pixmap = self._lut_process_cache[lut_cache_key].copy()
-                else:
-                    # Need full LUT processing - use SAME processing path regardless of lines
-                    # Apply LUT BEFORE enhancements for correct color processing
-                    lut_pixmap = self.apply_lut_to_image(base_pixmap.copy(), self.current_lut, self.lut_strength)
-                    pixmap = self.apply_fast_enhancements(lut_pixmap)
-                    
-                    # No async processing - use direct processing for consistent results
-            elif self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
-                # Only basic enhancements needed
-                pixmap = self.apply_fast_enhancements(base_pixmap.copy())
-            else:
-                pixmap = base_pixmap
-
-            # Apply curves (classical RGB levels) AFTER color enhancements / LUT
-            if self.curves_enabled:
-                pixmap = self.apply_curves(pixmap)
-
-            # Apply value filter (posterize) AFTER color enhancements / LUT
-            if self.value_filter_enabled:
-                pixmap = self.apply_value_filter(pixmap)
-
-            # Apply color groups (palette quantization) AFTER tonal processing
-            if self.color_groups_enabled:
-                pixmap = self.apply_color_groups(pixmap)
-
-            # Apply object groups (per-object flattening) AFTER colour reduction
-            if self.object_groups_enabled:
-                pixmap = self.apply_object_groups(pixmap)
-
-            # Apply form lines (cross-contour line work) AFTER tonal processing
-            if self.form_lines_enabled:
-                pixmap = self.apply_form_lines(pixmap)
-
-            # Apply edge detection (plane changes) AFTER all tonal processing
-            if self.edge_detection_enabled:
-                pixmap = self.apply_edge_detection(pixmap)
+            pixmap = self._effect_chain(self._studio_sheet(base_pixmap))
 
             # Apply rotation and flips if needed
             if self.rotation_angle != 0 or self.flipped_h or self.flipped_v:
@@ -3872,9 +4735,20 @@ class RandomImageViewer(QMainWindow):
         
         # Cache the original for line drawing reference
         self.original_pixmap = pixmap.copy()
+        self._update_layer_chip()       # ✨ there follows the effects being on
+        self._update_zoom_readout()
         
         # Scale FIRST, then draw lines on the scaled version
         scaled_pixmap = self._scale_pixmap(pixmap, img_path)
+        # Layers with effects on go under them: picture + their paint, then
+        # the effects; the other layers are painted on top below.
+        fx_on = self._fx_layers_on()
+        if fx_on:
+            composite = self._fx_composite(img_path)
+            if composite is not None:
+                scaled_pixmap = composite
+            else:
+                fx_on = False
         
         # Draw lines on the scaled pixmap if any exist AND lines are visible
         if self.lines_visible and (self.has_marks()):
@@ -3912,32 +4786,17 @@ class RandomImageViewer(QMainWindow):
             # All mark types, in the order they were drawn, with rotation,
             # flips, scale and letterbox offset applied. See _paint_marks().
             self._paint_marks(painter, final_pixmap.width(), final_pixmap.height(),
-                              original_size, scale_x, scale_y, draw_x, draw_y)
+                              original_size, scale_x, scale_y, draw_x, draw_y,
+                              which=(lambda layer: not layer.effects) if fx_on else None)
             painter.end()
-            # 🧽 Eraser: restore the clean (line-free) image inside erase strokes,
-            # punching holes through only the line layer (not the photo).
             self._last_display_scale_x = scale_x
-            # Strokes drawn AFTER the most recent erase must survive the erase holes,
-            # so you can draw again over an erased area. Composite them onto the
-            # "revealed" image that the eraser exposes inside its holes.
-            reveal_pixmap = scaled_pixmap
-            if self.erase_strokes and self.current_erase_stroke is None and self._erase_state_marks:
-                mark = self._erase_state_marks[-1]
-                post_strokes = self.drawn_free_strokes[mark.get('free_strokes', 0):]
-                post_lines = self.drawn_free_lines[mark.get('free_lines', 0):]
-                if post_strokes or post_lines:
-                    reveal_pixmap = scaled_pixmap.copy()
-                    self._draw_post_erase_overlay(
-                        reveal_pixmap, post_strokes, post_lines,
-                        scale_x, scale_y, draw_x, draw_y, original_size)
-            self._apply_erase_holes(final_pixmap, reveal_pixmap, scale_x, scale_y, draw_x, draw_y, original_size)
             scaled_pixmap = final_pixmap
         
         # Handle image visibility toggle
         if not self.image_visible:
             # Create a blank pixmap with the same size but keep lines visible
             blank_pixmap = QPixmap(scaled_pixmap.size())
-            blank_pixmap.fill(Qt.black)  # Fill with black background
+            blank_pixmap.fill(self.canvas_color)  # The background layer
             
             # If there are lines, draw them on the blank pixmap
             if self.lines_visible and (self.has_marks()):
@@ -3968,20 +4827,6 @@ class RandomImageViewer(QMainWindow):
                 self._paint_marks(painter, blank_pixmap.width(), blank_pixmap.height(),
                                   original_size, scale_x, scale_y, draw_x, draw_y)
                 painter.end()
-                # 🧽 Eraser holes reveal the black background in image-hidden mode;
-                # marks drawn after the last erase stay on top of the holes.
-                _clean_black = QPixmap(blank_pixmap.size())
-                _clean_black.fill(Qt.black)
-                if self.erase_strokes and self.current_erase_stroke is None and self._erase_state_marks:
-                    mark = self._erase_state_marks[-1]
-                    post_strokes = self.drawn_free_strokes[mark.get('free_strokes', 0):]
-                    post_lines = self.drawn_free_lines[mark.get('free_lines', 0):]
-                    if post_strokes or post_lines:
-                        self._draw_post_erase_overlay(
-                            _clean_black, post_strokes, post_lines,
-                            scale_x, scale_y, draw_x, draw_y, original_size)
-                self._apply_erase_holes(blank_pixmap, _clean_black, scale_x, scale_y, draw_x, draw_y, original_size)
-            
             scaled_pixmap = blank_pixmap
         
         # Display the final scaled pixmap
@@ -3990,19 +4835,238 @@ class RandomImageViewer(QMainWindow):
         self.image_label.setToolTip("")
         self.current_image = img_path
 
+    def _effect_chain(self, base_pixmap, cached=True):
+        """*base_pixmap* through the view's effects, in order: LUT and the
+        basic enhancements, curves, value filter, colour groups, object
+        groups, form lines, edge detection. No rotation or flips.
+
+        *cached*: the LUT result may come from (and go to) the picture's own
+        LUT cache. Off for a one-off image (see _fx_composite): that cache is
+        keyed by the image object's id, which a later throwaway image can
+        reuse, so its entry is dropped again straight away.
+        """
+        # SMART LUT PROCESSING: Use full quality when lines are present
+        if self.lut_enabled and self.current_lut and self.lut_strength > 0 and not cached:
+            work = base_pixmap.copy()
+            key = f"lut_{id(work)}_{work.width()}x{work.height()}_{self.current_lut['file_path']}_{self.lut_strength}"
+            lut_pixmap = self.apply_lut_to_image(work, self.current_lut, self.lut_strength)
+            getattr(self, '_lut_process_cache', {}).pop(key, None)
+            pixmap = self.apply_fast_enhancements(lut_pixmap)
+        elif self.lut_enabled and self.current_lut and self.lut_strength > 0:
+            # Check if we have cached LUT result (with lines)
+            lut_cache_key = self._get_lut_cache_key()
+            if (hasattr(self, '_lut_process_cache') and 
+                lut_cache_key in self._lut_process_cache):
+                # Use cached full-quality LUT result
+                pixmap = self._lut_process_cache[lut_cache_key].copy()
+            else:
+                # Need full LUT processing - use SAME processing path regardless of lines
+                # Apply LUT BEFORE enhancements for correct color processing
+                lut_pixmap = self.apply_lut_to_image(base_pixmap.copy(), self.current_lut, self.lut_strength)
+                pixmap = self.apply_fast_enhancements(lut_pixmap)
+                
+                # No async processing - use direct processing for consistent results
+        elif self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0:
+            # Only basic enhancements needed
+            pixmap = self.apply_fast_enhancements(base_pixmap.copy())
+        else:
+            pixmap = base_pixmap
+
+        # Apply curves (classical RGB levels) AFTER color enhancements / LUT
+        if self.curves_enabled:
+            pixmap = self.apply_curves(pixmap)
+
+        # Apply value filter (posterize) AFTER color enhancements / LUT
+        if self.value_filter_enabled:
+            pixmap = self.apply_value_filter(pixmap)
+
+        # Apply color groups (palette quantization) AFTER tonal processing
+        if self.color_groups_enabled:
+            pixmap = self.apply_color_groups(pixmap)
+
+        # Apply object groups (per-object flattening) AFTER colour reduction
+        if self.object_groups_enabled:
+            pixmap = self.apply_object_groups(pixmap)
+
+        # Apply form lines (cross-contour line work) AFTER tonal processing
+        if self.form_lines_enabled:
+            pixmap = self.apply_form_lines(pixmap)
+
+        # Apply edge detection (plane changes) AFTER all tonal processing
+        if self.edge_detection_enabled:
+            pixmap = self.apply_edge_detection(pixmap)
+        return pixmap
+
+    def _any_effect_on(self):
+        """True when any of the view's effects changes the picture."""
+        return bool(self.grayscale_value > 0 or self.contrast_value != 50 or self.gamma_value != 0
+                    or (self.lut_enabled and self.current_lut and self.lut_strength > 0)
+                    or self.curves_enabled or self.value_filter_enabled
+                    or self.color_groups_enabled or self.object_groups_enabled
+                    or self.form_lines_enabled or self.edge_detection_enabled)
+
+    def _fx_layers_on(self):
+        """True when a shown layer with effects on has marks to put under
+        them, and some effect is on to put them under."""
+        return (self.lines_visible and self.image_visible
+                and any(layer.visible and layer.effects and layer.has_content()
+                        for layer in self.layers)
+                and self._any_effect_on())
+
+    def _fx_paint_signature(self):
+        """What is painted under the effects, as a key: effects that sample
+        the picture (colour groups' palette) must sample the paint too."""
+        return "|".join(layer.signature() for layer in self.layers
+                        if layer.visible and layer.effects)
+
+    def _effect_chain_over_paint(self, view, signature):
+        """_effect_chain on a view with paint in it, *signature* naming that
+        paint for the effects' own caches."""
+        self._effect_content_sig = signature
+        try:
+            return self._effect_chain(view, cached=False)
+        finally:
+            self._effect_content_sig = None
+
+    def _fx_view_params(self):
+        """(original size, scale x, scale y, draw x, draw y) of the view."""
+        original_size = self.original_pixmap.size()
+        label_size = self.image_label.size()
+        zoom = self.image_label.zoom_factor
+        fitted = original_size.scaled(label_size, Qt.KeepAspectRatio)
+        zw, zh = int(fitted.width() * zoom), int(fitted.height() * zoom)
+        draw_x = (label_size.width() - zw) // 2 + int(self.image_label.pan_offset_x)
+        draw_y = (label_size.height() - zh) // 2 + int(self.image_label.pan_offset_y)
+        return original_size, zw / original_size.width(), zh / original_size.height(), draw_x, draw_y
+
+    def _fx_under(self, img_path, allow=None):
+        """The plain picture fitted to the view with the effects layers
+        painted on: what the effects then run over (see _fx_composite)."""
+        if img_path in self.pixmap_cache:
+            base = self.pixmap_cache[img_path]
+        else:
+            base, error = safe_load_pixmap(img_path)
+            if error:
+                return None
+        base = self._studio_sheet(base)
+        turn_key = (base.cacheKey(), self.flipped_h, self.flipped_v, self.rotation_angle)
+        kept = getattr(self, '_fx_raw', None)
+        if kept is None or kept[0] != turn_key:
+            kept = self._fx_raw = (turn_key, self._apply_cached_transforms(base))
+        view = self._scale_pixmap(kept[1], img_path)
+        painter = QPainter(view)
+        self._paint_marks(painter, view.width(), view.height(), *self._fx_view_params(),
+                          which=allow or (lambda layer: layer.effects))
+        painter.end()
+        return view
+
+    def _fx_over(self):
+        """The layers with effects off, alone on a transparent view-sized
+        image: what goes over the effects."""
+        size = self.image_label.size()
+        over = QPixmap(size)
+        over.fill(Qt.transparent)
+        painter = QPainter(over)
+        self._paint_marks(painter, size.width(), size.height(), *self._fx_view_params(),
+                          which=lambda layer: not layer.effects)
+        painter.end()
+        return over
+
+    def _fx_composite(self, img_path):
+        """The view as display_image shows it, but with the effects layers
+        painted onto the plain picture *before* the effects run, so the LUT,
+        curves, groups ... apply to that paint as to the picture. At screen
+        size: the effects run again for every change to those layers, and on
+        the full-size picture each stroke would cost a second or more."""
+        view = self._fx_under(img_path)
+        if view is None:
+            return None
+        self._fx_palette_last = None
+        out = self._effect_chain_over_paint(view, self._fx_paint_signature())
+        # Kept: a stroke starting on this very view begins from it instead of
+        # running the whole view through the effects again (see
+        # _show_live_with_effects) - hundreds of ms with the slow ones.
+        self._fx_last_full = (self._fx_full_key(img_path, view.size()), out, self._fx_palette_last)
+        return out
+
+    _FX_SETTING_PREFIXES = ('grayscale_', 'contrast_', 'gamma_', 'lut_', 'current_lut',
+                            'curves_', 'value_', 'color_groups_', 'object_groups_',
+                            'form_lines_', 'edge_')
+
+    def _fx_full_key(self, img_path, size):
+        """Everything a view run through the effects depends on: the
+        picture, the view, the paint under the effects and the effects'
+        own settings."""
+        plain = (int, float, str, bool, type(None))
+        settings = tuple(sorted(
+            (k, v) for k, v in vars(self).items()
+            if k.startswith(self._FX_SETTING_PREFIXES) and isinstance(v, plain)))
+        colour = self.edge_color.rgba() if getattr(self, 'edge_color', None) is not None else None
+        return (img_path, size.width(), size.height(), self._fx_view_params()[1:],
+                self.rotation_angle, self.flipped_h, self.flipped_v, self.canvas_color.rgba(),
+                self._fx_paint_signature(), self._curves_signature(), colour, settings)
+
+    def _picture_look(self):
+        """(opacity %, blend) of the picture layer - 🖼 Picture in 📚."""
+        return (getattr(self, 'picture_opacity', 100), getattr(self, 'picture_blend', 'Normal'))
+
+    def _picture_underlay(self):
+        """The sketch's canvas under a shown picture (a QColor), or None.
+        (With the picture hidden it is painted with the marks instead, see
+        _under_sheet_layer.)"""
+        if (getattr(self, 'under_canvas', None) is None
+                or not getattr(self, 'under_canvas_visible', True)):
+            return None
+        return self.under_canvas
+
+    def set_picture_opacity(self, value):
+        self.picture_opacity = max(0, min(100, int(value)))
+        self._picture_look_changed()
+
+    def set_picture_blend(self, mode):
+        if mode in BLEND_MODES:
+            self.picture_blend = mode
+            self._picture_look_changed()
+
+    def _picture_look_changed(self):
+        # A slider drag sends many of these: the redraw is debounced.
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        self._layer_redraw_timer.start()
+
     def _scale_pixmap(self, pixmap, img_path):
         """Scale pixmap for display with zoom and pan support"""
         size = self.image_label.size()
         zoom_factor = self.image_label.zoom_factor
         pan_x = self.image_label.pan_offset_x
         pan_y = self.image_label.pan_offset_y
-        
-        # Create cache key including zoom and pan for proper caching
-        scale_key = f"{img_path}_{size.width()}_{size.height()}_{zoom_factor}_{pan_x}_{pan_y}"
-        
+        # The same picture, view and background as last time: the fitted copy
+        # is the same too. Scaling a large picture smoothly costs tens of ms,
+        # and every stroke ends in a redraw; marks are painted on a copy.
+        sheet = self._picture_underlay()
+        fit_key = (pixmap.cacheKey(), size.width(), size.height(), zoom_factor,
+                   pan_x, pan_y, self.canvas_color.rgba(), self._picture_look(),
+                   sheet.rgba() if sheet is not None else None)
+        fits = getattr(self, '_fit_cache', None)
+        if fits is None:
+            fits = self._fit_cache = {}
+        if fit_key in fits:
+            self.last_size = size
+            return fits[fit_key].copy()
+        scaled = self._scale_pixmap_now(pixmap, size, zoom_factor, pan_x, pan_y)
+        if len(fits) >= 4:
+            fits.pop(next(iter(fits)))
+        fits[fit_key] = scaled
+        self.last_size = size
+        return scaled.copy()
+
+    def _scale_pixmap_now(self, pixmap, size, zoom_factor, pan_x, pan_y):
+        """The picture fitted to the view: zoomed, panned, on the background."""
         # UNIFIED coordinate system for ALL zoom levels - no special case for 1.0
-        # Always calculate the base scaled size first
-        base_scaled = pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # The fitted size at 100 %, worked out from the sizes alone (QPixmap
+        # .scaled rounds the same way): scaling the whole picture smoothly
+        # just to read its size doubled the cost of every redraw.
+        base_scaled = pixmap.size().scaled(size, Qt.KeepAspectRatio)
         
         # Apply zoom factor to get the final zoomed size
         zoomed_width = int(base_scaled.width() * zoom_factor)
@@ -4014,15 +5078,24 @@ class RandomImageViewer(QMainWindow):
         
         # Create a pixmap the size of the label
         final_pixmap = QPixmap(size)
-        final_pixmap.fill(Qt.black)  # Fill with black background
+        final_pixmap.fill(self.canvas_color)  # The background layer
         
         # Calculate the position to draw the zoomed image
         # Center the zoomed image in the label, then apply pan offset
         draw_x = (size.width() - zoomed_width) // 2 + int(pan_x)
         draw_y = (size.height() - zoomed_height) // 2 + int(pan_y)
         
-        # Draw the zoomed image onto the final pixmap
+        # Draw the zoomed image onto the final pixmap - over the sketch's
+        # canvas when there is one, with the picture layer's own opacity and
+        # blend (🖼 Picture in 📚), so it can be mixed into what is under it.
         painter = QPainter(final_pixmap)
+        sheet = self._picture_underlay()
+        if sheet is not None:
+            painter.fillRect(draw_x, draw_y, zoomed_pixmap.width(), zoomed_pixmap.height(), sheet)
+        opacity, blend = self._picture_look()
+        painter.setOpacity(opacity / 100.0)
+        if blend != 'Normal':
+            painter.setCompositionMode(BLEND_MODES[blend])
         painter.drawPixmap(draw_x, draw_y, zoomed_pixmap)
         painter.end()
         
@@ -4957,15 +6030,36 @@ class RandomImageViewer(QMainWindow):
             print(f"apply_value_filter error: {e}")
             return pixmap
 
-    def _kmeans_palette(self, sample, k, np, iters=8):
+    def _kmeans_palette(self, sample, k, np, iters=8, start=None):
         """Compute ``k`` dominant colours from ``sample`` (N,3) via k-means.
 
         Uses k-means++ seeding for stable, representative centres and a few
         Lloyd iterations. Returns a (k,3) float32 array of palette colours.
+
+        *start*: the palette so far (k, 3) - the centres begin there instead,
+        so a little new paint moves the colours a little. Seeded afresh, one
+        more stroke could reshuffle the whole palette and strokes far from it
+        jumped to another colour. A colour with nothing near it stays.
         """
         n = sample.shape[0]
         if k >= n:
             return sample.astype(np.float32)
+        if start is not None and len(start) == k:
+            centers = np.array(start, np.float32)
+            for _ in range(iters):
+                d = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+                labels = np.argmin(d, axis=1)
+                moved = False
+                for j in range(k):
+                    pts = sample[labels == j]
+                    if pts.shape[0] > 0:
+                        nc = pts.mean(axis=0)
+                        if not np.allclose(nc, centers[j]):
+                            centers[j] = nc
+                            moved = True
+                if not moved:
+                    break
+            return centers
         rng = np.random.default_rng(12345)
         centers = np.empty((k, 3), np.float32)
         centers[0] = sample[rng.integers(0, n)]
@@ -5106,17 +6200,28 @@ class RandomImageViewer(QMainWindow):
             work = rgb
             if field > 0:
                 radius = max(1, int(field))
-                work = np.empty_like(rgb)
-                for c in range(3):
+                gpu = getattr(self, 'gpu_processor', None)
+                blurred = gpu.box_blur_rgb_gpu(rgb, radius, 2) if gpu is not None else None
+                work = blurred if blurred is not None else np.empty_like(rgb)
+                for c in (range(3) if blurred is None else ()):
                     ch = self._box_blur_2d(rgb[:, :, c], radius, np)
                     ch = self._box_blur_2d(ch, radius, np)
                     work[:, :, c] = ch
 
             # Build palette from a downsampled colour sample (speed), with cache.
             flat = work.reshape(-1, 3)
+            # What is painted under the effects is part of the picture here:
+            # without it the palette came from the picture before any paint
+            # and every stroke was forced into its colours.
             cache_key = (self.current_image, n, field, w, h,
-                         self._upstream_tone_signature())
-            palette = self._color_palette_cache.get(cache_key)
+                         self._upstream_tone_signature(),
+                         getattr(self, '_effect_content_sig', None))
+            # Painting under the effects, the changed piece alone runs through
+            # them: it keeps the palette of the whole view (see
+            # _show_live_with_effects) - its own would be a different one.
+            palette = getattr(self, '_fx_palette_pin', None)
+            if palette is None:
+                palette = self._color_palette_cache.get(cache_key)
             if palette is None:
                 max_samples = 20000
                 if flat.shape[0] > max_samples:
@@ -5125,10 +6230,20 @@ class RandomImageViewer(QMainWindow):
                 else:
                     sample = flat
                 k = min(n, sample.shape[0])
-                palette = self._kmeans_palette(sample, k, np)
+                # The same picture and settings as the palette before (only
+                # the paint or the view changed): carry on from it.
+                warm_key = (self.current_image, n, field, self._upstream_tone_signature())
+                warm = getattr(self, '_palette_warm', None)
+                if warm is None:
+                    warm = self._palette_warm = {}
+                palette = self._kmeans_palette(sample, k, np, start=warm.get(warm_key))
+                if len(warm) > 12:
+                    warm.clear()
+                warm[warm_key] = palette
                 if len(self._color_palette_cache) > 12:
                     self._color_palette_cache.clear()
                 self._color_palette_cache[cache_key] = palette
+            self._fx_palette_last = palette
 
             # Quantize to the palette and (when a field size is set) smooth the
             # colour fields. Prefer a single GPU pass — the majority smoothing
@@ -5990,6 +7105,7 @@ class RandomImageViewer(QMainWindow):
         # from flickering hide/show while the user drags the window border.
         self.resize_timer.start(300)  # 300ms debounce
         super().resizeEvent(event)
+        self._dock_place_soon()         # 🎨 / 🖌 stay on the right edge
 
     # ── toolbar overflow ('»') popup: replace Qt's hover-close native
     #     popup with our own click-outside-to-close QMenu ──
@@ -6119,9 +7235,11 @@ class RandomImageViewer(QMainWindow):
             self._ext_menu_open = False
 
     def eventFilter(self, obj, event):
+        self._dock_event(obj, event)     # 🎨 / 🖌 follow what they are docked by
         # Reposition floating panels whenever the canvas is resized.
         if getattr(self, '_using_floating_panels', False) and obj is getattr(self, 'image_label', None):
             if event.type() == QEvent.Resize:
+                self._dock_place_soon()
                 # Restore saved layout once, after the canvas has a real size.
                 if not getattr(self, '_panel_layout_restored', True) and self.image_label.width() > 100:
                     self._panel_layout_restored = True
@@ -6631,9 +7749,10 @@ class RandomImageViewer(QMainWindow):
         rescale at 100 % zoom, only centring — one blit per frame."""
         size = self.image_label.size()
         if (self.image_label.zoom_factor == 1.0
-                and pixmap.size().scaled(size, Qt.KeepAspectRatio) == pixmap.size()):
+                and pixmap.size().scaled(size, Qt.KeepAspectRatio) == pixmap.size()
+                and self._picture_look() == (100, 'Normal') and self._picture_underlay() is None):
             final = QPixmap(size)
-            final.fill(Qt.black)
+            final.fill(self.canvas_color)
             painter = QPainter(final)
             painter.drawPixmap((size.width() - pixmap.width()) // 2 + int(self.image_label.pan_offset_x),
                                (size.height() - pixmap.height()) // 2 + int(self.image_label.pan_offset_y),
@@ -6718,7 +7837,12 @@ class RandomImageViewer(QMainWindow):
 
     def _deactivate_tools(self, keep=None):
         """Silently switch off every drawing tool except *keep* ('line',
-        'hline', 'free_line', 'free_draw', 'eraser', 'color_snap', 'fill')."""
+        'hline', 'free_line', 'free_draw', 'eraser', 'color_snap', 'fill',
+        'crop')."""
+        if keep != 'crop':
+            self._disable_crop_silent()
+        if keep != 'select':
+            self._disable_select_silent()
         if keep != 'line':
             self.line_drawing_mode = False
         if keep != 'hline':
@@ -6748,18 +7872,28 @@ class RandomImageViewer(QMainWindow):
             self._disable_color_snap_silent()
         if keep != 'fill':
             self._disable_fill_tools_silent()
+        self._sync_erase_button()
 
     def toggle_line_drawing(self, checked):
         self.line_drawing_mode = checked
         if checked:
             self._deactivate_tools(keep='line')
+            self._show_guides_for_tool()
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
+
+    def _show_guides_for_tool(self):
+        """A guide tool picked up while 👁 hides the guides: they show again,
+        or the new one would vanish as it is drawn."""
+        if not self.guides_visible:
+            self.toggle_line_visibility(True)
+            self.status.showMessage("👁 Guides shown again for the new one", 2500)
 
     def toggle_hline_drawing(self, checked):
         self.horizontal_line_drawing_mode = checked
         if checked:
             self._deactivate_tools(keep='hline')
+            self._show_guides_for_tool()
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
 
@@ -6767,6 +7901,7 @@ class RandomImageViewer(QMainWindow):
         self.free_line_drawing_mode = checked
         if checked:
             self._deactivate_tools(keep='free_line')
+            self._show_guides_for_tool()
         if not checked:
             # Reset current line start when mode is deactivated
             had_pending = self.current_line_start is not None
@@ -6776,6 +7911,1372 @@ class RandomImageViewer(QMainWindow):
             if had_pending and self.current_image:
                 self.display_image(self.current_image)
         self._update_cursor_and_status()
+
+    # -- layers ---------------------------------------------------------------
+
+    def _bind_layer(self, layer):
+        """Make *layer* the active one. The viewer's mark lists become its lists,
+        not copies, so every tool draws, undoes and erases on it unawares."""
+        if getattr(self, '_sel', None) is not None and self._sel['layer'] is not layer:
+            self.commit_selection()     # a transform belongs to the layer it began on
+        self.active_layer = layer
+        for field in MARK_FIELDS:
+            setattr(self, field, layer.marks[field])
+
+    def _layers_plain(self):
+        return all(layer.is_plain() for layer in self.layers) and not self._fx_layers_on()
+
+    def _layers_signature(self):
+        return "|".join([self.canvas_color.name()] + [layer.signature() for layer in self.layers])
+
+    def _redraw_layers(self):
+        self._update_layer_chip()
+        self._invalidate_line_caches()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def _update_layer_chip(self):
+        """The status bar chip: the layer drawn on now, with ✨ when the
+        effects reach it, 📄 for a canvas layer, dimmed and struck through
+        while it is hidden."""
+        chip = getattr(self, 'layer_chip', None)
+        if chip is None or not getattr(self, 'layers', None):
+            return
+        layer = self.active_layer
+        if len(self.layers) < 2 and layer.fill is None:
+            chip.hide()
+            return
+        marks = ("📄 " if layer.fill is not None else "") + layer.name
+        try:
+            reached = layer.effects and self._any_effect_on()
+        except AttributeError:      # still starting up: no effect settings yet
+            reached = False
+        if reached:
+            marks += " ✨"
+        chip.setText(f"✎ {marks}")
+        position = len(self.layers) - self.layers.index(layer)
+        chip.setToolTip(f"Drawing on {layer.name} ({position} of {len(self.layers)} from the top)"
+                        + ("" if layer.visible else " - hidden: drawing shows it again")
+                        + ". Click for 📚 Layers")
+        color = "#d6dade" if layer.visible else "#6f757b"
+        strike = "" if layer.visible else "text-decoration: line-through;"
+        chip.setStyleSheet(
+            f"QToolButton {{ color: {color}; font-size: 10px; padding: 0 6px; {strike}"
+            f" border: 1px solid #4a4f55; border-radius: 8px; }}"
+            f" QToolButton:hover {{ border-color: #8a9096; }}")
+        chip.show()
+
+    def _flash_layer_name(self, layer):
+        """The layer's name over the picture's corner for a moment, fading
+        out - the cue at the moment it changes, where the eye is."""
+        label = getattr(self, '_layer_flash', None)
+        if label is None:
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+            label = self._layer_flash = QLabel(self.image_label)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            label.setStyleSheet(
+                "QLabel { color: #f1f3f4; background: rgba(32, 33, 36, 190); font-size: 13px;"
+                " padding: 4px 10px; border-radius: 10px; }")
+            effect = QGraphicsOpacityEffect(label)
+            label.setGraphicsEffect(effect)
+            self._layer_flash_anim = QPropertyAnimation(effect, b"opacity", self)
+            self._layer_flash_anim.setDuration(1400)
+            self._layer_flash_anim.setKeyValueAt(0.0, 1.0)
+            self._layer_flash_anim.setKeyValueAt(0.6, 1.0)
+            self._layer_flash_anim.setKeyValueAt(1.0, 0.0)
+            self._layer_flash_anim.finished.connect(label.hide)
+        label.setText(f"✎ {'📄 ' if layer.fill is not None else ''}{layer.name}"
+                      + ("" if layer.visible else "  (hidden)"))
+        label.adjustSize()
+        # Beside the pointer, where the eye is (a fixed corner can lie under
+        # a tool panel); kept inside the picture area.
+        area = self.image_label.rect()
+        at = self.image_label.mapFromGlobal(QCursor.pos())
+        if not area.contains(at):
+            at = QPoint(area.width() // 2, area.height() // 2)
+        x = min(max(8, at.x() + 22), max(8, area.width() - label.width() - 8))
+        y = min(max(8, at.y() + 18), max(8, area.height() - label.height() - 8))
+        label.move(x, y)
+        label.show()
+        label.raise_()
+        self._layer_flash_anim.stop()
+        self._layer_flash_anim.start()
+
+    def _refresh_layer_window(self):
+        self._update_layer_chip()
+        if self._layer_window is not None:
+            self._layer_window.set_layers(self.layers, self.active_layer)
+            self._layer_window.set_background(self.canvas_color)
+            self._layer_window.set_picture(
+                self.image_visible,
+                None if self.under_canvas is None else self.under_canvas_visible,
+                self.picture_opacity, self.picture_blend)
+
+    def set_canvas_color(self, color):
+        """The background layer: what shows around the picture, and instead of
+        it when hidden. Marks can be drawn on it like on the picture."""
+        if not color.isValid() or color == self.canvas_color:
+            return
+        self.canvas_color = QColor(color)
+        self._settings.setValue("canvas_color", self.canvas_color.name())
+        if self._layer_window is not None:
+            self._layer_window.set_background(self.canvas_color)
+        self._layer_redraw_timer.start()    # a picker drag sends many of these
+
+    def choose_canvas_color(self):
+        """Drop the line colour's picker under the background swatch, in its own
+        copy, so the canvas follows it live against the picture."""
+        popup = self._canvas_popup
+        if popup is None:
+            popup = ColorPickerPopup(self)
+            popup.set_title("Background")
+            popup.color_picked.connect(self.set_canvas_color)
+            popup.set_anchor(self._layer_window.background_button)
+            self._canvas_popup = popup
+        # The swatch toggles, like the colour button.
+        if popup.isVisible():
+            if popup.is_pinned():
+                self._canvas_popup_pos = popup.pos()
+            popup.hide()
+            return
+        popup.set_color(self.canvas_color)
+        popup.set_palette_colors(self._snapped_colors())
+        popup.adjustSize()
+        self._place_color_popup(popup, self._layer_window.background_button,
+                                self._canvas_popup_pos)
+        popup.show()
+        popup.raise_()
+
+    def _ensure_layer_window(self):
+        if self._layer_window is None:
+            win = LayerWindow(self)
+            win.drag_finished.connect(lambda: self._dock_dragged('layers'))
+            win.layer_selected.connect(self.select_layer)
+            win.visibility_changed.connect(self.set_layer_visible)
+            win.name_changed.connect(self.rename_layer)
+            win.opacity_changed.connect(self.set_layer_opacity)
+            win.blend_changed.connect(self.set_layer_blend)
+            win.effects_changed.connect(self.set_layer_effects)
+            win.add_requested.connect(self.add_layer)
+            win.canvas_requested.connect(self.add_canvas_layer)
+            win.remove_requested.connect(self.remove_layer)
+            win.move_requested.connect(self.move_layer)
+            win.background_requested.connect(self.choose_canvas_color)
+            win.picture_toggled.connect(self.toggle_image_visibility)
+            win.under_canvas_toggled.connect(self.set_under_canvas)
+            win.picture_opacity_changed.connect(self.set_picture_opacity)
+            win.picture_blend_changed.connect(self.set_picture_blend)
+            win.closed.connect(lambda: self.layers_btn.setChecked(False))
+            self._layer_window = win
+        self._refresh_layer_window()
+        return self._layer_window
+
+    def toggle_layer_window(self, checked):
+        if checked:
+            win = self._ensure_layer_window()
+            btn = self.layers_btn
+            win.move(self._layer_window_pos or btn.mapToGlobal(btn.rect().bottomLeft()) + QPoint(0, 4))
+            win.show()
+            self._dock_place()          # docked (the default): down the left edge
+            win.raise_()
+        elif self._layer_window is not None:
+            self._layer_window_pos = self._layer_window.pos()
+            self._layer_window.hide()
+
+    def select_layer(self, layer):
+        changed = layer is not getattr(self, 'active_layer', None)
+        self._bind_layer(layer)
+        self._refresh_layer_window()
+        self.status.showMessage(f"Drawing on {layer.name}", 2000)
+        if changed:
+            self._flash_layer_name(layer)
+
+    def add_layer(self):
+        self._layer_count += 1
+        layer = Layer(f"Layer {self._layer_count}")
+        self.layers.insert(self.layers.index(self.active_layer) + 1, layer)
+        self.select_layer(layer)
+
+    def add_canvas_layer(self):
+        """📄 A canvas layer above the selected one: paper over the picture
+        to sketch on, a layer like any other (hide it to see the picture,
+        Opacity for tracing paper, ✨ for effects on it or not). Drawing
+        switches to it."""
+        if not self.current_image:
+            self.status.showMessage("Open a picture first - the canvas goes over it")
+            return None
+        self._canvas_count = getattr(self, '_canvas_count', 0) + 1
+        layer = Layer(f"Canvas {self._canvas_count}")
+        layer.fill = QColor(*self._CANVAS_FILL)
+        self.layers.insert(self.layers.index(self.active_layer) + 1, layer)
+        self.select_layer(layer)
+        self._redraw_layers()
+        btn = getattr(self, 'free_draw_tool_btn', None)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        self.status.showMessage(
+            f"{layer.name}: sketch on it; untick it in 📚 to see the picture, Opacity for tracing paper", 5000)
+        return layer
+
+    def snapshot_to_layer(self):
+        """📸: what is on screen now - effects, marks, background - onto a new
+        layer above the selected one, the very view 💾 would save.
+
+        It is kept in picture coordinates like any mark, so it zooms, pans and
+        turns with the picture, can be blended, erased and undone, and goes
+        when you move to another file, as marks do."""
+        shown = self.image_label.pixmap()
+        tx = self._compute_line_transform()
+        if not self.current_image or shown is None or shown.isNull() or not tx:
+            self.status.showMessage("Nothing on screen to snapshot")
+            return
+        original_size = self.original_pixmap.size()
+        if self.rotation_angle in (90, 270):
+            unrot_w, unrot_h = original_size.height(), original_size.width()
+        else:
+            unrot_w, unrot_h = original_size.width(), original_size.height()
+        to_display = self._mark_display_mapper(original_size, tx['scale_x'], tx['scale_y'],
+                                               tx['draw_x'], tx['draw_y'])
+        to_picture, ok = self._picture_to_display(to_display, unrot_w, unrot_h).inverted()
+        if not ok:
+            return
+        image = shown.toImage()
+        w = image.width() / shown.devicePixelRatio()
+        h = image.height() / shown.devicePixelRatio()
+        corners = [to_picture.map(QPointF(x, y)) for x, y in ((0, 0), (w, 0), (0, h))]
+        self.add_layer()
+        self.active_layer.name = f"Snapshot {self._layer_count}"
+        self.drawn_images.append({'image': image,
+                                  'corners': [(p.x(), p.y()) for p in corners]})
+        self._undo_stack.append('image')
+        self._refresh_layer_window()
+        self._redraw_layers()
+        self.status.showMessage(f"View copied to {self.active_layer.name}", 3000)
+
+    def remove_layer(self):
+        layer = self.active_layer
+        position = self.layers.index(layer)
+        if len(self.layers) == 1:
+            layer.clear()       # the last one stays, empty
+        else:
+            self.layers.remove(layer)
+            self._bind_layer(self.layers[max(0, position - 1)])
+        self._refresh_layer_window()
+        self._redraw_layers()
+
+    def move_layer(self, step):
+        position = self.layers.index(self.active_layer)
+        target = position + step
+        if 0 <= target < len(self.layers):
+            self.layers[position], self.layers[target] = self.layers[target], self.layers[position]
+            self._refresh_layer_window()
+            self._redraw_layers()
+
+    def rename_layer(self, layer, name):
+        layer.name = name
+
+    def set_layer_visible(self, layer, visible):
+        layer.visible = visible
+        self._redraw_layers()
+
+    def set_layer_opacity(self, value):
+        self.active_layer.opacity = value
+        self._layer_redraw_timer.start()     # a slider drag: at most one per 30 ms
+
+    def set_layer_blend(self, mode):
+        self.active_layer.blend = mode
+        self._redraw_layers()
+
+    def set_layer_effects(self, on):
+        """Run the view's effects over the selected layer's paint too."""
+        self.active_layer.effects = on
+        self._redraw_layers()
+        moving = getattr(self, '_video_playing', False) or (
+            self.current_image and (is_video_file(self.current_image)
+                                    or is_animated_image(self.current_image)))
+        if on and moving:
+            self.status.showMessage("Effects on a layer work on still pictures; "
+                                    "over a video / GIF the paint stays on top", 4000)
+
+    def reveal_active_layer(self):
+        """Marks made on a hidden layer would vanish, so drawing shows it."""
+        if not self.active_layer.visible:
+            self.active_layer.visible = True
+            self._refresh_layer_window()
+            self._redraw_layers()
+
+    # -- 🖌 brush tip ------------------------------------------------------------
+    #
+    # The free draw tool paints with the round pen, or stamps a PNG texture
+    # along the stroke (drawing/brushes.py). The textures listed and the
+    # settings are remembered between sessions; each stroke keeps the stamps it
+    # was drawn with, so changing the brush never restyles older strokes.
+
+    def _brush_texture(self):
+        """The tip to stamp with: the PNG, or for Round the built-in round
+        stamp when blending / smudging (painting Round keeps the plain pen)."""
+        path = self.brush_settings['texture']
+        if not path and self.brush_settings['mode'] != 'paint':
+            path = brushes.ROUND
+        if path == brushes.SPRAY:
+            # Its settings ride along in the path the stroke keeps.
+            path = brushes.spray_path(self.brush_settings, self.line_thickness)
+        elif path == brushes.RAKE:
+            path = brushes.rake_path(self.brush_settings)       # its tines ride along too
+        return brushes.load_texture(path) if path else None
+
+    def _history_picture(self):
+        """🕘 History's source: the picture as loaded - before effects, marks,
+        rotation - as a QImage in picture coordinates, kept while it is the
+        same picture. None where there is no still picture to paint back."""
+        path = self.current_image
+        if (not path or path not in self.pixmap_cache or is_video_file(path)
+                or is_animated_image(path)):
+            return None
+        base = self._studio_sheet(self.pixmap_cache[path])
+        kept = getattr(self, '_history_image', None)
+        if kept is None or kept[0] != base.cacheKey():
+            kept = self._history_image = (
+                base.cacheKey(), base.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied))
+        return kept[1]
+
+    _MODE_LOOK = {'paint': ("🖍", "Paint: the brush lays its own colour"),
+                  'erase': ("🧽", "Erase: the brush rubs out what is drawn on this layer - "
+                                  "its tip, size, pressure and opacity - never the picture"),
+                  'history': ("🕘", "History: paints the original picture back, the brush colour "
+                                   "mixed in by Tint (in 🖌)"),
+                  'blend': ("💧", "Blend: the brush colour mixes with what is under it (Mix in 🖌)"),
+                  'smudge': ("👆", "Smudge: drags the colours under the pen along (Mix in 🖌)"),
+                  'pick': ("🎯", "Pick blend: Blend with the colour under the pen where the "
+                                 "stroke starts, picked like the eyedropper (Mix in 🖌)")}
+
+    def cycle_brush_mode(self):
+        """Paint → Blend → Smudge → History → Paint, the toolbar switch."""
+        modes = brushes.MODES
+        self.set_brush_mode(modes[(modes.index(self.brush_settings['mode']) + 1) % len(modes)])
+
+    def set_brush_mode(self, mode):
+        """Switch the brush to *mode* and pick up the brush: keys 1-4 and the
+        toolbar switch."""
+        self.set_brush_setting('mode', mode)
+        self._refresh_brush_window()
+        if not self.free_draw_mode and hasattr(self, 'free_draw_tool_btn'):
+            self.free_draw_tool_btn.setChecked(True)
+        self.status.showMessage(self._MODE_LOOK[mode][1], 3000)
+
+    def _update_brush_mode_button(self):
+        btn = getattr(self, 'brush_mode_btn', None)
+        if btn is not None:
+            text, tip = self._MODE_LOOK[self.brush_settings['mode']]
+            btn.setText(text)
+            btn.setToolTip(f"{tip}. Click: Paint → Blend → Smudge → History → Pick blend "
+                           "→ Erase (keys 1 / 2 / 3 / 4 / 5 / 6)")
+        self._sync_erase_button()
+
+    def _sync_erase_button(self):
+        """⌫ shows whether the brush is rubbing out (🧽 Erase mode, brush on)."""
+        btn = getattr(self, 'eraser_tool_btn', None)
+        if btn is None:
+            return
+        on = self._brush_erasing() and bool(getattr(self, 'free_draw_mode', False))
+        if btn.isChecked() != on:
+            btn.blockSignals(True); btn.setChecked(on); btn.blockSignals(False)
+
+    def toggle_brush_erase(self, checked):
+        """⌫ in the Draw panel: the brush rubs out (🧽 Erase mode) with its
+        own tip, size, pressure and opacity - click again for the mode it
+        was in before (key 6 / the 🖌 mode switch do the same)."""
+        if checked:
+            if not self._brush_erasing():
+                self._mode_before_erase = self.brush_settings['mode']
+            self.set_brush_mode('erase')
+        else:
+            back = getattr(self, '_mode_before_erase', None)
+            if back not in brushes.MODES or back == 'erase':
+                back = 'paint'
+            if self._brush_erasing():
+                self.set_brush_mode(back)
+        self._sync_erase_button()
+
+    def _sample_view(self):
+        """What Blend and Smudge read from, by the brush's Sample setting: the
+        screen as it is ('all'), or the view made again from the picture -
+        with its effects - and only this layer and the ones under it
+        ('below'), or this layer alone on nothing ('layer'). Made once, when
+        the stroke starts."""
+        shown = self.image_label.pixmap()
+        source = self.brush_settings.get('sample', 'below')
+        if (source == 'all' or shown is None or shown.isNull() or not self.current_image
+                or getattr(self, 'original_pixmap', None) is None):
+            return shown
+        try:
+            index = self.layers.index(self.active_layer)
+            wanted = self.layers[:index + 1] if source == 'below' else [self.active_layer]
+            allowed = {id(layer) for layer in wanted}
+            if source == 'below':
+                allowed.add(id(self._under_sheet))     # the canvas under the picture is below too
+            size = self.image_label.size()
+            params = self._fx_view_params()
+            if source == 'layer':
+                view = QPixmap(size)
+                view.fill(Qt.transparent)
+            else:
+                still = not (is_video_file(self.current_image) or is_animated_image(self.current_image))
+                if (still and self._fx_layers_on()
+                        and any(id(l) in allowed and l.effects and l.has_content() for l in self.layers)):
+                    view = self._fx_under(self.current_image,
+                                          allow=lambda layer: layer.effects and id(layer) in allowed)
+                    if view is None:
+                        return shown
+                    view = self._effect_chain_over_paint(view, self._fx_paint_signature() + "|sample")
+                    allowed = {i for i in allowed
+                               if not next((l for l in self.layers if id(l) == i),
+                                           self._under_sheet).effects}
+                elif self.image_visible:
+                    view = self._scale_pixmap(self.original_pixmap, self.current_image)
+                else:
+                    view = QPixmap(size)
+                    view.fill(self.canvas_color)
+            painter = QPainter(view)
+            self._paint_marks(painter, view.width(), view.height(), *params,
+                              which=lambda layer: id(layer) in allowed)
+            painter.end()
+            return view
+        except Exception as e:      # never let sampling stop the stroke
+            print(f"_sample_view error: {e}")
+            return shown
+
+    def _screen_sampler(self, to_screen, shown=None):
+        """f(x, y, size) -> the colour under a stamp (picture coords) in
+        *shown* (the screen by default), averaged over its middle; None where
+        it is (nearly) see-through - an empty spot of a layer sampled on its
+        own has no colour to give."""
+        import numpy as np
+        if shown is None:
+            shown = self.image_label.pixmap()
+        if shown is None or shown.isNull():
+            return None
+        image = shown.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        w, h = image.width(), image.height()
+        pixels = np.frombuffer(image.constBits(), np.uint8).reshape(h, image.bytesPerLine())
+        pixels = pixels[:, :w * 4].reshape(h, w, 4)
+        scale = math.sqrt(abs(to_screen.determinant()))
+        t = to_screen
+
+        def sample(x, y, size, _keep=image):
+            sx = t.m11() * x + t.m21() * y + t.dx()
+            sy = t.m12() * x + t.m22() * y + t.dy()
+            r = max(1, int(size * scale * 0.2))
+            x0, x1 = max(0, int(sx) - r), min(w, int(sx) + r + 1)
+            y0, y1 = max(0, int(sy) - r), min(h, int(sy) + r + 1)
+            if x0 >= x1 or y0 >= y1:
+                return None
+            b, g, r_, a = pixels[y0:y1, x0:x1].reshape(-1, 4).mean(axis=0)
+            if a < brushes.SAMPLE_MIN_ALPHA:
+                return None
+            k = 255.0 / a                           # premultiplied -> plain colour
+            # With how much paint is there: sparse specks are a little of it
+            # (see brushes.picked_up for why not just their coverage).
+            return brushes.Sampled((min(255, round(r_ * k)) << 16) | (min(255, round(g * k)) << 8)
+                                   | min(255, round(b * k)), brushes.picked_up(a / 255.0))
+
+        def many(points, size):
+            """sample() for many spots of one size at once (a stamp's streaks):
+            one array gather instead of a slice and a mean each."""
+            xy = np.asarray(points, np.float64)
+            sx = t.m11() * xy[:, 0] + t.m21() * xy[:, 1] + t.dx()
+            sy = t.m12() * xy[:, 0] + t.m22() * xy[:, 1] + t.dy()
+            r = max(1, int(size * scale * 0.2))
+            step = max(1, -(-r // 6))               # a big spot: every few pixels
+            off = np.arange(-r, r + 1, step)
+            gx = sx.astype(np.int64)[:, None, None] + off[None, None, :]
+            gy = sy.astype(np.int64)[:, None, None] + off[None, :, None]
+            gx, gy = np.broadcast_arrays(gx, gy)
+            inside = (gx >= 0) & (gx < w) & (gy >= 0) & (gy < h)
+            px = pixels[np.clip(gy, 0, h - 1), np.clip(gx, 0, w - 1)].astype(np.float32)
+            px *= inside[..., None]
+            count = inside.sum((1, 2)).astype(np.float32)
+            mean = px.sum((1, 2)) / np.maximum(count, 1.0)[:, None]
+            a = mean[:, 3]
+            k = 255.0 / np.maximum(a, 1.0)
+            rgb = np.minimum(255, np.round(mean[:, 2::-1] * k[:, None])).astype(np.int64)
+            packed = ((rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2]).tolist()
+            ok = ((a >= brushes.SAMPLE_MIN_ALPHA) & (count > 0)).tolist()
+            share = [brushes.picked_up(x) for x in (a / 255.0).tolist()]
+            return [brushes.Sampled(c, s) if good else None for c, s, good in zip(packed, share, ok)]
+
+        sample.many = many
+        return sample
+
+    def _save_brush_settings(self):
+        self._settings.setValue("brush_settings", json.dumps(self.brush_settings))
+        self._settings.setValue("brush_textures", json.dumps(self.brush_textures))
+
+    def _update_brush_button(self):
+        texture = self._brush_texture()
+        btn = getattr(self, 'brush_texture_btn', None)
+        if btn is None:
+            return
+        if texture is None:
+            btn.setIcon(QIcon())
+            btn.setText("🖌")
+            btn.setToolTip("Brush tip: Round. Click for textured PNG brushes")
+        else:
+            btn.setText("")
+            btn.setIcon(QIcon(QPixmap.fromImage(texture.thumbnail(20))))
+            btn.setToolTip(f"Brush tip: {texture.name}. Click to change it or its settings")
+
+    def _brush_window_textures(self):
+        entries = []
+        for path in [brushes.BRISTLES, brushes.RAKE, brushes.DUST, brushes.SPRAY] + self.brush_textures:   # the built-in tips first
+            texture = brushes.load_texture(path)
+            if texture is not None:
+                entries.append((path, texture.name, texture.thumbnail(40)))
+        return entries
+
+    def _on_panel_size(self, position, done):
+        """The Brush panel's size slider: moves the toolbar's with it; the
+        size is set as it moves, and applied in full once the drag ends."""
+        size = self._brush_slider_to_size(position)
+        slider = getattr(self, 'line_thickness_slider', None)
+        if slider is not None:
+            slider.blockSignals(True)
+            slider.setValue(int(position))
+            slider.blockSignals(False)
+        if getattr(self, 'line_thickness_label', None) is not None:
+            self.line_thickness_label.setText(f"{size}px")
+        if done:
+            self.update_line_thickness(size)
+        else:
+            self.line_thickness = size
+            if self._brush_window is not None:
+                self._brush_window.show_size(position, size)
+
+    def _show_size_in_panel(self):
+        win = getattr(self, '_brush_window', None)
+        if win is not None:
+            win.show_size(self._brush_size_to_slider(self.line_thickness), self.line_thickness)
+
+    def _refresh_brush_window(self):
+        self._show_size_in_panel()
+        if self._brush_window is not None:
+            self._brush_window.set_textures(self._brush_window_textures(),
+                                            self.brush_settings['texture'])
+            self._brush_window.set_settings(self.brush_settings)
+
+    def toggle_brush_window(self, checked):
+        if checked:
+            if self._brush_window is None:
+                win = BrushWindow(self)
+                win.texture_chosen.connect(self.set_brush_texture)
+                win.setting_changed.connect(self.set_brush_setting)
+                win.size_changed.connect(self._on_panel_size)
+                win.folder_requested.connect(self.choose_brush_folder)
+                win.files_requested.connect(self.add_brush_files)
+                win.remove_requested.connect(self.remove_brush_texture)
+                win.reset_requested.connect(self.reset_brush_settings)
+                win.closed.connect(lambda: self.brush_texture_btn.setChecked(False))
+                win.drag_finished.connect(lambda: self._dock_dragged('brush'))
+                self._brush_window = win
+            self._refresh_brush_window()
+            btn = self.brush_texture_btn
+            self._brush_window.move(self._brush_window_pos
+                                    or btn.mapToGlobal(btn.rect().bottomLeft()) + QPoint(0, 4))
+            self._brush_window.show()
+            self._dock_place()          # docked (the default): on the right edge
+            self._brush_window.raise_()
+        elif self._brush_window is not None:
+            self._brush_window_pos = self._brush_window.pos()
+            self._brush_window.hide()
+
+    def set_brush_texture(self, path):
+        """Paint with the PNG at *path*, or the round pen for ''."""
+        if path and brushes.load_texture(path) is None:
+            self.status.showMessage(f"Could not read {os.path.basename(path)} as a brush")
+            return
+        self.brush_settings['texture'] = path
+        self._save_brush_settings()
+        self._update_brush_button()
+        if not self.free_draw_mode and hasattr(self, 'free_draw_tool_btn'):
+            self.free_draw_tool_btn.setChecked(True)    # picking a tip means painting
+        self.apply_tool_cursor()
+        name = brushes.load_texture(path).name if path else "Round"
+        self.status.showMessage(f"Brush: {name}", 2000)
+
+    def reset_brush_settings(self):
+        """↺ in the Brush panel: every brush setting back to its default -
+        the tip and the mode stay (size and colour are not brush settings)."""
+        keep = {k: self.brush_settings[k] for k in ('texture', 'mode') if k in self.brush_settings}
+        self.brush_settings = dict(brushes.DEFAULT_SETTINGS)
+        self.brush_settings.update(keep)
+        self.brush_settings['mix'] = brushes.MODE_MIX.get(self.brush_settings['mode'], 50)
+        self._save_brush_settings()
+        self._refresh_brush_window()
+        self._update_brush_mode_button()
+        self._update_brush_button()
+        if self.free_draw_mode:
+            self.apply_tool_cursor()
+        self.status.showMessage("Brush settings reset to the defaults", 2000)
+
+    def set_brush_setting(self, key, value):
+        settings = self.brush_settings
+        if key == 'mode' and value != settings['mode']:
+            # Each mode keeps its own Mix / Carry / Tint.
+            settings[f"mix_{settings['mode']}"] = settings['mix']
+            settings['mix'] = settings.get(f"mix_{value}", brushes.MODE_MIX.get(value, 50))
+        elif key == 'mix':
+            settings[f"mix_{settings['mode']}"] = value
+        settings[key] = value
+        self._save_brush_settings()
+        if key == 'mode':
+            self._refresh_brush_window()
+            self._update_brush_mode_button()
+            self._update_brush_button()
+        if key in ('angle', 'angle_mode', 'mode', 'spray_spread', 'rake_tines', 'rake_tine',
+                   'rake_wobble') and self.free_draw_mode:
+            self.apply_tool_cursor()
+
+    def _add_brush_textures(self, paths):
+        """Add PNGs to the list (unreadable ones are skipped); the first new
+        one becomes the brush."""
+        import hashlib
+
+        def digest(p):
+            try:
+                with open(p, "rb") as f:
+                    return hashlib.sha1(f.read()).hexdigest()
+            except OSError:
+                return None
+        # The same image under another name or folder counts as imported too.
+        seen = {digest(p) for p in self.brush_textures}
+        added = []
+        for path in paths:
+            path = os.path.abspath(path)
+            if path in self.brush_textures or brushes.load_texture(path) is None:
+                continue
+            h = digest(path)
+            if h is not None and h in seen:
+                continue
+            seen.add(h)
+            self.brush_textures.append(path)
+            added.append(path)
+        if added:
+            self.set_brush_texture(added[0])
+            self._refresh_brush_window()
+            self.status.showMessage(f"Added {len(added)} brush texture{'s' if len(added) > 1 else ''}", 3000)
+        else:
+            self.status.showMessage("No new PNG brush textures there")
+        return added
+
+    def choose_brush_folder(self):
+        start = os.path.dirname(self.brush_textures[-1]) if self.brush_textures else ""
+        folder = QFileDialog.getExistingDirectory(self, "Folder of PNG brush textures", start)
+        if folder:
+            self._add_brush_textures(brushes.textures_in_folder(folder))
+
+    def add_brush_files(self):
+        start = os.path.dirname(self.brush_textures[-1]) if self.brush_textures else ""
+        paths, _ = QFileDialog.getOpenFileNames(self, "PNG brush textures", start, "PNG images (*.png)")
+        if paths:
+            self._add_brush_textures(paths)
+
+    def remove_brush_texture(self, path):
+        if path in self.brush_textures:
+            self.brush_textures.remove(path)
+        if self.brush_settings['texture'] == path:
+            self.brush_settings['texture'] = ''
+            self._update_brush_button()
+        self._save_brush_settings()
+        self._refresh_brush_window()
+
+    def _current_tilt(self):
+        """The pen's (xTilt, yTilt) if a tablet event came in just now."""
+        if self._tablet_tilt is not None and time.monotonic() - self._tablet_tilt_time < 0.25:
+            return self._tablet_tilt
+        return None
+
+    def refresh_texture_cursor(self):
+        """Turn the outline cursor with the pen's lean or the stroke, when the
+        turn has moved on by a step (it is rebuilt only then)."""
+        if (not self.free_draw_mode or self._brush_texture() is None
+                or not hasattr(self, 'image_label')):
+            return
+        now = time.monotonic()
+        if now - getattr(self, '_cursor_refresh_t', 0.0) < 0.03:
+            return
+        self._cursor_refresh_t = now
+        if self._texture_cursor_key()[:-2] != getattr(self, '_cursor_key', None):
+            self.image_label.setCursor(self._brush_cursor())
+
+    def _pick_brush_colour(self, screen_pos):
+        """Make the colour on screen at *screen_pos* (label coords) the brush
+        colour, as the eyedropper would - but light: only the colour, its
+        swatch and the picker follow, nothing is redrawn under a stroke that
+        is just starting. Nothing there (off the picture): the colour stays."""
+        picked = self._sample_screen_color(screen_pos)
+        if picked is None:
+            return
+        self.line_color = QColor(picked)
+        self.line_color.setAlpha(self.line_transparency)
+        btn = getattr(self, 'line_color_btn', None)
+        if btn is not None:
+            btn.setStyleSheet(f"QToolButton {{ background-color: {self.line_color.name()}; "
+                              f"border: 1px solid #666; }}")
+        self._sync_color_popup()
+
+    def _start_stamp_trail(self, x, y):
+        """A textured stroke: lay its stamps from this first point on."""
+        texture = self._brush_texture()
+        cache = self.drawing_cache
+        if texture is None or not cache:
+            self._stamp_trail = None
+            return
+        size = cache['original_size']
+        to_screen = self._picture_to_display(
+            lambda px, py: self._stroke_cache_to_screen(cache, px, py), size.width(), size.height())
+        to_picture, ok = to_screen.inverted()
+        if not ok:
+            self._stamp_trail = None
+            return
+        self._stamp_to_screen = to_screen
+        under = (self._sample_view() if self.brush_settings['mode'] in ('blend', 'smudge', 'pick')
+                 else None)
+        sampler = (self._screen_sampler(to_screen, under)
+                   if under is not None and self.brush_settings['mode'] == 'smudge' else None)
+        self._blend_under = (under.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
+                             if under is not None and self.brush_settings['mode'] in brushes.BLENDING
+                             else None)
+        if self.brush_settings['mode'] == 'pick':
+            # 🎯 Pick blend: the eyedropper first - what is on screen under
+            # the first touch becomes the brush colour, then it blends.
+            self._pick_brush_colour(to_screen.map(QPointF(x, y)))
+        self._stamp_trail = brushes.StampTrail(
+            self.brush_settings, texture, QColor(self.line_color), self.line_thickness,
+            to_picture, self.pen_pressure_enabled, sampler=sampler)
+        live = getattr(self, '_stroke_image', None)
+        if live is not None and live.format() != QImage.Format_ARGB32_Premultiplied:
+            # Stamps go down premultiplied, as on the layer's own image: the
+            # stroke kept from this buffer (see _live_stroke_render) is then
+            # the same pixels as it laid again later, not rounded differently.
+            self._stroke_image = QImage(live.size(), QImage.Format_ARGB32_Premultiplied)
+            self._stroke_image.fill(Qt.transparent)
+        self._stamp_trail.add(x, y, None, self._current_tilt())
+        image = getattr(self, '_stroke_image', None)
+        mode = self.brush_settings['mode']
+        history = mode == 'history'
+        picture = self._history_picture() if history else None
+        source = (picture, to_screen, self.brush_settings['mix'] / 100.0) if picture is not None else None
+        if mode in brushes.BLENDING and self._blend_under is not None and image is not None:
+            # Blend: a blender brush moving the pixels under it (see SmearStroke).
+            if self.brush_settings.get('pigment', True):
+                # Its paint mixing runs on the GPU (started once, ~0.3 s).
+                gpu = getattr(self, 'gpu_processor', None)
+                if gpu is not None and gpu.is_available():
+                    brushes.pigment.use_gpu(gpu)
+            self._flat_live = brushes.SmearStroke(image.rect(), self._blend_under,
+                                                  self.brush_settings['mix'] / 100.0,
+                                                  self.brush_settings['spacing'],
+                                                  self.brush_settings.get('pigment', True))
+        else:
+            self._flat_live = (brushes.FlatStroke(image.rect(), source)
+                               if (self._stamp_trail.settings['flat'] or history) and image is not None
+                               else None)
+        self._flat_live_box, self._flat_live_count = None, 0
+        self._live_stamp_count = 0
+
+    def _paint_live_stamps(self, stamps):
+        if not stamps or getattr(self, '_stroke_image', None) is None:
+            return
+        painter = QPainter(self._stroke_image)
+        if self._flat_live is not None:
+            # Only what the new stamps touched is composed again.
+            dirty = self._flat_live.add(self._stamp_trail.texture, stamps, self._stamp_to_screen)
+            self._flat_live_count = getattr(self, '_flat_live_count', 0) + len(stamps)
+            if dirty is not None and not dirty.isEmpty():
+                box = getattr(self, '_flat_live_box', None)
+                self._flat_live_box = dirty if box is None else box.united(dirty)
+                painter.setCompositionMode(QPainter.CompositionMode_Source)
+                painter.drawImage(dirty.topLeft(), self._flat_live.compose(dirty))
+                self._mark_live_dirty(dirty)
+        else:
+            brushes.paint_stamps(painter, self._stamp_trail.texture, stamps, self._stamp_to_screen)
+            self._live_stamp_count = getattr(self, '_live_stamp_count', 0) + len(stamps)
+            # what they cover on screen (a turned stamp reaches its diagonal)
+            t = self._stamp_to_screen
+            scale = math.sqrt(abs(t.determinant())) or 1.0
+            for x, y, size, *_rest in stamps:
+                p = t.map(QPointF(x, y))
+                half = size * scale * 0.75 + 2
+                self._mark_live_dirty(QRectF(p.x() - half, p.y() - half, 2 * half, 2 * half).toAlignedRect())
+        painter.end()
+        if not self.stroke_update_timer.isActive():
+            self.stroke_update_timer.start()
+
+    # -- ⬚ select + transform ---------------------------------------------------
+    #
+    # Draw a lasso round marks on the selected layer (or click one): they get
+    # a frame. Drag inside it to move them, a corner to scale them (around the
+    # opposite corner), outside it to turn them (Shift: 15° steps). Enter or
+    # a double-click applies, Esc cancels, Ctrl+Z undoes. Marks are data, so
+    # the result is laid again from it - textured strokes stay sharp at any
+    # size. While dragging, a picture of the selection made once follows the
+    # pointer (cheap); the marks themselves change when it is applied.
+
+    select_mode = False
+    _sel = None             # the transform under way: see _start_selection
+    _sel_hidden = None      # ids of the marks it holds, left out of the layer meanwhile
+    _sel_lasso = None       # label points of a lasso being drawn
+    _sel_drag = None        # (part, start pos in picture coords, transform at start, anchor)
+    _transform_undo = None  # layer id -> [kept state, ...] for Ctrl+Z
+    _SEL_HANDLE = 7         # px: a corner grabs within this
+    _SEL_TURN_REACH = 60    # px outside the frame that still turn it; further starts a new lasso
+
+    def toggle_select_tool(self, checked):
+        if checked:
+            self._deactivate_tools(keep='select')
+            self.select_mode = True
+            self.status.showMessage(
+                "⬚ Select: draw a lasso round marks (or click one) on this layer — drag inside to "
+                "move, a corner to scale, outside to turn (Shift: 15°) · Enter applies, Esc cancels")
+        else:
+            self._disable_select_silent()
+        self.apply_tool_cursor()
+
+    def _disable_select_silent(self):
+        """Select off: a transform under way is applied (as switching tools
+        in a paint app does)."""
+        if not self.select_mode and self._sel is None:
+            return
+        self.commit_selection()
+        self.select_mode = False
+        self._sel_lasso = None
+        btn = getattr(self, 'select_tool_btn', None)
+        if btn is not None and btn.isChecked():
+            btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
+        self.image_label.update()
+
+    def _sel_view(self):
+        """The current view as _paint_marks takes it, and picture -> label."""
+        pix = self.image_label.pixmap()
+        if pix is None or pix.isNull() or getattr(self, 'original_pixmap', None) is None:
+            return None, None
+        view = (pix.width(), pix.height(), *self._fx_view_params())
+        return view, self._layer_view_transform(view)
+
+    def _to_picture(self, pos):
+        _view, to_label = self._sel_view()
+        if to_label is None:
+            return None
+        back, ok = to_label.inverted()
+        return back.map(QPointF(pos)) if ok else None
+
+    def _start_selection(self, lasso_label):
+        """Take the marks the lasso (label points) holds, on the active layer."""
+        view, to_label = self._sel_view()
+        if to_label is None:
+            return
+        back, ok = to_label.inverted()
+        if not ok:
+            return
+        if len(lasso_label) < 3 or QPolygonF(lasso_label).boundingRect().width() + \
+                QPolygonF(lasso_label).boundingRect().height() < 8:
+            # A click: whatever is under it.
+            c = QPointF(lasso_label[0]) if lasso_label else QPointF()
+            r = 6
+            lasso_label = [c + QPointF(-r, -r), c + QPointF(r, -r), c + QPointF(r, r), c + QPointF(-r, r)]
+        lasso = QPolygonF([back.map(QPointF(p)) for p in lasso_label])
+        layer = self.active_layer
+        taken = [(k, m) for k, m in self._ordered_marks(layer) if mark_transform.lasso_takes(k, m, lasso)]
+        self._take_marks(layer, taken, view, to_label)
+
+    def select_all_marks(self):
+        """Ctrl+A with ⬚ on: everything movable on the active layer."""
+        if not self.select_mode:
+            return
+        self.commit_selection()
+        view, to_label = self._sel_view()
+        if to_label is None:
+            return
+        layer = self.active_layer
+        self._take_marks(layer, [(k, m) for k, m in self._ordered_marks(layer)
+                                 if k in mark_transform.SELECTABLE], view, to_label)
+
+    def _take_marks(self, layer, taken, view, to_label):
+        if not taken:
+            self.status.showMessage(f"⬚ Nothing drawn there on {layer.name}", 3000)
+            self.image_label.update()
+            return
+        box = mark_transform.bounds(taken)
+        if box.isEmpty():
+            box = box.adjusted(-1, -1, 1, 1)
+        self._sel = {'layer': layer, 'marks': taken, 'box': box, 't': QTransform(),
+                     'kept': mark_transform.snapshot(taken), 'to_label': QTransform(to_label),
+                     'image': None}
+        # The selection on its own, as it looks now: what follows the pointer.
+        image = QImage(view[0], view[1], QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        self._paint_layer_marks(painter, taken, *view)
+        painter.end()
+        self._sel['image'] = image
+        # ... and the layer without it underneath.
+        self._sel_hidden = {id(m) for _k, m in taken}
+        self._relay_layer(layer)
+        n = len(taken)
+        self.status.showMessage(
+            f"⬚ {n} mark{'s' if n != 1 else ''} — drag inside to move, a corner to scale, "
+            "outside to turn · Enter applies, Esc cancels")
+
+    def _relay_layer(self, layer):
+        for sc in getattr(self, '_sel_shortcuts', ()):
+            sc.setEnabled(self._sel is not None)
+        layer.raster = None
+        self._invalidate_line_caches()
+        if self.current_image:
+            self.display_image(self.current_image)
+
+    def commit_selection(self):
+        """Apply the transform under way to the marks (one Ctrl+Z step)."""
+        sel = self._sel
+        if sel is None:
+            return
+        t = sel['t']
+        self._sel, self._sel_hidden, self._sel_drag = None, None, None
+        if not t.isIdentity():
+            mark_transform.apply(sel['marks'], t)
+            layer = sel['layer']
+            if self._transform_undo is None:
+                self._transform_undo = {}
+            self._transform_undo.setdefault(id(layer), []).append(sel['kept'])
+            layer.marks['_undo_stack'].append('transform')
+            scale, turn = mark_transform.scale_and_turn(t)
+            self.status.showMessage(
+                f"⬚ Applied: {scale * 100:.0f} %, {math.degrees(turn):.0f}° — Ctrl+Z undoes", 4000)
+        self._relay_layer(sel['layer'])
+
+    def cancel_selection(self):
+        """Esc: the marks stay as they were."""
+        sel = self._sel
+        if sel is None:
+            return
+        self._sel, self._sel_hidden, self._sel_drag = None, None, None
+        self._relay_layer(sel['layer'])
+
+    def _drop_selection(self):
+        """The marks are going (another picture): nothing to put back."""
+        self._sel, self._sel_hidden, self._sel_drag, self._sel_lasso = None, None, None, None
+
+    def _sel_frame(self):
+        """The frame's corners in label coords (tl, tr, br, bl), or None."""
+        sel = self._sel
+        _view, to_label = self._sel_view()
+        if sel is None or to_label is None:
+            return None
+        b = sel['box']
+        m = sel['t'] * to_label
+        return [m.map(p) for p in (b.topLeft(), b.topRight(), b.bottomRight(), b.bottomLeft())]
+
+    def _sel_part_at(self, pos):
+        """'scale<i>' (corner i), 'move', 'turn' or None (far outside)."""
+        frame = self._sel_frame()
+        if frame is None:
+            return None
+        pos = QPointF(pos)
+        for i, corner in enumerate(frame):
+            if (corner - pos).manhattanLength() <= self._SEL_HANDLE * 2:
+                return f"scale{i}"
+        poly = QPolygonF(frame)
+        if poly.containsPoint(pos, Qt.OddEvenFill):
+            return 'move'
+        # distance to the frame: near it turns, far away starts afresh
+        near = min(self._dist_to_segment(pos, frame[i], frame[(i + 1) % 4]) for i in range(4))
+        return 'turn' if near <= self._SEL_TURN_REACH else None
+
+    @staticmethod
+    def _dist_to_segment(p, a, b):
+        ab = b - a
+        length = QPointF.dotProduct(ab, ab)
+        k = 0.0 if length == 0 else max(0.0, min(1.0, QPointF.dotProduct(p - a, ab) / length))
+        q = a + ab * k
+        return math.hypot(p.x() - q.x(), p.y() - q.y())
+
+    _SEL_CURSORS = {'move': Qt.SizeAllCursor, 'turn': Qt.PointingHandCursor,
+                    'scale0': Qt.SizeFDiagCursor, 'scale2': Qt.SizeFDiagCursor,
+                    'scale1': Qt.SizeBDiagCursor, 'scale3': Qt.SizeBDiagCursor}
+
+    def select_press(self, pos):
+        if self._sel is not None and self._sel['layer'] is not self.active_layer:
+            self.commit_selection()
+        part = self._sel_part_at(pos) if self._sel is not None else None
+        if part is None:
+            # Afresh: what is there now goes in, a new lasso starts.
+            self.commit_selection()
+            self._sel_lasso = [QPointF(pos)]
+            self.image_label.update()
+            return
+        start = self._to_picture(pos)
+        if start is None:
+            return
+        sel = self._sel
+        anchor = None
+        b = sel['box']
+        corners = (b.topLeft(), b.topRight(), b.bottomRight(), b.bottomLeft())
+        if part.startswith('scale'):
+            anchor = sel['t'].map(corners[(int(part[-1]) + 2) % 4])
+        elif part == 'turn':
+            anchor = sel['t'].map(b.center())
+        self._sel_drag = (part, start, QTransform(sel['t']), anchor)
+
+    def select_move(self, pos, buttons, modifiers=Qt.NoModifier):
+        label = self.image_label
+        if self._sel_lasso is not None and buttons & Qt.LeftButton:
+            self._sel_lasso.append(QPointF(pos))
+            label.update()
+            return
+        drag = self._sel_drag
+        if drag is None or not buttons & Qt.LeftButton:
+            part = self._sel_part_at(pos) if self._sel is not None else None
+            label.setCursor(self._SEL_CURSORS.get(part, Qt.CrossCursor))
+            return
+        now = self._to_picture(pos)
+        if now is None:
+            return
+        part, start, t0, anchor = drag
+        if part == 'move':
+            step = QTransform.fromTranslate(now.x() - start.x(), now.y() - start.y())
+        elif part.startswith('scale'):
+            d0 = math.hypot(start.x() - anchor.x(), start.y() - anchor.y())
+            d1 = math.hypot(now.x() - anchor.x(), now.y() - anchor.y())
+            step = mark_transform.about(anchor, max(0.02, d1 / d0) if d0 > 1e-6 else 1.0)
+        else:
+            a0 = math.atan2(start.y() - anchor.y(), start.x() - anchor.x())
+            a1 = math.atan2(now.y() - anchor.y(), now.x() - anchor.x())
+            degrees = math.degrees(a1 - a0)
+            if modifiers & Qt.ShiftModifier:
+                # Shift: the frame's whole turn in 15° steps
+                total = math.degrees(mark_transform.scale_and_turn(t0)[1]) + degrees
+                degrees = round(total / 15.0) * 15.0 - math.degrees(mark_transform.scale_and_turn(t0)[1])
+            step = mark_transform.about(anchor, 1.0, degrees)
+        self._sel['t'] = t0 * step
+        scale, turn = mark_transform.scale_and_turn(self._sel['t'])
+        self.status.showMessage(f"⬚ {scale * 100:.0f} %, {math.degrees(turn):.0f}°")
+        label.update()
+
+    def select_release(self):
+        if self._sel_lasso is not None:
+            lasso, self._sel_lasso = self._sel_lasso, None
+            self._start_selection(lasso)
+            self.image_label.update()
+            return
+        self._sel_drag = None
+
+    def select_double_click(self, pos):
+        if self._sel is not None and self._sel_part_at(pos) == 'move':
+            self.commit_selection()
+            return True
+        return False
+
+    def paint_selection_overlay(self, painter):
+        """On the label: the lasso being drawn, the selection following the
+        pointer and its frame with corner handles."""
+        if self._sel_lasso and len(self._sel_lasso) > 1:
+            poly = QPolygonF(self._sel_lasso)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+            painter.drawPolyline(poly)
+            painter.setPen(QPen(QColor(255, 255, 255), 1, Qt.DashLine))
+            painter.drawPolyline(poly)
+        sel = self._sel
+        if sel is None:
+            return
+        _view, to_label = self._sel_view()
+        if to_label is None:
+            return
+        back, ok = sel['to_label'].inverted()
+        if ok and sel['image'] is not None:
+            # the picture made when it was taken -> picture -> moved -> the view now
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            layer = sel['layer']
+            painter.setOpacity(layer.opacity / 100 if layer.visible else 0.0)
+            painter.setTransform(back * sel['t'] * to_label, True)
+            painter.drawImage(0, 0, sel['image'])
+            painter.restore()
+        frame = self._sel_frame()
+        if frame is None:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        poly = QPolygonF(frame + [frame[0]])
+        painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+        painter.drawPolyline(poly)
+        painter.setPen(QPen(QColor(240, 160, 48), 1, Qt.DashLine))
+        painter.drawPolyline(poly)
+        h = self._SEL_HANDLE
+        painter.setPen(QPen(QColor(0, 0, 0, 220), 1))
+        painter.setBrush(QColor(255, 255, 255))
+        for corner in frame:
+            painter.drawRect(QRectF(corner.x() - h / 2, corner.y() - h / 2, h, h))
+        painter.restore()
+
+    # -- ✂ crop ---------------------------------------------------------------
+    #
+    # A frame dragged over the picture as shown; everything outside it dims.
+    # Applying cuts that area from the file at its real resolution - not from
+    # the screen-capped pixmap - with the view's rotation / flips and any marks
+    # burnt in. The original is never touched: the result is a new picture in
+    # Downloads, slotted in right after the original. Effects (LUT, contrast …)
+    # stay view settings, so they look the same on it and are not saved in it.
+
+    _CROP_GRAB = 8      # px around the frame's edge that grab it
+
+    def _can_crop(self):
+        path = self.current_image
+        return bool(path) and self._open_document() is None and not (
+            is_video_file(path) or is_animated_image(path))
+
+    def toggle_crop_tool(self, checked):
+        if checked:
+            if not self._can_crop():
+                self.crop_btn.blockSignals(True)
+                self.crop_btn.setChecked(False)
+                self.crop_btn.blockSignals(False)
+                self.status.showMessage("Crop works on still pictures", 3000)
+                return
+            # A slideshow would change the picture under the frame.
+            self.timer_button.setChecked(False)
+            self._deactivate_tools(keep='crop')
+            self.crop_mode = True
+            self.apply_tool_cursor()
+            self.status.showMessage(
+                "Crop: drag a frame, then Enter or double-click — Esc cancels")
+        else:
+            self._disable_crop_silent()
+            self.apply_tool_cursor()
+
+    def _disable_crop_silent(self):
+        """Turn the crop tool off and drop its frame, without emitting signals."""
+        self.crop_mode = False
+        self._crop_drag = None
+        self._set_crop_sel(None)
+        btn = getattr(self, 'crop_btn', None)
+        if btn is not None and btn.isChecked():
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+
+    def _set_crop_sel(self, sel):
+        self._crop_sel = sel
+        self._crop_path = self.current_image if sel is not None else None
+        for shortcut in getattr(self, '_crop_shortcuts', ()):
+            shortcut.setEnabled(sel is not None)
+        label = getattr(self, 'image_label', None)
+        if label is not None:
+            label.update()
+
+    def _crop_picture_rect(self):
+        """The whole picture in label coords (QRectF), or None."""
+        geometry = self._fill_input_geometry()
+        if geometry is None:
+            return None
+        return QRectF(geometry['draw_x'], geometry['draw_y'],
+                      geometry['zoomed_width'], geometry['zoomed_height'])
+
+    def _crop_screen_rect(self):
+        """The frame in label coords (QRectF), or None with no frame to show."""
+        sel = self._crop_sel
+        if not self.crop_mode or sel is None:
+            return None
+        if self._crop_path != self.current_image:      # moved to another picture
+            self._set_crop_sel(None)
+            return None
+        pic = self._crop_picture_rect()
+        if pic is None:
+            return None
+        return QRectF(pic.x() + sel.x() * pic.width(), pic.y() + sel.y() * pic.height(),
+                      sel.width() * pic.width(), sel.height() * pic.height())
+
+    def _crop_part_at(self, pos):
+        """What a press at *pos* grabs: 'move', an edge / corner made of the
+        letters l r t b, or 'new' to drag a fresh frame."""
+        rect = self._crop_screen_rect()
+        if rect is None:
+            return 'new'
+        grab = self._CROP_GRAB
+        if not rect.adjusted(-grab, -grab, grab, grab).contains(pos):
+            return 'new'
+        part = ''
+        if abs(pos.x() - rect.left()) <= grab:
+            part += 'l'
+        elif abs(pos.x() - rect.right()) <= grab:
+            part += 'r'
+        if abs(pos.y() - rect.top()) <= grab:
+            part += 't'
+        elif abs(pos.y() - rect.bottom()) <= grab:
+            part += 'b'
+        return part or 'move'
+
+    def _crop_cursor(self, part):
+        return {'new': Qt.CrossCursor, 'move': Qt.SizeAllCursor,
+                'l': Qt.SizeHorCursor, 'r': Qt.SizeHorCursor,
+                't': Qt.SizeVerCursor, 'b': Qt.SizeVerCursor,
+                'lt': Qt.SizeFDiagCursor, 'rb': Qt.SizeFDiagCursor,
+                'lb': Qt.SizeBDiagCursor, 'rt': Qt.SizeBDiagCursor}[part]
+
+    def _crop_fraction(self, pos, pic):
+        """*pos* as a fraction of the picture, held inside it."""
+        return (min(1.0, max(0.0, (pos.x() - pic.x()) / pic.width())),
+                min(1.0, max(0.0, (pos.y() - pic.y()) / pic.height())))
+
+    def crop_press(self, pos):
+        if not self._can_crop():
+            self.status.showMessage("Crop works on still pictures", 3000)
+            return
+        pic = self._crop_picture_rect()
+        if pic is None or pic.isEmpty():
+            return
+        part = self._crop_part_at(pos)
+        if part == 'new':
+            x, y = self._crop_fraction(pos, pic)
+            self._set_crop_sel(QRectF(x, y, 0, 0))
+        self._crop_drag = (part, QRectF(self._crop_sel), pos)
+
+    def crop_move(self, pos):
+        if self._crop_drag is None:
+            self.image_label.setCursor(self._crop_cursor(self._crop_part_at(pos)))
+            return
+        pic = self._crop_picture_rect()
+        if pic is None or pic.isEmpty():
+            return
+        part, start, press = self._crop_drag
+        x, y = self._crop_fraction(pos, pic)
+        if part == 'new':
+            sel = QRectF(QPointF(start.x(), start.y()), QPointF(x, y)).normalized()
+        elif part == 'move':
+            dx = (pos.x() - press.x()) / pic.width()
+            dy = (pos.y() - press.y()) / pic.height()
+            sel = QRectF(start)
+            sel.moveTo(min(1.0 - start.width(), max(0.0, start.x() + dx)),
+                       min(1.0 - start.height(), max(0.0, start.y() + dy)))
+        else:
+            sel = QRectF(start)
+            if 'l' in part:
+                sel.setLeft(x)
+            elif 'r' in part:
+                sel.setRight(x)
+            if 't' in part:
+                sel.setTop(y)
+            elif 'b' in part:
+                sel.setBottom(y)
+            sel = sel.normalized()
+        self._set_crop_sel(sel)
+
+    def crop_release(self):
+        self._crop_drag = None
+        rect = self._crop_screen_rect()
+        if rect is None:
+            return
+        if rect.width() < 3 or rect.height() < 3:       # a click, not a frame
+            self._set_crop_sel(None)
+            return
+        size = self._crop_output_size()
+        self.status.showMessage(
+            f"Crop: {size[0]}×{size[1]} — Enter or double-click to cut, "
+            "drag the frame to adjust, Esc cancels")
+
+    def _crop_full_size(self):
+        """The file's real size, as the picture is shown (rotation applied)."""
+        size = QImageReader(self.current_image).size()
+        if not size.isValid():
+            size = self.original_pixmap.size() if self.rotation_angle % 180 == 0 \
+                else self.original_pixmap.size().transposed()
+        return size.transposed() if self.rotation_angle % 180 == 90 else size
+
+    def _crop_output_size(self):
+        full = self._crop_full_size()
+        sel = self._crop_sel
+        return (max(1, round(sel.width() * full.width())),
+                max(1, round(sel.height() * full.height())))
+
+    def _crop_file_box(self, sel):
+        """The frame as (left, top, right, bottom) fractions of the file:
+        undoes the rotation, then the flips (the inverse of the display)."""
+        def to_file(u, v):
+            if self.rotation_angle == 90:
+                u, v = v, 1.0 - u
+            elif self.rotation_angle == 180:
+                u, v = 1.0 - u, 1.0 - v
+            elif self.rotation_angle == 270:
+                u, v = 1.0 - v, u
+            return (1.0 - u if self.flipped_h else u,
+                    1.0 - v if self.flipped_v else v)
+        ax, ay = to_file(sel.left(), sel.top())
+        bx, by = to_file(sel.right(), sel.bottom())
+        return min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)
+
+    def _burn_marks(self, pixmap, sel):
+        """Marks on the cropped *pixmap*, at the size and place they have on
+        screen (a pen's width is in screen pixels)."""
+        full = self._crop_full_size()
+        reference = self.original_pixmap.size()     # the space marks map from
+        pic = self._crop_picture_rect()
+        full_scale = full.width() / reference.width()
+        view_scale = pic.width() / reference.width()
+        zoom = full_scale / view_scale
+        left, top = round(sel.x() * full.width()), round(sel.y() * full.height())
+
+        marked = pixmap.copy()
+        painter = QPainter(marked)
+        painter.scale(zoom, zoom)
+        painter.translate(-left / zoom, -top / zoom)
+        self._paint_marks(painter, int(pic.width()), int(pic.height()),
+                          reference, view_scale, view_scale)
+        painter.end()
+        return marked
+
+    def apply_crop(self):
+        """Cut the framed area out into a new picture and show it."""
+        sel = self._crop_sel
+        path = self.current_image
+        if not self.crop_mode or sel is None or self._crop_path != path or sel.isEmpty():
+            return
+        image = read_image_region(path, *self._crop_file_box(sel))
+        if image.isNull():
+            self.status.showMessage("Crop failed: could not read the picture")
+            return
+        if self.flipped_h:
+            image = image.transformed(QTransform().scale(-1, 1))
+        if self.flipped_v:
+            image = image.transformed(QTransform().scale(1, -1))
+        if self.rotation_angle:
+            image = image.transformed(QTransform().rotate(self.rotation_angle))
+        pixmap = QPixmap.fromImage(image)
+        if self.lines_visible and self.has_marks():
+            pixmap = self._burn_marks(pixmap, sel)
+
+        # JPEG stays JPEG; PNG for the rest, so nothing else loses quality.
+        source_ext = os.path.splitext(path)[1].lower()
+        is_jpeg = source_ext in ('.jpg', '.jpeg')
+        base = os.path.splitext(os.path.basename(path))[0]
+        out_path = self._unique_download_path(f"{base}_crop", source_ext if is_jpeg else ".png")
+        if not pixmap.save(out_path, "JPG" if is_jpeg else "PNG", 95 if is_jpeg else -1):
+            self.status.showMessage("Crop failed: could not write to Downloads")
+            return
+
+        # Orientation is in the new file now and must not be applied twice.
+        self._disable_crop_silent()
+        self.apply_tool_cursor()
+        self.rotation_angle = 0
+        self.flipped_h = self.flipped_v = False
+        for btn in (getattr(self, 'flip_h_btn', None), getattr(self, 'flip_v_btn', None)):
+            if btn is not None:
+                btn.setChecked(False)
+        self.image_label.reset_zoom()
+        self._insert_canvas_into_playlist(out_path)
+        self._sync_line_tools_state()
+        self.status.showMessage(
+            f"Cropped to {pixmap.width()}×{pixmap.height()} — saved to Downloads: "
+            f"{os.path.basename(out_path)} (← back to the original)")
 
     # How finely a dragged ellipse is flattened into an outline. 64 segments is
     # smooth at any practical zoom and keeps the shape a plain polygon, so it
@@ -6812,6 +9313,8 @@ class RandomImageViewer(QMainWindow):
                     btn.setChecked(False)
                     btn.blockSignals(False)
             self._deactivate_tools(keep='fill')
+            if mode == 'polyline':
+                self._show_guides_for_tool()
             if mode in self._CLICK_SHAPES:
                 self.status.showMessage(self._click_shape_hint(mode))
             else:
@@ -6905,16 +9408,30 @@ class RandomImageViewer(QMainWindow):
         else:
             self._fill_screen_pts = []
 
-    def _fill_input_geometry(self):
-        """Geometry for label -> image mapping, without decoding if possible.
-
-        Only the loaded image's size is needed, and display_image keeps the
-        loaded pixmap in pixmap_cache, so normally no file is read at all.
-        """
+    def loaded_image_size(self):
+        """The size marks are stored against, or None, without decoding if
+        possible: display_image keeps the loaded pixmap in pixmap_cache, so
+        normally no file is read at all."""
+        # Video and GIF frames: the frame on screen, turned back upright.
+        if self._video_playing or self.image_label.is_animation_active():
+            frame = getattr(self, 'original_pixmap', None)
+            if frame is None or frame.isNull():
+                return None
+            return frame.size().transposed() if self.rotation_angle in (90, 270) else frame.size()
         cache = getattr(self, 'pixmap_cache', None)
         base = cache.get(self.current_image) if cache is not None else None
-        if base is not None and not base.isNull():
-            return self._build_display_geometry_cache(original_size=base.size())
+        if base is None or base.isNull():
+            base, error = safe_load_pixmap(self.current_image)
+            if error or base.isNull():
+                return None
+        # ◧ Studio: marks live on the whole sheet (canvas + strip + picture),
+        # so pointer mapping must use the sheet's size, not the picture's.
+        if getattr(self, 'studio_mode', False):
+            return QSize(self._studio_offset(base) + base.width(), base.height())
+        return base.size()
+
+    def _fill_input_geometry(self):
+        """Geometry for label -> image mapping, without decoding if possible."""
         return self._build_display_geometry_cache()
 
     def map_fill_input(self, pos):
@@ -6936,9 +9453,28 @@ class RandomImageViewer(QMainWindow):
             return None, None
         return self.image_label._map_pos_with_cache(pos, cache)
 
+    def _mark_color(self):
+        """The colour of the line or shape being made: the pen colour, or -
+        with 'Jitter lines & shapes too' - one jittered by the brush's Hue /
+        Sat / Value ±. Picked once and kept until the mark is done, so its
+        preview shows the colour it gets (see _roll_mark_color)."""
+        settings = self.brush_settings
+        key = (self.line_color.rgba(), bool(settings.get('jitter_marks')), settings['hue_jitter'],
+               settings['sat_jitter'], settings['val_jitter'])
+        kept = getattr(self, '_next_mark_colour', None)
+        if kept is None or kept[0] != key:
+            colour = (brushes.jitter_color(self.line_color, settings)
+                      if settings.get('jitter_marks') else QColor(self.line_color))
+            kept = self._next_mark_colour = (key, colour)
+        return QColor(kept[1])
+
+    def _roll_mark_color(self):
+        """A mark was made: the next one gets a colour of its own."""
+        self._next_mark_colour = None
+
     def _fill_preview_color(self):
         """The colour the fill will be committed in, so the preview is exact."""
-        colour = QColor(self.line_color)
+        colour = self._mark_color()
         colour.setAlpha(getattr(self, 'line_transparency', 255))
         return colour
 
@@ -6994,6 +9530,7 @@ class RandomImageViewer(QMainWindow):
             return
         record = {'shape': fill['shape'], 'points': points,
                   'color': self._fill_preview_color()}
+        self._roll_mark_color()
         if fill['shape'] == 'polyline':
             # Its own width and open / closed state, so later brush changes
             # never restyle it (as with strokes).
@@ -7027,7 +9564,8 @@ class RandomImageViewer(QMainWindow):
         """
         if not self.lines_visible:
             return True            # marks are hidden: nothing to show
-        if (self.erase_strokes or self.current_erase_stroke
+        if (not self._layers_plain() or self.current_erase_stroke
+                or self.active_layer is not self.layers[-1]
                 or self.crosshair_overlay or self.grid_overlay
                 or getattr(self, '_video_playing', False)):
             # Erase holes and guide overlays are composited around the marks,
@@ -7241,6 +9779,7 @@ class RandomImageViewer(QMainWindow):
             # Enable tablet tracking for pressure sensitivity, but handle events carefully
             if hasattr(self, 'image_label'):
                 self.image_label.setAttribute(Qt.WA_TabletTracking, True)
+            self._show_color_box_for_painting()
             print(f"Free draw mode activated - pen pressure enabled")
         if not checked:
             # Reset drawing state when mode is deactivated
@@ -7250,6 +9789,7 @@ class RandomImageViewer(QMainWindow):
             if hasattr(self, 'image_label'):
                 self.image_label.setAttribute(Qt.WA_TabletTracking, False)
             print(f"Free draw mode deactivated")
+        self._sync_erase_button()
         self._update_cursor_and_status()
 
     # ───────────────────── Eraser tool ─────────────────────
@@ -7272,9 +9812,7 @@ class RandomImageViewer(QMainWindow):
         self.eraser_mode = False
         self.current_erase_stroke = None
         self.is_erasing = False
-        btn = getattr(self, 'eraser_tool_btn', None)
-        if btn is not None and btn.isChecked():
-            btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
+        # ⌫ belongs to the brush's 🧽 Erase mode now (see _sync_erase_button).
         self._update_eraser_cursor()
 
     def update_eraser_size(self, value):
@@ -7282,9 +9820,94 @@ class RandomImageViewer(QMainWindow):
         self.eraser_size = int(value)
         self._update_eraser_cursor()
 
+    def _view_turn(self):
+        """How the view turns the picture on screen (rotation, mirror; no
+        scale), as a QTransform."""
+        tx = self._compute_line_transform()
+        if not tx or self.original_pixmap is None:
+            return QTransform()
+        original_size = self.original_pixmap.size()
+        if self.rotation_angle in (90, 270):
+            unrot_w, unrot_h = original_size.height(), original_size.width()
+        else:
+            unrot_w, unrot_h = original_size.width(), original_size.height()
+        t = self._picture_to_display(
+            self._mark_display_mapper(original_size, tx['scale_x'], tx['scale_y'],
+                                      tx['draw_x'], tx['draw_y']), unrot_w, unrot_h)
+        s = math.sqrt(abs(t.determinant())) or 1.0
+        return QTransform(t.m11() / s, t.m12() / s, t.m21() / s, t.m22() / s, 0, 0)
+
+    def _texture_cursor_turn(self):
+        """(picture angle, view turn) the next stamp would get: the stroke's
+        last stamp while drawing, else the pen's lean (or none) plus Angle."""
+        trail = self._stamp_trail
+        if trail is not None and trail.angle is not None:
+            t = self._stamp_to_screen
+            s = math.sqrt(abs(t.determinant())) or 1.0
+            return trail.angle, QTransform(t.m11() / s, t.m12() / s, t.m21() / s, t.m22() / s, 0, 0)
+        turn = self._view_turn()
+        settings = self.brush_settings
+        sx, sy = 1.0, 0.0
+        tilt = self._current_tilt()
+        if (settings['angle_mode'] == 'auto' and tilt is not None
+                and math.hypot(*tilt) >= brushes.TILT_MIN):
+            sx, sy = tilt
+        back, _ = turn.inverted()
+        px, py = back.m11() * sx + back.m21() * sy, back.m12() * sx + back.m22() * sy
+        return math.atan2(py, px) + math.radians(settings['angle']), turn
+
+    _SPRAY_CURSOR_MAX = 256     # px: a bigger spray shows a cross with its size
+
+    def _spray_cursor(self):
+        """Spray: a dotted ring the size of the cloud; a cloud bigger than a
+        cursor can be gets a cross and a small ring instead."""
+        self._cursor_key = self._texture_cursor_key()[:-2]
+        spread = max(1, int(self.brush_settings.get('spray_spread', 1)))
+        d = int(self.line_thickness * spread)
+        big = d > self._SPRAY_CURSOR_MAX
+        edge = 33 if big else max(8, d) + 3
+        pix = QPixmap(edge, edge)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        c = edge / 2.0
+        for colour, width in ((QColor(0, 0, 0, 200), 3), (QColor(255, 255, 255, 230), 1)):
+            pen = QPen(colour, width)
+            if not big:
+                pen.setStyle(Qt.DotLine)
+            p.setPen(pen)
+            r = 6.0 if big else (edge - 3) / 2.0
+            p.drawEllipse(QPointF(c, c), r, r)
+            if big:
+                p.drawLine(QPointF(c, 0), QPointF(c, c - 9))
+                p.drawLine(QPointF(c, c + 9), QPointF(c, edge))
+                p.drawLine(QPointF(0, c), QPointF(c - 9, c))
+                p.drawLine(QPointF(c + 9, c), QPointF(edge, c))
+        p.end()
+        return QCursor(pix)
+
+    def _texture_cursor_key(self):
+        angle, turn = self._texture_cursor_turn()
+        return (self.brush_settings['texture'], int(self.line_thickness),
+                round(math.degrees(angle) / 4) % 90,     # 4° steps
+                round(turn.m11()), round(turn.m12()), round(turn.m21()), round(turn.m22()),
+                angle, turn)
+
     def _brush_cursor(self):
-        """Free draw: a ring the size of the brush (a small one for thin
-        brushes), black and white so it shows on any picture."""
+        """Free draw: the textured tip's outline, or for the round pen a ring
+        the size of the brush (a small one for thin brushes), black and white
+        so it shows on any picture."""
+        texture = self._brush_texture()
+        if texture is not None and getattr(texture, 'procedural', False):
+            return self._spray_cursor()
+        if texture is not None:
+            key = self._texture_cursor_key()
+            self._cursor_key = key[:-2]
+            dpr = self.image_label.devicePixelRatioF() if hasattr(self, 'image_label') else 1.0
+            image = texture.outline(max(4, self.line_thickness),
+                                    QTransform().rotateRadians(key[-2]) * key[-1], dpr)
+            if image is not None:
+                return QCursor(QPixmap.fromImage(image))
         d = max(6, min(128, int(self.line_thickness)))
         pix = QPixmap(d + 3, d + 3)
         pix.fill(Qt.transparent)
@@ -7340,10 +9963,9 @@ class RandomImageViewer(QMainWindow):
             if not label or not label.pixmap() or label.pixmap().isNull():
                 return None
             if original_size is None:
-                original_pixmap, error = safe_load_pixmap(self.current_image)
-                if error or original_pixmap.isNull():
+                original_size = self.loaded_image_size()
+                if original_size is None:
                     return None
-                original_size = original_pixmap.size()
             rotation = self.rotation_angle
             if rotation == 90 or rotation == 270:
                 display_reference_size = QSize(original_size.height(), original_size.width())
@@ -7403,12 +10025,6 @@ class RandomImageViewer(QMainWindow):
         self.erase_update_timer.stop()
         if self.current_erase_stroke and len(self.current_erase_stroke) > 0:
             self.erase_strokes.append(self.current_erase_stroke)
-            # Snapshot the current drawing counts so anything drawn AFTER this erase
-            # is rendered on top of the erase holes (lets you re-draw over erased areas).
-            self._erase_state_marks.append({
-                'free_strokes': len(self.drawn_free_strokes),
-                'free_lines': len(self.drawn_free_lines),
-            })
             self._undo_stack.append('erase')
         self.current_erase_stroke = None
         self.is_erasing = False
@@ -7436,116 +10052,6 @@ class RandomImageViewer(QMainWindow):
         """
         return self._mark_display_mapper(original_size, scale_x, scale_y, draw_x, draw_y)(x, y)
 
-    def _draw_post_erase_overlay(self, pixmap, strokes, free_lines, scale_x, scale_y, draw_x, draw_y, original_size):
-        """Draw drawings made AFTER the most recent erase onto the revealed image.
-
-        The eraser exposes this image inside its holes, so these strokes stay
-        visible there — letting the user draw again over an erased area. Uses the
-        same point transform as the erase mask so the overlay aligns with the holes."""
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        try:
-            # Free draw strokes (continuous paths) — always safe to overlay since
-            # _transform_point_to_display matches the free-stroke renderer exactly.
-            for stroke in strokes:
-                if len(stroke) < 2:
-                    continue
-                # Same size / colour / pressure rules as _paint_marks, so the
-                # overlay lines up with the stroke outside the hole.
-                base = getattr(stroke, 'thickness', None) or self.line_thickness
-                ink = getattr(stroke, 'color', None) or self.line_color
-                for i in range(len(stroke) - 1):
-                    a = stroke[i]
-                    b = stroke[i + 1]
-                    ax, ay, ap = (a if len(a) == 3 else (a[0], a[1], 1.0))
-                    bx, by, bp = (b if len(b) == 3 else (b[0], b[1], 1.0))
-                    thickness = self._pressure_to_thickness((ap + bp) / 2.0, base)
-                    sx, sy = self._transform_point_to_display(ax, ay, scale_x, scale_y, draw_x, draw_y, original_size)
-                    ex, ey = self._transform_point_to_display(bx, by, scale_x, scale_y, draw_x, draw_y, original_size)
-                    painter.setPen(QPen(ink, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                    painter.drawLine(sx, sy, ex, ey)
-            # Two-point free lines — only overlay when un-rotated/un-flipped, where
-            # the transform matches the main free-line renderer (avoids misalignment).
-            if free_lines and self.rotation_angle == 0 and not self.flipped_h and not self.flipped_v:
-                for line in free_lines:
-                    painter.setPen(QPen(line.get('color') or self.line_color,
-                                        max(1, line.get('thickness') or self.line_thickness),
-                                        Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                    s = line['start']
-                    e = line['end']
-                    sx, sy = self._transform_point_to_display(s[0], s[1], scale_x, scale_y, draw_x, draw_y, original_size)
-                    ex, ey = self._transform_point_to_display(e[0], e[1], scale_x, scale_y, draw_x, draw_y, original_size)
-                    painter.drawLine(sx, sy, ex, ey)
-        finally:
-            painter.end()
-
-    def _apply_erase_holes(self, target_pixmap, clean_pixmap, scale_x, scale_y, draw_x, draw_y, original_size):
-        """Restore the clean (line-free) image inside each erase stroke, which
-        visually erases only the touched portions of lines/drawings."""
-        if not (self.erase_strokes or self.current_erase_stroke):
-            return
-        if clean_pixmap is None or clean_pixmap.isNull():
-            return
-        from PySide6.QtGui import QPolygonF
-        from PySide6.QtCore import QPointF
-        strokes = list(self.erase_strokes)
-        if self.current_erase_stroke:
-            strokes.append(self.current_erase_stroke)
-
-        # ── Build a SOLID coverage mask of every erased region ──────────────
-        # Painting opaque white strokes onto a transparent mask is robust against
-        # self-overlap (back-and-forth drags): overlapping opaque paint just stays
-        # opaque, with none of the odd/even or winding cancellation that made
-        # path-union clipping leave holes. Cost is O(points), so it stays fast
-        # even on long tablet strokes.
-        mask = QPixmap(target_pixmap.size())
-        mask.fill(Qt.transparent)
-        mp = QPainter(mask)
-        mp.setRenderHint(QPainter.Antialiasing, True)
-        white = QColor(255, 255, 255, 255)
-        any_drawn = False
-        for stroke in strokes:
-            if not stroke:
-                continue
-            pts = []
-            max_r = 1.0
-            for (x, y, r) in stroke:
-                dx, dy = self._transform_point_to_display(x, y, scale_x, scale_y, draw_x, draw_y, original_size)
-                rd = max(1.0, r * scale_x)
-                pts.append((dx, dy))
-                if rd > max_r:
-                    max_r = rd
-            if len(pts) == 1:
-                # Single tap → a filled dot
-                mp.setPen(Qt.NoPen)
-                mp.setBrush(white)
-                mp.drawEllipse(QPointF(pts[0][0], pts[0][1]), max_r, max_r)
-            else:
-                # Continuous band: a round-cap/round-join pen stroke is fully
-                # solid and self-overlap-safe.
-                mp.setBrush(Qt.NoBrush)
-                pen = QPen(white, max_r * 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                mp.setPen(pen)
-                mp.drawPolyline(QPolygonF([QPointF(px, py) for px, py in pts]))
-            any_drawn = True
-        mp.end()
-        if not any_drawn:
-            return
-
-        # ── Keep the clean image only inside the mask, then paint it over the
-        #    drawn pixmap → reveals the untouched image exactly where erased ──
-        patch = QPixmap(clean_pixmap.size())
-        patch.fill(Qt.transparent)
-        pp = QPainter(patch)
-        pp.drawPixmap(0, 0, clean_pixmap)
-        pp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-        pp.drawPixmap(0, 0, mask)
-        pp.end()
-
-        ep = QPainter(target_pixmap)
-        ep.drawPixmap(0, 0, patch)
-        ep.end()
-
     def _invalidate_line_caches(self):
         """Clear caches so the next render repaints lines/erases."""
         if isinstance(getattr(self, 'enhancement_cache', None), dict):
@@ -7554,6 +10060,11 @@ class RandomImageViewer(QMainWindow):
             self.scaled_cache.clear()
 
     # ───────────────────── Color Snap (eyedropper) tool ─────────────────────
+    # Tools the eyedropper hands back to after a pick
+    _RETURN_TOOLS = ('free_draw_tool_btn', 'eraser_tool_btn', 'line_tool_btn', 'hline_tool_btn',
+                     'free_line_tool_btn', 'polyline_btn', 'lasso_fill_btn', 'polygon_fill_btn',
+                     'rect_fill_btn', 'ellipse_fill_btn', 'triangle_fill_btn')
+
     def _shortcut_color_snap(self):
         """I: toggle the colour snap eyedropper, exactly like its button.
 
@@ -7575,6 +10086,10 @@ class RandomImageViewer(QMainWindow):
         """
         self.color_snap_mode = bool(checked)
         if self.color_snap_mode:
+            # The tool in hand goes back on after a pick (see commit_color_snap)
+            self._tool_before_snap = next(
+                (btn for btn in (getattr(self, name, None) for name in self._RETURN_TOOLS)
+                 if btn is not None and btn.isChecked()), None)
             # Mutually exclude with all drawing tools
             self._deactivate_tools(keep='color_snap')
             if self._color_snap_preview is None:
@@ -7640,6 +10155,47 @@ class RandomImageViewer(QMainWindow):
         except Exception:
             return None
 
+    def _sample_screen_color(self, label_pos, radius=2):
+        """The colour on screen under *label_pos* (label coords), averaged
+        over (2*radius+1)² screen pixels.
+
+        Reads the label's shown pixmap, so painted strokes, layers and
+        fills count - the picture alone would give the colour under the
+        paint (a grey canvas picks grey whatever was painted on it).
+        Falls back to the picture when nothing is shown there.
+        """
+        label = getattr(self, 'image_label', None)
+        pix = label.pixmap() if label is not None else None
+        if pix is not None and not pix.isNull():
+            try:
+                key = pix.cacheKey()
+                if getattr(self, '_color_snap_screen_key', None) != key:
+                    self._color_snap_screen_image = pix.toImage().convertToFormat(
+                        QImage.Format_ARGB32)
+                    self._color_snap_screen_key = key
+                img = self._color_snap_screen_image
+                dpr = pix.devicePixelRatio() or 1.0
+                off_x = (label.width() - pix.width() / dpr) / 2.0
+                off_y = (label.height() - pix.height() / dpr) / 2.0
+                cx = int((label_pos.x() - off_x) * dpr)
+                cy = int((label_pos.y() - off_y) * dpr)
+                w, h = img.width(), img.height()
+                if 0 <= cx < w and 0 <= cy < h:
+                    r_sum = g_sum = b_sum = n = 0
+                    for y in range(max(0, cy - radius), min(h, cy + radius + 1)):
+                        for x in range(max(0, cx - radius), min(w, cx + radius + 1)):
+                            c = img.pixelColor(x, y)
+                            if c.alpha() < 128:
+                                continue
+                            r_sum += c.red(); g_sum += c.green(); b_sum += c.blue()
+                            n += 1
+                    if n:
+                        return QColor(r_sum // n, g_sum // n, b_sum // n)
+            except Exception:
+                pass
+        ox, oy = label._map_label_pos_to_display(label_pos) if label is not None else (None, None)
+        return None if ox is None else self._sample_color_at(ox, oy)
+
     def _get_color_snap_source_image(self):
         """The processed image as shown on screen, cached for cheap sampling.
 
@@ -7695,7 +10251,7 @@ class RandomImageViewer(QMainWindow):
         ox, oy = self.image_label._map_label_pos_to_display(label_pos)
         if ox is None:
             return
-        color = self._sample_color_at(ox, oy)
+        color = self._sample_screen_color(label_pos)
         if color is not None:
             self._update_color_snap_preview(global_pos, color, label_pos)
 
@@ -7743,6 +10299,12 @@ class RandomImageViewer(QMainWindow):
                 QTimer.singleShot(180, lambda: btn.setStyleSheet(original_style))
             except Exception:
                 pass
+        # Back to the tool the eyedropper was picked up from, after this click
+        # has been handled. With none, the eyedropper stays on for more picks.
+        tool = getattr(self, '_tool_before_snap', None)
+        if self.color_snap_mode and tool is not None:
+            self._tool_before_snap = None
+            QTimer.singleShot(0, lambda: tool.setChecked(True) if self.color_snap_mode else None)
 
     # ───────────── Snap palette (visible swatches) ─────────────
     def _palette_contains(self, hex_color):
@@ -7860,6 +10422,31 @@ class RandomImageViewer(QMainWindow):
                 pass
             win.hide()
 
+    def _shown_picture_image(self):
+        """The picture's part of the screen as a QImage - with everything
+        painted on it - or None. The background around it is left out, so
+        a zoomed-out picture does not fill the palette with that."""
+        label = getattr(self, 'image_label', None)
+        pix = label.pixmap() if label is not None else None
+        src = getattr(self, 'original_pixmap', None)
+        if pix is None or pix.isNull() or src is None or src.isNull():
+            return None
+        try:
+            base = QSize(src.width(), src.height()).scaled(label.size(), Qt.KeepAspectRatio)
+            zw, zh = base.width() * label.zoom_factor, base.height() * label.zoom_factor
+            x0 = (label.width() - zw) / 2 + label.pan_offset_x
+            y0 = (label.height() - zh) / 2 + label.pan_offset_y
+            dpr = pix.devicePixelRatio() or 1.0
+            off_x = (label.width() - pix.width() / dpr) / 2.0
+            off_y = (label.height() - pix.height() / dpr) / 2.0
+            rect = QRect(int((x0 - off_x) * dpr), int((y0 - off_y) * dpr),
+                         int(zw * dpr), int(zh * dpr)).intersected(QRect(0, 0, pix.width(), pix.height()))
+            if rect.width() < 2 or rect.height() < 2:
+                return None
+            return pix.copy(rect).toImage()
+        except Exception:
+            return None
+
     def extract_palette_from_image(self):
         """Auto-extract a small set of dominant colors from the current image.
 
@@ -7867,7 +10454,9 @@ class RandomImageViewer(QMainWindow):
         4×4×4 cube (64 buckets), keep the top buckets by population, use the
         per-bucket average color. Cheap (~ms) and good enough for a UI palette.
         """
-        img = self._get_color_snap_source_image()
+        # What is on screen - paint, layers and effects included; the picture
+        # alone is only the canvas under them (a new sketch: all grey).
+        img = self._shown_picture_image() or self._get_color_snap_source_image()
         if img is None:
             self.status.showMessage("Color palette: no image loaded")
             return
@@ -7966,7 +10555,8 @@ class RandomImageViewer(QMainWindow):
             label.setCursor(self._brush_cursor())
         elif (getattr(self, 'color_snap_mode', False) or self.free_line_drawing_mode
                 or self.line_drawing_mode or self.horizontal_line_drawing_mode
-                or getattr(self, 'fill_mode', None)):
+                or getattr(self, 'fill_mode', None) or self.crop_mode
+                or getattr(self, 'select_mode', False)):
             label.setCursor(Qt.CrossCursor)
         else:
             label.setCursor(Qt.ArrowCursor)
@@ -8043,6 +10633,9 @@ class RandomImageViewer(QMainWindow):
         size = self._brush_slider_to_size(pos)
         if getattr(self, 'line_thickness_label', None) is not None:
             self.line_thickness_label.setText(f"{size}px")
+        win = getattr(self, '_brush_window', None)
+        if win is not None:
+            win.show_size(pos, size)
         if self.line_thickness_slider.isSliderDown():
             # Mid-drag: keep it cheap. Strokes already carry their own size, so
             # nothing on the canvas restyles while the value moves.
@@ -8067,10 +10660,19 @@ class RandomImageViewer(QMainWindow):
             self.line_thickness_label.setText(f"{size}px")
         self.update_line_thickness(size)
 
+    def step_brush_size(self, sign):
+        """[ / ]: brush size down / up by about a tenth (at least 1 px), so
+        fine sizes move finely and big ones quickly."""
+        size = self.line_thickness
+        step = max(1, int(round(size * 0.1)))
+        self.set_brush_size(size + sign * step)
+        self.status.showMessage(f"Brush size {self.line_thickness}px", 1500)
+
     def update_line_thickness(self, value):
         self.line_thickness = max(1, min(self._BRUSH_MAX, int(value)))
         if getattr(self, 'line_thickness_label', None) is not None:
             self.line_thickness_label.setText(f"{self.line_thickness}px")
+        self._show_size_in_panel()
         if getattr(self, 'free_draw_mode', False) and hasattr(self, 'image_label'):
             self.image_label.setCursor(self._brush_cursor())   # the ring follows the size
         # Clear LUT cache since line appearance changed
@@ -8085,19 +10687,18 @@ class RandomImageViewer(QMainWindow):
             self.display_image(self.current_image)
 
     def update_line_transparency(self, value):
-        """Update line transparency and refresh display"""
+        """Set the transparency the next marks are drawn with.
+
+        Nothing is redrawn: every mark keeps the colour (alpha included) it
+        was drawn with, so the slider cannot change what is on screen. It used
+        to clear every cache and render the whole picture again on each tick,
+        and a drag sends dozens of ticks - the program seemed to hang.
+        """
         self.line_transparency = value
-        # Update the existing line color's alpha channel
         self.line_color.setAlpha(value)
-        # Clear caches to force redraw with new transparency
-        if hasattr(self, '_lut_process_cache'):
-            self._lut_process_cache.clear()
-        self.enhancement_cache.clear()
-        self.scaled_cache.clear()
-        # Refresh display to show transparency changes
-        if self.current_image and (self.has_marks()
-                                    or self.crosshair_overlay or self.grid_overlay):
-            self.display_image(self.current_image)
+        label = getattr(self, 'line_opacity_label', None)
+        if label is not None:
+            label.setText(f"{round(value * 100 / 255)}%")
 
     def choose_line_color(self):
         """Drop the inline colour picker under the colour button.
@@ -8112,6 +10713,7 @@ class RandomImageViewer(QMainWindow):
             popup = ColorPickerPopup(self)
             popup.color_picked.connect(self.apply_line_color)
             popup.set_anchor(getattr(self, 'line_color_btn', None))
+            popup.drag_finished.connect(lambda: self._dock_dragged('color'))
             self._color_popup = popup
         # The button toggles: a second click puts the picker away again.
         if popup.isVisible():
@@ -8121,8 +10723,199 @@ class RandomImageViewer(QMainWindow):
             return
         self._sync_color_popup(force=True)
         popup.adjustSize()
-        btn = getattr(self, 'line_color_btn', None)
-        pinned_pos = getattr(self, '_color_popup_pos', None)
+        self._place_color_popup(popup, getattr(self, 'line_color_btn', None),
+                                getattr(self, '_color_popup_pos', None))
+        popup.show()
+        if self._dock_state().get('color'):
+            popup.set_pinned(True)      # docked: it stays open on the edge
+            self._dock_place()
+        popup.raise_()
+
+    def _show_color_box_for_painting(self):
+        """Free draw picked up: open the colour picker beside it, pinned so
+        the first stroke does not click it away. Left alone when already open,
+        and not while the window is hidden or minimised."""
+        if not self.isVisible() or self.isMinimized():
+            return
+        popup = getattr(self, '_color_popup', None)
+        if popup is not None and popup.isVisible():
+            return
+        # Shown without taking focus: the next press paints, and keys
+        # (1-4, I ...) still reach this window.
+        popup = getattr(self, '_color_popup', None)
+        if popup is None:
+            self.choose_line_color()
+            popup = self._color_popup
+            popup.hide()
+        popup.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        try:
+            self.choose_line_color()
+        finally:
+            popup.setAttribute(Qt.WA_ShowWithoutActivating, False)
+        popup.set_pinned(True)
+        self.activateWindow()
+
+    # -- the left-hand dock for 🎨 Color, 🖌 Brush and 📚 Layers ---------------
+    #
+    # They open docked: stacked down the left edge of the window, Color at
+    # the top, then Brush, then Layers - a window that no longer fits below
+    # starts a new column to the right. Docked, they follow the window when
+    # it moves or resizes, and close up when one of them is shut or changes
+    # size. Dragged away by hand, one stays where it is dropped; dropped back
+    # near its place, it snaps in again. ⟲ (reset tool panels) closes all
+    # three - they open docked again.
+
+    _DOCK_MARGIN = 8
+    _DOCK_GAP = 6
+    _DOCK_SNAP = 48             # px: dropped this close to its place, it docks again
+
+    def _dock_state(self):
+        state = getattr(self, '_dock', None)
+        if state is None:
+            state = {'color': True, 'brush': True, 'layers': True}
+            try:
+                saved = json.loads(self._settings.value("panel_dock", "{}") or "{}")
+                state.update({k: bool(v) for k, v in saved.items() if k in state})
+            except (TypeError, ValueError):
+                pass
+            self._dock = state
+        return state
+
+    def _save_dock_state(self):
+        try:
+            self._settings.setValue("panel_dock", json.dumps(self._dock_state()))
+        except Exception:
+            pass
+
+    def _dock_windows(self):
+        """{'color': popup, 'brush': window, 'layers': window} of those made so far."""
+        found = {}
+        for name, attr in (('color', '_color_popup'), ('brush', '_brush_window'),
+                           ('layers', '_layer_window')):
+            window = getattr(self, attr, None)
+            if window is not None:
+                found[name] = window
+        return found
+
+    def _dock_targets(self):
+        """{name: global QPoint} where each docked window goes."""
+        canvas = getattr(self, 'image_label', None)
+        if canvas is None or not canvas.isVisible():
+            return {}
+        state = self._dock_state()
+        # Only the open ones: shutting one closes the gap it leaves.
+        windows = {k: w for k, w in self._dock_windows().items()
+                   if state.get(k) and w.isVisible()}
+        if not windows:
+            return {}
+        m, gap = self._DOCK_MARGIN, self._DOCK_GAP
+        origin = canvas.mapToGlobal(QPoint(0, 0))
+        left, top = origin.x() + m, origin.y() + m
+        bottom = origin.y() + canvas.height() - m
+        # Down the left edge, top first; one that does not fit below the
+        # last starts the next column to the right.
+        x, y, col_right = left, top, left
+        targets = {}
+        for k in ('color', 'brush', 'layers'):
+            window = windows.get(k)
+            if window is None:
+                continue
+            w, h = window.width(), window.height()
+            if y > top and y + h > bottom:
+                x, y = col_right + gap, top
+            targets[k] = QPoint(x, y)
+            y += h + gap
+            col_right = max(col_right, x + w)
+        return targets
+
+    def _dock_place(self):
+        """Move the docked windows (that are shown) to their places."""
+        self._dock_pending = False
+        self._dock_watch()
+        targets = self._dock_targets()
+        for name, window in self._dock_windows().items():
+            pos = targets.get(name)
+            if pos is not None and window.isVisible() and window.pos() != pos:
+                window.move(pos)
+
+    def _dock_place_soon(self):
+        if not getattr(self, '_dock_pending', False):
+            self._dock_pending = True
+            QTimer.singleShot(0, self._dock_place)
+
+    def _dock_watch(self):
+        """Re-place the dock when what it lines up with changes size or
+        moves: the two windows themselves and the tool panels."""
+        watched = self.__dict__.setdefault('_dock_watched', set())
+        widgets = list(self._dock_windows().values()) + list(getattr(self, '_panel_by_key', {}).values())
+        for widget in widgets:
+            if id(widget) not in watched:
+                widget.installEventFilter(self)
+                watched.add(id(widget))
+
+    def _dock_dragged(self, name):
+        """A docked window was dragged by hand: dropped near its place it
+        docks (and snaps in), anywhere else it stays put, undocked."""
+        window = self._dock_windows().get(name)
+        if window is None:
+            return
+        state = self._dock_state()
+        was = state[name]
+        state[name] = True
+        target = self._dock_targets().get(name)
+        near = target is not None and (window.pos() - target).manhattanLength() <= self._DOCK_SNAP
+        state[name] = bool(near)
+        title = {'color': "🎨 Color", 'brush': "🖌 Brush", 'layers': "📚 Layers"}[name]
+        if near:
+            window.move(target)
+            if not was:
+                self.status.showMessage(f"{title} docked", 2000)
+        else:
+            if name == 'color':
+                self._color_popup_pos = window.pos()
+                if hasattr(window, 'set_pinned'):
+                    window.set_pinned(True)     # left where it was put
+            elif name == 'brush':
+                self._brush_window_pos = window.pos()
+            else:
+                self._layer_window_pos = window.pos()
+            if was:
+                self.status.showMessage(
+                    f"{title} undocked — drag it back to its place on the left to dock it again", 3000)
+        self._save_dock_state()
+        self._dock_place_soon()
+
+    def dock_panels(self):
+        """⟲: 🎨 Color, 🖌 Brush and 📚 Layers close, and open docked again."""
+        self._dock = {'color': True, 'brush': True, 'layers': True}
+        self._save_dock_state()
+        for btn in ('brush_texture_btn', 'layers_btn'):
+            button = getattr(self, btn, None)
+            if button is not None and button.isChecked():
+                button.setChecked(False)
+        popup = getattr(self, '_color_popup', None)
+        if popup is not None and popup.isVisible():
+            popup.hide()
+        self._color_popup_pos = self._brush_window_pos = self._layer_window_pos = None
+
+    def _dock_event(self, obj, event):
+        """From eventFilter: something the dock lines up with changed."""
+        watched = getattr(self, '_dock_watched', None)
+        if watched and id(obj) in watched and event.type() in (
+                QEvent.Resize, QEvent.Move, QEvent.Show, QEvent.Hide):
+            if not (event.type() == QEvent.Move and obj in self._dock_windows().values()):
+                self._dock_place_soon()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._dock_place_soon()
+
+    def _snapped_colors(self):
+        return [c for row in getattr(self, 'snapped_rows', []) for c in row]
+
+    @staticmethod
+    def _place_color_popup(popup, btn, pinned_pos):
+        """Put a colour picker under *btn*, kept on its screen."""
         if popup.is_pinned() and pinned_pos is not None:
             # A pinned picker comes back exactly where you left it.
             popup.move(pinned_pos)
@@ -8138,8 +10931,6 @@ class RandomImageViewer(QMainWindow):
             except Exception:
                 pass
             popup.move(target)
-        popup.show()
-        popup.raise_()
 
     def _sync_color_popup(self, force=False):
         """Mirror the current colour and snapped palette into the picker.
@@ -8148,12 +10939,13 @@ class RandomImageViewer(QMainWindow):
         new palette entries all change colour behind its back, and a picker
         left open on the canvas has to keep showing the truth.
         """
+        if self._canvas_popup is not None and self._canvas_popup.isVisible():
+            self._canvas_popup.set_palette_colors(self._snapped_colors())
         popup = getattr(self, '_color_popup', None)
         if popup is None or (not force and not popup.isVisible()):
             return
         popup.set_color(self.line_color)
-        popup.set_palette_colors(
-            [c for row in getattr(self, 'snapped_rows', []) for c in row])
+        popup.set_palette_colors(self._snapped_colors())
 
     def apply_line_color(self, color):
         """Adopt *color* as the line colour and refresh what depends on it."""
@@ -8207,8 +10999,9 @@ class RandomImageViewer(QMainWindow):
 
     def _ruler_line(self, position):
         """A ruler line at *position* that keeps the current size and colour."""
-        return RulerLine(position, thickness=max(1, int(self.line_thickness)),
-                         color=QColor(self.line_color))
+        colour = self._mark_color()
+        self._roll_mark_color()
+        return RulerLine(position, thickness=max(1, int(self.line_thickness)), color=colour)
 
     def _marks_follow_live_style(self):
         """True if any mark still paints with the live pen size / colour.
@@ -8264,7 +11057,8 @@ class RandomImageViewer(QMainWindow):
             self._line_preview_geom = self._build_display_geometry_cache()
             base = self.image_label.pixmap()
             self._line_preview_base = base.copy() if base and not base.isNull() else None
-            self.status.showMessage(f"Line start set at ({x:.0f}, {y:.0f}) - Click second point to complete line")
+            self.status.showMessage(f"Line start set at ({x:.0f}, {y:.0f}) - drag and lift the pen, "
+                                    "or click the end point")
         else:
             # Second click - complete the line
             start_x, start_y = self.current_line_start
@@ -8276,7 +11070,8 @@ class RandomImageViewer(QMainWindow):
                 'end': (end_x, end_y)
             }
             line['thickness'] = max(1, int(self.line_thickness))
-            line['color'] = QColor(self.line_color)
+            line['color'] = self._mark_color()
+            self._roll_mark_color()
             self.drawn_free_lines.append(line)
             self._undo_stack.append('free_line')
             
@@ -8336,7 +11131,7 @@ class RandomImageViewer(QMainWindow):
         preview = self._line_preview_base.copy()
         painter = QPainter(preview)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        pen_color = QColor(self.line_color)
+        pen_color = self._mark_color()
         pen_color.setAlpha(self.line_transparency)
         painter.setPen(QPen(pen_color, self.line_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.drawLine(int(start_dx), int(start_dy), int(end_x), int(end_y))
@@ -8354,6 +11149,7 @@ class RandomImageViewer(QMainWindow):
         
         # Initialize stroke data with pressure information, but mark first point's pressure as pending
         self.current_stroke = [(x, y, -1)] # Use -1 to indicate pending pressure
+        self._stamp_trail = None
         self.is_drawing_free_stroke = True
         self.last_draw_point = None # Reset last draw point
         
@@ -8375,11 +11171,11 @@ class RandomImageViewer(QMainWindow):
                 'flipped_v': self.flipped_v
             }
             
-            # Load original image dimensions once
-            original_pixmap, error = safe_load_pixmap(self.current_image)
-            if error or original_pixmap.isNull():
+            # Original image dimensions, once
+            original_size = self.loaded_image_size()
+            if original_size is None:
                 return
-            self.drawing_cache['original_size'] = original_pixmap.size()
+            self.drawing_cache['original_size'] = original_size
             
             # Pre-calculate display transformation matrices
             rotation = self.drawing_cache['rotation']
@@ -8420,7 +11216,14 @@ class RandomImageViewer(QMainWindow):
             
             # Initialize last point for incremental drawing
             self.last_draw_point = None
-            
+            self._start_stamp_trail(x, y)
+            # Straight to the screen: each frame as soon as the pen events
+            # in hand are painted, no fixed wait (the old 8 ms was up to a
+            # frame of lag). Under the effects or erasing, the view is made
+            # again each frame, so that keeps its pace.
+            self._live_direct, self._live_dirty = False, None
+            self.stroke_update_timer.setInterval(0 if self._live_direct_ok() else 8)
+
             print(f"Optimized drawing cache initialized - ready for true real-time performance")
             self.status.showMessage("Ultra-fast real-time free drawing active")
             
@@ -8465,6 +11268,10 @@ class RandomImageViewer(QMainWindow):
 
         # Add to stroke data (store original coordinates with pressure)
         self.current_stroke.append((x, y, pressure))
+        if self._stamp_trail is not None:
+            self._paint_live_stamps(self._stamp_trail.add(x, y, pressure, self._current_tilt()))
+            self.refresh_texture_cursor()
+            return
 
         # ⚡ ULTRA-FAST coordinate conversion using cached data
         cache = self.drawing_cache
@@ -8587,6 +11394,9 @@ class RandomImageViewer(QMainWindow):
             # smooth on its own; subdividing it into collinear sub-segments only
             # multiplied painter work and made fast strokes feel laggy.
             painter.drawLine(x0, y0, x1, y1)
+            r = line_thickness / 2.0 + 2
+            self._mark_live_dirty(QRectF(QPointF(x0, y0), QPointF(x1, y1)).normalized()
+                                  .adjusted(-r, -r, r, r).toAlignedRect())
 
         finally:
             painter.end()
@@ -8600,10 +11410,13 @@ class RandomImageViewer(QMainWindow):
         line_thickness = thickness if thickness is not None else self.line_thickness
             
         image = self._stroke_image
-        
+
         # ⚡ ULTRA-FAST: Bresenham's algorithm for direct pixel access
         x0, y0 = int(start_point[0]), int(start_point[1])
         x1, y1 = int(end_point[0]), int(end_point[1])
+        r = int(line_thickness) // 2 + 2
+        self._mark_live_dirty(QRect(min(x0, x1) - r, min(y0, y1) - r,
+                                    abs(x1 - x0) + 2 * r + 1, abs(y1 - y0) + 2 * r + 1))
         
         # Handle single point (dot) - ultra-fast
         if x0 == x1 and y0 == y1:
@@ -8689,11 +11502,54 @@ class RandomImageViewer(QMainWindow):
             # Clear the reference to allow garbage collection
             self._stroke_image = None
 
+    def _live_direct_ok(self):
+        """The stroke being drawn can go straight over the view: it is not
+        rubbing paint out (🧽) and not drawn under the effects."""
+        return not self._brush_erasing() and not self._live_with_effects()
+
+    def live_stroke_overlay(self):
+        """(image, opacity, composition mode or None) the label paints over
+        the view while a stroke is drawn, or None."""
+        if not (getattr(self, 'is_drawing_free_stroke', False) and getattr(self, '_live_direct', False)):
+            return None
+        image = getattr(self, '_stroke_image', None)
+        if image is None or image.isNull():
+            return None
+        layer = self.active_layer
+        mode = BLEND_MODES[layer.blend] if layer.blend != 'Normal' else None
+        return image, (layer.opacity / 100 if layer.visible else 0.0), mode
+
+    def _mark_live_dirty(self, rect):
+        """*rect* (stroke-image pixels) changed: repaint it at the next frame."""
+        if rect is None or rect.isEmpty():
+            return
+        kept = getattr(self, '_live_dirty', None)
+        self._live_dirty = rect if kept is None else kept.united(rect)
+
     def _update_display_with_overlay(self):
         """⚡ TIMER-BASED: Update display only when timer fires for optimal performance"""
         if not hasattr(self, '_stroke_image') or not self.temp_stroke_overlay:
             return
-            
+
+        if self._live_direct_ok():
+            # ✏ Straight onto the screen: the view stays as it is and the
+            # label paints the stroke over it (see live_stroke_overlay), only
+            # where it changed since the last frame. Compositing the whole view
+            # and swapping it in cost ~8 ms a frame at 1.5x - for a 5 px dab.
+            self._live_direct = True
+            dirty, self._live_dirty = self._live_dirty, None
+            label = self.image_label
+            if dirty is None:
+                label.update()
+            else:
+                pm = label.pixmap()
+                dpr = pm.devicePixelRatio() if pm is not None and not pm.isNull() else 1.0
+                ox = (label.width() - round(self._stroke_image.width() / dpr)) // 2
+                oy = (label.height() - round(self._stroke_image.height() / dpr)) // 2
+                label.update(QRect(int(dirty.x() / dpr) + ox - 1, int(dirty.y() / dpr) + oy - 1,
+                                   int(dirty.width() / dpr) + 3, int(dirty.height() / dpr) + 3))
+            return
+
         # ⚠️ FIX: Ensure no active painters before converting back to pixmap
         # Create a copy of the image to avoid conflicts with active painters
         stroke_image_copy = QImage(self._stroke_image)
@@ -8702,45 +11558,288 @@ class RandomImageViewer(QMainWindow):
         label = self.image_label
         if not label or not label.pixmap():
             return
-        
+
+        if self._brush_erasing():
+            # 🧽 Erase: the stroke is not laid over the view but taken out of
+            # the active layer, so the view is made again with it (see
+            # _live_rub_image), the way the ⌫ eraser shows its stroke.
+            if self.current_image:
+                self.display_image(self.current_image)
+            return
+
         # ⚡ PRE-ALLOCATED COMPOSITE: Reuse composite buffer to avoid allocation overhead
         if not hasattr(self, '_composite_buffer'):
             base_pixmap = label.pixmap()
             self._composite_buffer = QPixmap(base_pixmap.size())
             
-        base_pixmap = label.pixmap()
-        
+        layer = self.active_layer
+        tinted = layer.opacity != 100 or layer.blend != 'Normal'
+        if self._live_with_effects():
+            self._show_live_with_effects(tinted)
+            return
+        # Over the view as it was when the stroke started, every pass: the
+        # label shows the previous composite, and drawing onto that piled the
+        # stroke up pass after pass, so soft edges and anything under 100 %
+        # opacity looked denser while drawing than once done.
+        if self._stroke_base is None:
+            self._stroke_base = label.pixmap().copy()
+        base_pixmap = self._stroke_base
+
         # ⚡ FAST COMPOSITE: Direct painter operations without transparency fill
         painter = QPainter(self._composite_buffer)
         painter.drawPixmap(0, 0, base_pixmap)
+        if tinted:
+            painter.setOpacity(layer.opacity / 100)
+            painter.setCompositionMode(BLEND_MODES[layer.blend])
         painter.drawPixmap(0, 0, self.temp_stroke_overlay)
         painter.end()
         
         # ⚡ INSTANT DISPLAY: Set pixmap directly
         label.setPixmap(self._composite_buffer)
 
+    def _bake_blend_stroke(self, trail, stamps):
+        """A Blend stroke is what it made of what was under it, so it is kept
+        as those pixels - like a 📸 snapshot, in picture coordinates: it zooms,
+        turns, erases and undoes like any mark. (Laid again from its stamps
+        later, it would blend with whatever is there by then instead.)
+        True when kept."""
+        render = self._finished_render(trail, stamps)
+        self._blend_under = None
+        if render is None:
+            return False
+        to_screen, image, top_left = render
+        to_picture, ok = to_screen.inverted()
+        if not ok:
+            return False
+        x, y, w, h = top_left.x(), top_left.y(), image.width(), image.height()
+        corners = [to_picture.map(QPointF(px, py)) for px, py in ((x, y), (x + w, y), (x, y + h))]
+        self.drawn_images.append({'image': image, 'corners': [(p.x(), p.y()) for p in corners]})
+        self._undo_stack.append('image')
+        return True
+
+    def _live_stroke_render(self, trail, stamps):
+        """A build-up or spray stroke just drawn, as the live buffer has it:
+        (view transform, image, top-left) cut to the stroke, or None. Laid
+        again from its stamps after the pen lifts, a big spray took ~0.3 s
+        for the very pixels already on screen."""
+        image = getattr(self, '_stroke_image', None)
+        to_screen = getattr(self, '_stamp_to_screen', None)
+        if (image is None or image.isNull() or to_screen is None
+                or trail.settings['flat'] or trail.settings['mode'] == 'history'):
+            return None
+        done = getattr(self, '_live_stamp_count', 0)
+        self._live_stamp_count = 0
+        if done < len(stamps):
+            # What came with the pen lifting (a tap's stamp) is not in it yet.
+            painter = QPainter(image)
+            brushes.paint_stamps(painter, trail.texture, stamps[done:], to_screen)
+            painter.end()
+        try:
+            import numpy as np
+            alpha = self._image_words(image) >> 24
+            rows = np.flatnonzero(alpha.any(1))
+            if not len(rows):
+                return None
+            cols = np.flatnonzero(alpha.any(0))
+            box = QRect(int(cols[0]), int(rows[0]),
+                        int(cols[-1] - cols[0]) + 1, int(rows[-1] - rows[0]) + 1)
+        except Exception:
+            box = image.rect()
+        part = image.copy(box).convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        return (QTransform(to_screen), part, box.topLeft())
+
+    def _finished_render(self, trail, stamps):
+        """The flat stroke just drawn, as the live buffers have it: (view
+        transform, image, top-left), or None. Laying all its stamps again for
+        the redraw after the pen lifts took tens of ms, for the same pixels."""
+        live = self._flat_live
+        self._flat_live = None
+        if live is None or getattr(self, '_stamp_to_screen', None) is None:
+            return None
+        done = getattr(self, '_flat_live_count', 0)
+        if done < len(stamps):          # a tap: its stamp came with finish()
+            dirty = live.add(trail.texture, stamps[done:], self._stamp_to_screen)
+            if dirty is not None:
+                box = getattr(self, '_flat_live_box', None)
+                self._flat_live_box = dirty if box is None else box.united(dirty)
+        box = getattr(self, '_flat_live_box', None)
+        self._flat_live_box, self._flat_live_count = None, 0
+        if box is None or box.isEmpty():
+            return None
+        return (QTransform(self._stamp_to_screen), live.compose(box), box.topLeft())
+
+    def _live_with_effects(self):
+        """Whether the stroke being drawn goes under the effects as it is
+        drawn (an effects layer, an effect on, a still picture)."""
+        return (self.active_layer.effects and self._any_effect_on()
+                and self.lines_visible and self.image_visible and self.current_image
+                and not is_video_file(self.current_image)
+                and not is_animated_image(self.current_image)
+                and getattr(self, '_pdf_doc', None) is None)
+
+    _FX_LIVE_S = 0.04       # the effects run at most this often while drawing (whole view)
+    _FX_PIECE_S = 0.012     # ... and when only the changed piece runs through them
+
+    def _fx_live_margin(self):
+        """How far past a changed area the effects read (px): what a changed
+        piece needs around it to come out as in the whole view. None when one
+        of them looks at the whole picture at once (object groups, form
+        lines): then the whole view runs through them again."""
+        if ((self.object_groups_enabled and int(self.object_groups_opacity) > 0)
+                or (self.form_lines_enabled and int(self.form_lines_opacity) > 0)):
+            return None
+        margin = 0
+        if self.color_groups_enabled:
+            field = max(0, min(20, int(self.color_groups_field)))
+            margin = max(margin, 3 * field + 4 if field else 0)    # its blur and field smoothing
+        if self.edge_detection_enabled:
+            margin = max(margin, 12)
+        return margin
+
+    @staticmethod
+    def _image_words(image):
+        """A 32-bit QImage's pixels as an (h, w) uint32 array (a copy)."""
+        import numpy as np
+        w, h, line = image.width(), image.height(), image.bytesPerLine()
+        data = np.frombuffer(image.constBits(), np.uint8, count=line * h).reshape(h, line)
+        return data[:, :w * 4].copy().view(np.uint32).reshape(h, w)
+
+    def _show_live_with_effects(self, tinted):
+        """The view with the stroke being drawn under the effects, as it will
+        look once done: picture + effects layers + the stroke, the effects
+        over that, the other layers on top. The parts that do not change
+        during the stroke are made once, when it starts.
+
+        After the first frame only the piece the stroke changed since the
+        last one goes through the effects (with a margin for those that look
+        around a pixel), and is patched into the frame kept from before: a
+        few ms however slow the effects are on the whole view - colour groups
+        with smoothing took ~400 ms a frame, so the paint showed up in lumps."""
+        import numpy as np
+        live = self._fx_live
+        margin = self._fx_live_margin()
+        piecewise = margin is not None and live is not None and live[2] is not None
+        now = time.monotonic()
+        # At most every _FX_LIVE_S, and never more than ~40 % of the time on
+        # the effects: slow ones (a big LUT, object groups) on a slower PC
+        # would otherwise starve the pen events.
+        floor = self._FX_PIECE_S if piecewise else self._FX_LIVE_S
+        gap = max(floor, 2.5 * getattr(self, '_fx_live_cost', 0.0))
+        wait = gap - (now - getattr(self, '_fx_live_t', 0.0))
+        if wait > 0:
+            self.stroke_update_timer.start(int(wait * 1000) + 1)
+            return
+        self._fx_live_t = now
+        if live is None:
+            under = self._fx_under(self.current_image)
+            if under is None:
+                return
+            # under, over, the effects' output so far, the stroke it was
+            # made with (pixels), the colour groups palette of the whole view
+            live = self._fx_live = [under, self._fx_over(), None, None, None]
+            kept = getattr(self, '_fx_last_full', None)
+            if (margin is not None and kept is not None
+                    and kept[0] == self._fx_full_key(self.current_image, under.size())):
+                # The view on screen is this one through the effects, and the
+                # stroke has nothing in it yet: start from that.
+                live[2], live[4] = kept[1].copy(), kept[2]
+                live[3] = np.zeros((self._stroke_image.height(), self._stroke_image.width()), np.uint32)
+                piecewise = True
+        under, over = live[0], live[1]
+        stroke_now = self._image_words(self._stroke_image)
+        t0 = time.perf_counter()
+
+        def with_stroke(area):
+            part = under.copy(area)
+            painter = QPainter(part)
+            if tinted:
+                painter.setOpacity(self.active_layer.opacity / 100)
+                painter.setCompositionMode(BLEND_MODES[self.active_layer.blend])
+            painter.drawPixmap(QPoint(0, 0), self.temp_stroke_overlay, area)
+            painter.end()
+            return part
+
+        if piecewise and live[3] is not None and live[3].shape == stroke_now.shape:
+            changed = stroke_now != live[3]
+            rows = np.flatnonzero(changed.any(1))
+            if not len(rows):
+                return                          # nothing new under the effects
+            cols = np.flatnonzero(changed.any(0))
+            box = QRect(int(cols[0]), int(rows[0]), int(cols[-1] - cols[0]) + 1, int(rows[-1] - rows[0]) + 1)
+            area = box.adjusted(-margin, -margin, margin, margin).intersected(under.rect())
+            self._fx_palette_pin = live[4]
+            try:
+                piece = self._effect_chain_over_paint(with_stroke(area), "live-piece")
+            finally:
+                self._fx_palette_pin = None
+            painter = QPainter(live[2])
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
+            painter.drawPixmap(box.topLeft(), piece, box.translated(-area.topLeft()))
+            painter.end()
+        else:
+            stroke = self.current_stroke or []
+            trail = self._stamp_trail
+            self._fx_palette_last = None
+            live[2] = self._effect_chain_over_paint(
+                with_stroke(under.rect()), f"{self._fx_paint_signature()}|live{len(stroke)}-"
+                                           f"{len(trail.stamps) if trail is not None else 0}")
+            live[4] = self._fx_palette_last
+        live[3] = stroke_now
+        # The pace follows what the next passes will cost: after a whole
+        # view, those are pieces again (if the effects allow).
+        self._fx_live_cost = time.perf_counter() - t0 if (piecewise or margin is None) else 0.0
+        frame = live[2].copy()
+        painter = QPainter(frame)
+        painter.drawPixmap(0, 0, over)
+        painter.end()
+        self.image_label.setPixmap(frame)
+
     def end_free_draw_stroke(self):
         """⚡ OPTIMIZED FINALIZATION: Clean finalization with single redraw"""
         print(f"Ending optimized free draw stroke")
         
-        if self.current_stroke is not None and len(self.current_stroke) > 1:
+        trail, self._stamp_trail = self._stamp_trail, None
+        rubbing = self._brush_erasing()
+        if rubbing and not self.active_layer.has_content():
+            # 🧽 Nothing on this layer to rub out: no mark, no undo step.
+            self.current_stroke = None
+            if trail is not None:
+                self._flat_live = None
+                self.apply_tool_cursor()
+            self.status.showMessage("🧽 Erase: nothing drawn on this layer to rub out", 3000)
+        elif trail is not None and self.current_stroke is not None:
+            # A textured stroke: a tap leaves a stamp too.
+            stamps = trail.finish(self._tablet_pressure if self.pen_pressure_enabled else 1.0)
+            baked = (self._bake_blend_stroke(trail, stamps)
+                     if stamps and trail.settings['mode'] in brushes.BLENDING else False)
+            if stamps and not baked:
+                stroke = Stroke(
+                    self.current_stroke,
+                    thickness=max(1, int(self.line_thickness)),
+                    color=QColor(self.line_color),
+                    texture=trail.texture.path, stamps=list(stamps),
+                    flat=bool(trail.settings['flat']))
+                if trail.settings['mode'] == 'history':
+                    stroke.history = trail.settings['mix'] / 100.0
+                    stroke.flat = True
+                stroke.erase = trail.settings['mode'] == 'erase'
+                stroke.render = (self._finished_render(trail, stamps)
+                                 or self._live_stroke_render(trail, stamps))
+                self.drawn_free_strokes.append(stroke)
+                self._undo_stack.append('free_stroke')
+            self.apply_tool_cursor()    # the outline turns back to the pen's lean
+        elif self.current_stroke is not None and len(self.current_stroke) > 1:
             # Add completed stroke to the permanent list
             # Freeze the pen settings into the stroke so later changes to the
             # brush size or colour only affect what you draw next.
-            self.drawn_free_strokes.append(Stroke(
+            stroke = Stroke(
                 self.current_stroke,
                 thickness=max(1, int(self.line_thickness)),
-                color=QColor(self.line_color)))
+                color=QColor(self.line_color))
+            stroke.erase = rubbing
+            self.drawn_free_strokes.append(stroke)
             self._undo_stack.append('free_stroke')
             print(f"Stroke completed with {len(self.current_stroke)} points, total strokes: {len(self.drawn_free_strokes)}")
-            
-            # ⚡ CLEAN FINALIZATION: Clear caches and perform single clean redraw
-            if hasattr(self, '_lut_process_cache'):
-                self._lut_process_cache.clear()
-            if hasattr(self, 'enhancement_cache'):
-                self.enhancement_cache.clear()
-            if hasattr(self, 'scaled_cache'):
-                self.scaled_cache.clear()
             
             self.status.showMessage(f"Stroke finalized ({len(self.current_stroke)} points)")
         else:
@@ -8749,10 +11848,14 @@ class RandomImageViewer(QMainWindow):
         # ⚡ CLEANUP: Reset all performance optimization state
         self.current_stroke = None
         self.is_drawing_free_stroke = False
+        self._live_direct, self._live_dirty = False, None
+        self.stroke_update_timer.stop()
         self.drawing_cache = None
         self.temp_stroke_overlay = None
         self.last_draw_point = None
-        
+        self._stroke_base = None
+        self._fx_live = None
+
         # ⚡ CLEANUP: Reset ultra-fast drawing buffers
         if hasattr(self, '_stroke_image'):
             delattr(self, '_stroke_image')
@@ -8771,16 +11874,13 @@ class RandomImageViewer(QMainWindow):
         repeated in 25 places, so every new mark type had to be added to all of
         them or it would simply never be drawn. One test now, like _paint_marks.
         """
-        return bool(self.drawn_lines or self.drawn_horizontal_lines
-                    or self.drawn_free_lines or self.drawn_free_strokes
-                    or self.drawn_fills or self.current_fill)
+        return (bool(self.current_fill) or any(layer.has_content() for layer in self.layers)
+                or self._under_sheet_layer() is not None)
 
     def has_unsaved_drawing(self):
         """True when the annotation layer holds marks that are not saved."""
-        return bool(self.drawn_lines or self.drawn_horizontal_lines
-                    or self.drawn_free_lines or self.drawn_free_strokes
-                    or self.drawn_fills or self.current_stroke
-                    or self.current_fill)
+        return bool(self.current_stroke or self.current_fill) or any(
+            layer.has_marks() for layer in self.layers)
 
     def wheel_should_zoom(self):
         """True when a plain wheel scroll must zoom instead of changing image.
@@ -8791,8 +11891,14 @@ class RandomImageViewer(QMainWindow):
         explicit controls. Merely having a drawing tool armed is not enough:
         with nothing drawn there is nothing to lose, and blocking the wheel
         then only broke browsing (New Canvas arms the pencil, and it stayed
-        armed after returning to ordinary images).
+        armed after returning to ordinary images). And once every drawing tool
+        is turned off, the user is done drawing: the wheel browses again, even
+        with marks on screen.
         """
+        if self.current_stroke or self.current_fill:
+            return True
+        if self.image_label._no_tool_engaged():
+            return False
         return self.has_unsaved_drawing()
 
     def note_wheel_nav_blocked(self):
@@ -8804,19 +11910,27 @@ class RandomImageViewer(QMainWindow):
         # event and again on a 100 ms debounce, so the hint has to land after
         # both or it is overwritten before it can be read.
         QTimer.singleShot(150, lambda: self.status.showMessage(
-            "Wheel zooms while a drawing is on screen \u2014 use \u2190 \u2192 "
-            "to change image (clears the drawing)", 4000))
+            "Wheel zooms while drawing \u2014 turn the tool off (or use \u2190 \u2192) "
+            "to change image; that clears the drawing", 4000))
 
     def clear_lines(self):
         self._wheel_nav_hint_shown = False
-        self.drawn_fills.clear()
         self.cancel_fill()
-        self.drawn_lines.clear()
-        self.drawn_horizontal_lines.clear()
-        self.drawn_free_lines.clear()
-        self.drawn_free_strokes.clear()  # NEW: Clear free draw strokes
-        self.erase_strokes.clear()  # 🧽 Clear eraser strokes
-        self._erase_state_marks.clear()
+        self._drop_selection()          # its marks go with the rest
+        self._transform_undo = {}
+        # Every layer's marks; the layers themselves stay for the next picture.
+        for layer in self.layers:
+            layer.clear()
+        # The sketch's canvas under the picture goes with it, and a picture
+        # the sketch hid comes back.
+        self.under_canvas = None
+        if getattr(self, '_sketch_hid_picture', False):
+            self._sketch_hid_picture = False
+            self.image_visible = True
+            btn = getattr(self, 'toggle_image_btn', None)
+            if btn is not None:
+                btn.blockSignals(True); btn.setChecked(True); btn.blockSignals(False)
+        self._refresh_layer_window()
         self.current_erase_stroke = None
         self.is_erasing = False
         self.current_line_start = None
@@ -8847,18 +11961,33 @@ class RandomImageViewer(QMainWindow):
             return
 
         if not self._undo_stack:
-            self.status.showMessage("No lines to remove")
+            self.status.showMessage(
+                f"Nothing to undo on {self.active_layer.name}" if len(self.layers) > 1
+                else "No lines to remove")
+            return
+
+        if getattr(self, '_sel', None) is not None:
+            # ⬚ A transform under way: Ctrl+Z puts the marks back as they were.
+            self.cancel_selection()
+            self.status.showMessage("Transform cancelled")
             return
 
         action = self._undo_stack.pop()
-        if action == 'fill':
+        if action == 'transform':
+            # ⬚ The marks go back to where (and how big, how turned) they were.
+            kept = (self._transform_undo or {}).get(id(self.active_layer))
+            if kept:
+                mark_transform.restore(kept.pop())
+            self.active_layer.raster = None
+        elif action == 'fill':
             if self.drawn_fills:
                 self.drawn_fills.pop()
         elif action == 'erase':
             if self.erase_strokes:
                 self.erase_strokes.pop()
-            if self._erase_state_marks:
-                self._erase_state_marks.pop()
+        elif action == 'image':
+            if self.drawn_images:
+                self.drawn_images.pop()
         elif action == 'free_stroke':
             if self.drawn_free_strokes:
                 self.drawn_free_strokes.pop()
@@ -8880,14 +12009,31 @@ class RandomImageViewer(QMainWindow):
             self.display_image(self.current_image)
         self.status.showMessage("Removed last line")
 
+    # Guides: marks made with the line tools, to measure against - the rest
+    # (brush strokes, fills, snapshots) is the drawing itself.
+    _GUIDE_KINDS = ('line', 'hline', 'free_line')
+    guides_visible = True
+
+    @classmethod
+    def _is_guide(cls, kind, mark):
+        """True for a vertical / horizontal ruler line, a free line or a polyline."""
+        return kind in cls._GUIDE_KINDS or (
+            kind == 'fill' and isinstance(mark, dict) and mark.get('shape') == 'polyline')
+
     def toggle_line_visibility(self, checked):
-        """Toggle visibility of all drawn lines"""
-        self.lines_visible = checked
-        # Update button appearance
-        if hasattr(self, 'toggle_lines_btn'):
-            self.toggle_lines_btn.setText("👁" if checked else "🙈")  # Eye open/closed
-            self.toggle_lines_btn.setToolTip("Hide Lines" if checked else "Show Lines")
-        
+        """👁: show / hide the guides - ruler lines, free lines, polylines.
+        What is painted (brush strokes, fills, snapshots) stays; a whole
+        layer is hidden with its tick in 📚."""
+        self.guides_visible = bool(checked)
+        btn = getattr(self, 'toggle_lines_btn', None)
+        if btn is not None:
+            if btn.isChecked() != self.guides_visible:
+                btn.blockSignals(True); btn.setChecked(self.guides_visible); btn.blockSignals(False)
+            btn.setText("👁" if checked else "🙈")  # Eye open/closed
+            btn.setToolTip("Hide guides (ruler lines, free lines, polylines) - what is painted stays"
+                           if checked else "Show guides (ruler lines, free lines, polylines)")
+        for layer in self.layers:
+            layer.raster = None         # laid again with / without them
         # Clear LUT cache since line visibility changed
         if hasattr(self, '_lut_process_cache'):
             self._lut_process_cache.clear()
@@ -8965,6 +12111,27 @@ class RandomImageViewer(QMainWindow):
         sized to the drawing area so it displays 1:1 — saving captures the view,
         so a larger canvas would only be scaled back down.
         """
+        # Over a picture: the middle grey canvas goes under the picture, and
+        # the picture is hidden to draw on it - ticking 🖼 Picture in 📚
+        # brings it back under the paint. Nothing open: a blank sketch.
+        if (self.current_image and not is_video_file(self.current_image)
+                and not is_animated_image(self.current_image)
+                and not os.path.basename(self.current_image).startswith("sketch_")):
+            self.under_canvas = QColor(*self._CANVAS_FILL)
+            self.under_canvas_visible = True
+            if self.image_visible:
+                self._sketch_hid_picture = True
+                self.toggle_image_visibility(False)
+            else:
+                self.display_image(self.current_image)
+            self._refresh_layer_window()
+            btn = getattr(self, 'free_draw_tool_btn', None)
+            if btn is not None and not btn.isChecked():
+                btn.setChecked(True)
+            self.status.showMessage(
+                "New sketch on a canvas under the picture - tick 🖼 Picture in 📚 Layers "
+                "to see the picture under your paint", 6000)
+            return self.current_image
         try:
             import tempfile
 
@@ -9005,6 +12172,288 @@ class RandomImageViewer(QMainWindow):
             print(f"new_draw_canvas error: {e}")
             return None
 
+    # ── ◧ Studio: a canvas beside the picture ─────────────────────────────
+
+    # The strip between canvas and picture, as a share of the picture's
+    # width: enough to read them as two sheets.
+    _STUDIO_GAP = 0.03
+
+    def _studio_offset(self, base):
+        """Where the picture starts on the Studio sheet built from *base*."""
+        return base.width() + max(8, round(base.width() * self._STUDIO_GAP))
+
+    def _studio_sheet(self, base):
+        """*base* - the picture as loaded - as ◧ Studio shows it: a mid-grey
+        canvas of the same size on the left, a strip, then the picture.
+
+        Everything downstream (effects, turning, zoom, layers, marks, 💾)
+        takes this sheet for the picture, so it all works on both halves
+        alike - a value or colour study shows the painting and the picture
+        through the same filter. *base* itself while Studio is off.
+        """
+        if not self.studio_mode or base is None or base.isNull():
+            return base
+        kept = self._studio_kept
+        if kept is not None and kept[0] == base.cacheKey():
+            return kept[1]
+        x = self._studio_offset(base)
+        sheet = QPixmap(x + base.width(), base.height())
+        sheet.fill(Qt.transparent)
+        painter = QPainter(sheet)
+        painter.fillRect(0, 0, base.width(), base.height(), QColor(*self._CANVAS_FILL))
+        painter.drawPixmap(x, 0, base)
+        painter.end()
+        self._studio_kept = (base.cacheKey(), sheet, x)
+        return sheet
+
+    def _shift_marks(self, dx):
+        """Move every layer's marks *dx* along the picture's x axis: switching
+        Studio moves the picture on the sheet, and its marks go with it (the
+        ones on the canvas go off the picture and come back with Studio)."""
+        if not dx:
+            return
+
+        def moved(p):
+            if isinstance(p, QPointF):
+                return QPointF(p.x() + dx, p.y())
+            return (p[0] + dx, *p[1:])
+
+        for layer in self.layers:
+            marks = layer.marks
+            marks['drawn_lines'][:] = [
+                RulerLine(x + dx, x.thickness, x.color) if isinstance(x, RulerLine) else x + dx
+                for x in marks['drawn_lines']]
+            # drawn_horizontal_lines: a y position, which does not move
+            for line in marks['drawn_free_lines']:
+                line['start'], line['end'] = moved(line['start']), moved(line['end'])
+            for stroke in marks['drawn_free_strokes']:
+                stroke[:] = [moved(p) for p in stroke]
+                if getattr(stroke, 'stamps', None):
+                    stroke.stamps = [moved(s) for s in stroke.stamps]
+                stroke.render = None            # laid for the old place
+            for fill in marks['drawn_fills']:
+                fill['points'] = [moved(p) for p in fill.get('points') or []]
+            for image in marks['drawn_images']:
+                image['corners'] = [moved(p) for p in image['corners']]
+            for stroke in marks['erase_strokes']:
+                stroke[:] = [moved(p) for p in stroke]
+            layer.raster = None
+
+    def toggle_studio_mode(self, on):
+        """◧ Studio on / off: a blank grey canvas the size of the picture on
+        its left, with the brush ready, to paint what you see on the right.
+
+        It stays on from picture to picture. A drawing already on the picture
+        keeps its place on it; switching Studio off hides what was painted
+        on the canvas (moving to another picture clears it, as always) and
+        switching it back on shows it again.
+        """
+        on = bool(on)
+        btn = getattr(self, 'studio_btn', None)
+        if btn is not None and btn.isChecked() != on:
+            btn.blockSignals(True); btn.setChecked(on); btn.blockSignals(False)
+        if on == self.studio_mode:
+            return
+        self.cancel_fill()
+        path = self.current_image
+        base = self.pixmap_cache.get(path) if path else None
+        if base is not None and not base.isNull() and any(
+                layer.has_marks() for layer in self.layers):
+            dx = self._studio_offset(base)
+            self._shift_marks(dx if on else -dx)
+        self.studio_mode = on
+        self._studio_kept = None
+        self.clear_lut_cache()
+        self._invalidate_line_caches()
+        if hasattr(self, 'image_label'):
+            self.image_label.reset_zoom()   # fit the sheet: both halves in view
+        if path:
+            self.display_image(path)
+        if on:
+            draw = getattr(self, 'free_draw_tool_btn', None)
+            if draw is not None and not draw.isChecked():
+                draw.setChecked(True)
+            still = path and not is_video_file(path) and not is_animated_image(path)
+            self.status.showMessage(
+                "◧ Studio: paint on the grey canvas on the left — 💾 saves both side by side"
+                if still or not path else
+                "◧ Studio: the canvas shows beside still pictures and pages, not videos or animations",
+                6000)
+        else:
+            self.status.showMessage("◧ Studio off", 3000)
+
+    def _unique_download_path(self, base, ext):
+        """A free "OvaViewer_<base>_<timestamp><ext>" path in Downloads."""
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        try:
+            if not os.path.isdir(downloads_dir):
+                os.makedirs(downloads_dir, exist_ok=True)
+        except Exception:
+            # Fall back to the home directory if Downloads is unavailable
+            downloads_dir = os.path.expanduser("~")
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = os.path.join(downloads_dir, f"OvaViewer_{base}_{timestamp}{ext}")
+
+        # Guard against collisions (e.g. multiple saves within the same second)
+        counter = 1
+        while os.path.exists(file_path):
+            file_path = os.path.join(downloads_dir, f"OvaViewer_{base}_{timestamp}_{counter}{ext}")
+            counter += 1
+        return file_path
+
+    # -- 💾 saving the painting, sharp at any size --------------------------
+    #
+    # Marks are data (stamps, points, outlines in picture coordinates), so
+    # they can be laid again at any resolution: 2x is not the view blown up,
+    # it is the drawing painted at twice the size. Pen and line widths grow
+    # with it, so it looks the same - only finer.
+
+    _exporting = False          # laying marks for a file: no screen caches touched
+    _export_pen_scale = 1       # ... and pen / line widths times this
+    _export_no_paper = False    # ... and without canvas paper (a picture saved hidden)
+    _EXPORT_MAX_SIDE = 16384
+    _EXPORT_MAX_PIXELS = 80_000_000
+
+    def _export_parts(self):
+        """{name: QRect on the sheet} of what can be saved on its own."""
+        base = self.pixmap_cache.get(self.current_image) if self.current_image else None
+        if base is None or base.isNull():
+            return {}
+        if not self.studio_mode:
+            return {'picture': QRect(0, 0, base.width(), base.height())}
+        off = self._studio_offset(base)
+        return {'painting': QRect(0, 0, base.width(), base.height()),
+                'picture': QRect(off, 0, base.width(), base.height()),
+                'both': QRect(0, 0, off + base.width(), base.height())}
+
+    def _export_fits(self, rect, k):
+        w, h = rect.width() * k, rect.height() * k
+        return max(w, h) <= self._EXPORT_MAX_SIDE and w * h <= self._EXPORT_MAX_PIXELS
+
+    def _render_sheet_part(self, rect, k, paper=True):
+        """*rect* of the sheet (picture coordinates, upright, unflipped) at
+        *k* times its size: the canvas, the picture from its file and every
+        shown layer laid again at that size. The view's effects are left
+        out - they are a way of looking, and they depend on the view's size.
+        *paper* False: no canvas paper (📄 layers, the sketch's sheet) - the
+        marks alone, on transparent."""
+        path = self.current_image
+        base = self.pixmap_cache[path]
+        off = self._studio_offset(base) if self.studio_mode else 0
+        sheet = QSize(off + base.width(), base.height())
+        w, h = max(1, round(rect.width() * k)), max(1, round(rect.height() * k))
+        out = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        out.fill(Qt.transparent)
+        painter = QPainter(out)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        ox, oy = -rect.x() * k, -rect.y() * k
+        if self.studio_mode:
+            painter.fillRect(QRectF(ox, oy, base.width() * k, base.height() * k),
+                             QColor(*self._CANVAS_FILL))
+        target = QRectF(ox + off * k, oy, base.width() * k, base.height() * k)
+        if self.image_visible and target.intersects(QRectF(0, 0, w, h)):
+            painter.save()
+            painter.setOpacity(self._picture_look()[0] / 100)
+            painter.drawImage(target, self._picture_at(path, target.size().toSize(), base))
+            painter.restore()
+        saved = (self.rotation_angle, self.flipped_h, self.flipped_v)
+        self._exporting, self._export_pen_scale, self._export_no_paper = True, k, not paper
+        self.rotation_angle, self.flipped_h, self.flipped_v = 0, False, False
+        try:
+            self._paint_marks(painter, w, h, sheet, float(k), float(k), ox, oy)
+        finally:
+            self.rotation_angle, self.flipped_h, self.flipped_v = saved
+            self._exporting, self._export_pen_scale, self._export_no_paper = False, 1, False
+            painter.end()
+        return out
+
+    def _picture_at(self, path, size, base):
+        """The picture at *size*, from the file when the one in memory is
+        smaller (large pictures are held at screen size)."""
+        if size.width() <= base.width() and size.height() <= base.height():
+            return base.toImage().scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        try:
+            from PySide6.QtGui import QImageReader
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            full = reader.size()
+            if full.isValid() and (full.width() > size.width() or full.height() > size.height()):
+                reader.setScaledSize(size)      # decoded straight at that size
+            image = reader.read()
+            if not image.isNull():
+                if image.size() != size:
+                    image = image.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                return image
+        except Exception:
+            pass
+        return base.toImage().scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+    def save_sheet_part(self, part, k):
+        """💾 menu: save *part* ('painting', 'picture', 'both') at *k* times."""
+        self.commit_selection()         # a transform under way goes in as it is
+        rect = self._export_parts().get(part)
+        if rect is None:
+            self.status.showMessage("Nothing to save", 3000)
+            return
+        busy = getattr(self, '_busy_line', None)
+        if busy is not None:
+            busy.show_progress(1.0)
+            busy.repaint()
+        try:
+            # The picture saved on its own while 🖼 Picture is unticked in 📚:
+            # what is drawn over it, on transparent - no grey paper behind.
+            image = self._render_sheet_part(
+                rect, k, paper=not (part == 'picture' and not self.image_visible))
+            stem = os.path.splitext(os.path.basename(self.current_image))[0]
+            name = {'painting': 'painting', 'picture': 'picture', 'both': 'studio'}[part]
+            file_path = self._unique_download_path(f"{stem}_{name}_{k}x", ".png")
+            if image.save(file_path, 'PNG'):
+                self.status.showMessage(
+                    f"Saved to Downloads: {os.path.basename(file_path)} "
+                    f"({image.width()} × {image.height()})", 6000)
+            else:
+                self.status.showMessage("Failed to save image", 4000)
+        except Exception as e:
+            print(f"Error saving {part}: {e!r}")
+            self.status.showMessage("Error saving", 4000)
+        finally:
+            if busy is not None and getattr(self, '_settle_job', None) is None:
+                busy.hide()
+
+    def show_save_menu(self, at=None):
+        """💾's menu: the view as shown, or a part of the sheet at 1x / 2x / 4x."""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addAction("💾 View as shown (effects included)", self.save_current_view)
+        parts = self._export_parts()
+        labels = (('painting', "🎨 Painting only"), ('picture', "🖼 Picture with its drawing"
+                   if not self.studio_mode else "🖼 Picture only"), ('both', "◧ Both side by side"))
+        for part, label in labels:
+            rect = parts.get(part)
+            if rect is None:
+                continue
+            menu.addSeparator()
+            for k in (1, 2, 4):
+                act = menu.addAction(f"{label} — {k}×  ({rect.width() * k} × {rect.height() * k})",
+                                     lambda p=part, s=k: self.save_sheet_part(p, s))
+                act.setEnabled(self._export_fits(rect, k))
+        if len(parts):
+            menu.addSeparator()
+            note = menu.addAction("Parts are laid again at that size, upright, without effects")
+            note.setEnabled(False)
+        btn = getattr(self, 'save_btn', None)
+        menu.exec(at if at is not None else btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _save_clicked(self):
+        """💾: in ◧ Studio, the menu (which side, what size); else the view."""
+        if self.studio_mode and self.current_image:
+            self.show_save_menu()
+        else:
+            self.save_current_view()
+
     def save_current_view(self):
         """Save the currently displayed view to a file, including LUT/enhancements and visible lines."""
         # Create the final pixmap representing current view
@@ -9025,30 +12474,12 @@ class RandomImageViewer(QMainWindow):
                 final_pixmap = self.image_label.pixmap().copy()
 
             # Auto-save to the Downloads folder with a unique name (no dialog)
-            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-            try:
-                if not os.path.isdir(downloads_dir):
-                    os.makedirs(downloads_dir, exist_ok=True)
-            except Exception:
-                # Fall back to the home directory if Downloads is unavailable
-                downloads_dir = os.path.expanduser("~")
-
-            # Build a unique filename from the source name + timestamp
             if self.current_image:
                 base = os.path.splitext(os.path.basename(self.current_image))[0]
             else:
                 base = "view"
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_name = f"OvaViewer_{base}_{timestamp}.png"
-            file_path = os.path.join(downloads_dir, file_name)
-
-            # Guard against collisions (e.g. multiple saves within the same second)
-            counter = 1
-            while os.path.exists(file_path):
-                file_name = f"OvaViewer_{base}_{timestamp}_{counter}.png"
-                file_path = os.path.join(downloads_dir, file_name)
-                counter += 1
+            file_path = self._unique_download_path(base, ".png")
+            file_name = os.path.basename(file_path)
 
             # Save as PNG - preserves pixel data including lines and transparency
             saved = final_pixmap.save(file_path, 'PNG')
@@ -9309,10 +12740,13 @@ class RandomImageViewer(QMainWindow):
                 self.toggle_image_btn.setChecked(checked)
                 self.toggle_image_btn.blockSignals(False)
             
+            if checked:
+                self._sketch_hid_picture = False    # shown by hand: stays shown
+            self._refresh_layer_window()            # 🖼 Picture in 📚 is the same switch
             # Force immediate update
             if self.current_image:
                 self.display_image(self.current_image)
-                
+
             # Update status
             if checked:
                 self.status.showMessage("Image visible")
@@ -10442,7 +13876,8 @@ class RandomImageViewer(QMainWindow):
                 base_pixmap, error = safe_load_pixmap(self.current_image)
                 if error:
                     return
-            
+            base_pixmap = self._studio_sheet(base_pixmap)
+
             # ENHANCED PREVIEW SIZING: When lines are present, maintain higher quality
             has_lines = (self.lines_visible and 
                         (self.has_marks()))
@@ -10609,7 +14044,8 @@ class RandomImageViewer(QMainWindow):
                     return
                 # Cache the loaded image
                 self._manage_cache(self.pixmap_cache, self.current_image, base_pixmap)
-            
+            base_pixmap = self._studio_sheet(base_pixmap)
+
             # Convert to image for processing
             image = base_pixmap.toImage()
             if image.format() != image.Format.Format_RGB32:
@@ -10926,6 +14362,10 @@ class RandomImageViewer(QMainWindow):
             self._paint_marks(painter, final_pixmap.width(), final_pixmap.height(),
                               original_size, scale_x, scale_y, 0, 0)
             painter.end()
+            if self._fx_layers_on() and self.current_image:
+                # This path paints over the finished effects; layers that go
+                # under them are put right by a full render straight after.
+                QTimer.singleShot(0, lambda: self.display_image(self.current_image))
             return final_pixmap
         except Exception as e:
             print(f"Error adding lines to pixmap: {e}")
@@ -10971,7 +14411,8 @@ class RandomImageViewer(QMainWindow):
                     return
                 # Cache it for future use
                 self._manage_cache(self.pixmap_cache, img_path, base_pixmap)
-            
+            base_pixmap = self._studio_sheet(base_pixmap)
+
             # ENHANCED PREVIEW: Better quality when lines are present
             has_lines = (self.lines_visible and 
                         (self.has_marks()))
@@ -11256,6 +14697,10 @@ class RandomImageViewer(QMainWindow):
         if self.image_label:
             current_zoom = getattr(self.image_label, 'zoom_factor', 1.0)
             new_zoom = max(current_zoom / 1.15, 0.1)
+            if current_zoom > 1.0 > new_zoom:
+                new_zoom = 1.0              # stop at the fit once, then smaller
+            if new_zoom <= 1.0:
+                self.image_label.pan_offset_x = self.image_label.pan_offset_y = 0
             self.image_label.zoom_factor = new_zoom
             if self.current_image:
                 self._smart_zoom_display()
@@ -11417,10 +14862,30 @@ class RandomImageViewer(QMainWindow):
         self._last_processed_has_lut = False
         self.display_image(path)
 
-    def _smart_zoom_display(self):
+    def _begin_view_motion(self):
+        """The view is moving (zoom, pan, a quarter turn, a flip): marks
+        follow cheaply - the last image of each layer, moved (see
+        _layer_image) - and are laid properly once the view rests for a
+        moment, a slice at a time (see _settle_view)."""
+        if not self.has_marks():
+            return
+        self._view_in_motion = True
+        self._settle_job = None             # a settle under way starts over
+        timer = getattr(self, '_view_settle_timer', None)
+        if timer is None:
+            timer = self._view_settle_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(200)
+            timer.timeout.connect(self._settle_view)
+        timer.start()
+
+    def _smart_zoom_display(self, settled=False):
         """OPTIMIZED zoom display - avoids GPU reprocessing during interactive zoom"""
         if not self.current_image:
             return
+        self._update_zoom_readout()
+        if not settled:
+            self._begin_view_motion()
 
         # A playing film: refit the frame on screen, the next one follows suit.
         if self._frame_timer.isActive():
@@ -11433,6 +14898,15 @@ class RandomImageViewer(QMainWindow):
             return
         if self.image_label.is_animation_paused():
             self._redraw_paused_gif_frame()
+            return
+        # A video likewise; there is no file below to read a picture from.
+        if self._video_playing:
+            self._redraw_paused_video_frame()
+            return
+        # Layers under the effects need them run again over the new view,
+        # which only the full render does (see _fx_composite).
+        if self._fx_layers_on() and getattr(self, '_pdf_doc', None) is None:
+            self.display_image(self.current_image)
             return
 
         # PDF only: schedule a sharper re-render of the page if we've zoomed in
@@ -11511,7 +14985,7 @@ class RandomImageViewer(QMainWindow):
                 if not self.image_visible:
                     # Create a blank pixmap with the same size but keep lines visible
                     blank_pixmap = QPixmap(final_pixmap.size())
-                    blank_pixmap.fill(Qt.black)  # Fill with black background
+                    blank_pixmap.fill(self.canvas_color)  # The background layer
                     
                     # If there are lines, copy them from final_pixmap to blank_pixmap
                     if self.lines_visible and (self.has_marks()):
@@ -11613,7 +15087,7 @@ class RandomImageViewer(QMainWindow):
                     if not self.image_visible:
                         # Create a blank pixmap with the same size but keep lines visible
                         blank_pixmap = QPixmap(final_pixmap.size())
-                        blank_pixmap.fill(Qt.black)  # Fill with black background
+                        blank_pixmap.fill(self.canvas_color)  # The background layer
                         
                         # If there are lines, copy them from final_pixmap to blank_pixmap
                         if self.lines_visible and (self.has_marks()):
@@ -11666,6 +15140,7 @@ class RandomImageViewer(QMainWindow):
                 base_pixmap, error = safe_load_pixmap(self.current_image)
                 if error or (not base_pixmap) or base_pixmap.isNull():
                     return
+            base_pixmap = self._studio_sheet(base_pixmap)
             # Apply fast enhancements first (grayscale/contrast/gamma)
             preview_pixmap = self.apply_fast_enhancements(base_pixmap.copy()) if (self.grayscale_value!=0 or self.contrast_value!=50 or self.gamma_value!=0) else base_pixmap
             # Apply lightweight LUT preview at current strength (no caching write to avoid thrash)
@@ -11718,7 +15193,7 @@ class RandomImageViewer(QMainWindow):
             if not self.image_visible:
                 # Create a blank pixmap with the same size but keep lines visible
                 blank_pixmap = QPixmap(final_pixmap.size())
-                blank_pixmap.fill(Qt.black)  # Fill with black background
+                blank_pixmap.fill(self.canvas_color)  # The background layer
                 
                 # If there are lines, copy them from final_pixmap to blank_pixmap
                 if self.lines_visible and (self.has_marks()):
@@ -11775,6 +15250,7 @@ class RandomImageViewer(QMainWindow):
                     original_pixmap, error = safe_load_pixmap(self.current_image)
                     if error or original_pixmap.isNull():
                         return
+                original_pixmap = self._studio_sheet(original_pixmap)
                 final_pixmap = self._scale_pixmap(original_pixmap, self.current_image)
                 
                 # Draw lines on emergency fallback if any exist
@@ -11801,7 +15277,7 @@ class RandomImageViewer(QMainWindow):
                 if not self.image_visible:
                     # Create a blank pixmap with the same size but keep lines visible
                     blank_pixmap = QPixmap(final_pixmap.size())
-                    blank_pixmap.fill(Qt.black)  # Fill with black background
+                    blank_pixmap.fill(self.canvas_color)  # The background layer
                     
                     # If there are lines, copy them from final_pixmap to blank_pixmap
                     if self.lines_visible and (self.has_marks()):
@@ -11851,7 +15327,7 @@ class RandomImageViewer(QMainWindow):
             strokes += f"F{len(self.drawn_fills)}" if self.drawn_fills else ""
             color_key = self.line_color.name()
             thickness_key = str(self.line_thickness)
-            lines_key = f"_lines_{vlines}{hlines}{flines}{strokes}_{color_key}_{thickness_key}"
+            lines_key = f"_lines_{vlines}{hlines}{flines}{strokes}_{color_key}_{thickness_key}_{self._layers_signature()}"
         
         # Include enhancement settings in cache key
         enhancements_key = ""
@@ -11884,6 +15360,7 @@ class RandomImageViewer(QMainWindow):
             # Clear caches since flip changes the image
             self.enhancement_cache.clear()
             self.scaled_cache.clear()
+            self._begin_view_motion()       # the drawing flips at once, laid again after
             self.display_image(self.current_image)
             self.status.showMessage(f"Horizontal flip: {'ON' if self.flipped_h else 'OFF'}")
             # Disable/enable line tools when flip/rotation state changes
@@ -11902,6 +15379,7 @@ class RandomImageViewer(QMainWindow):
             # Clear caches since flip changes the image
             self.enhancement_cache.clear()
             self.scaled_cache.clear()
+            self._begin_view_motion()       # the drawing flips at once, laid again after
             self.display_image(self.current_image)
             self.status.showMessage(f"Vertical flip: {'ON' if self.flipped_v else 'OFF'}")
             # Disable/enable line tools when flip/rotation state changes
@@ -11917,6 +15395,7 @@ class RandomImageViewer(QMainWindow):
             # Clear caches since rotation changes the image
             self.enhancement_cache.clear()
             self.scaled_cache.clear()
+            self._begin_view_motion()       # the drawing turns at once, laid again after
             # Redisplay the image with new rotation
             self.display_image(self.current_image)
             self.status.showMessage(f"Rotated to {self.rotation_angle}°")
@@ -11933,6 +15412,9 @@ class RandomImageViewer(QMainWindow):
         """
         # If any transform is active, disable line tools
         transforms_active = (getattr(self, 'rotation_angle', 0) != 0) or getattr(self, 'flipped_h', False) or getattr(self, 'flipped_v', False)
+        # A textured tip's outline cursor turns with the view.
+        if getattr(self, 'free_draw_mode', False) and self._brush_texture() is not None:
+            self.apply_tool_cursor()
 
         # Buttons may not exist yet during startup; guard with hasattr
         for btn_name in ('line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn'):
@@ -12067,11 +15549,13 @@ class RandomImageViewer(QMainWindow):
                 minimized = bool(self.windowState() & Qt.WindowMinimized)
                 was = getattr(self, '_was_minimized', False)
                 if minimized and not was:
+                    self._hide_panels_for_minimize()
                     self._paused_by_minimize = self._pause_media_for_minimize()
                     # The grid's slideshow and in-place clip hold too.
                     self._grid_held_by_minimize = (
                         self._grid_visible() and self._thumb_grid.hold_activity())
                 elif was and not minimized:
+                    self._show_panels_after_minimize()
                     if getattr(self, '_paused_by_minimize', False):
                         self._resume_media_after_minimize()
                     self._paused_by_minimize = False
@@ -12082,6 +15566,46 @@ class RandomImageViewer(QMainWindow):
         except Exception as e:
             print(f"changeEvent error: {e}")
         super().changeEvent(event)
+
+    def _panel_windows(self):
+        """The floating panels (colour, brush, layers, effects, curves,
+        palette ...): visible tool windows owned by this window. They may sit
+        outside it, but they belong to it."""
+        found = []
+        for w in QApplication.topLevelWidgets():
+            if w is self or not w.isVisible() or w.windowType() != Qt.Tool:
+                continue
+            p = w.parentWidget()
+            while p is not None and p is not self:
+                p = p.parentWidget()
+            if p is self:
+                found.append(w)
+        return found
+
+    def _hide_panels_for_minimize(self):
+        """Minimised: the panels go to the taskbar with the window instead of
+        floating over other programs. Signals are held so hiding does not
+        count as closing one (the buttons stay checked)."""
+        panels = self._panel_windows()
+        for w in panels:
+            w.blockSignals(True)
+            try:
+                w.hide()
+            finally:
+                w.blockSignals(False)
+        self._panels_hidden_by_minimize = panels
+        preview = getattr(self, '_color_snap_preview', None)
+        if preview is not None:
+            preview.hide()
+
+    def _show_panels_after_minimize(self):
+        """Restored: the panels hidden by the minimise come back where they were."""
+        panels, self._panels_hidden_by_minimize = getattr(self, '_panels_hidden_by_minimize', []), []
+        for w in panels:
+            try:
+                w.show()
+            except RuntimeError:        # deleted meanwhile
+                pass
 
     def _pause_media_for_minimize(self):
         """Pause a running video/GIF. True if something was actually paused."""
@@ -12109,8 +15633,60 @@ class RandomImageViewer(QMainWindow):
         elif label.is_animation_paused():
             label.gif_toggle_play_pause()
 
+    _TOUCH_PAN_PX_PER_MM = 8.0     # screen px the picture moves per mm the fingers move
+    _TOUCH_PEN_QUIET_S = 0.5       # touch pans only once the pen has been quiet this long
+
+    def _start_touch_pan(self):
+        """Two fingers on a Wacom tablet's touch surface pan the zoomed
+        picture, any direction (see widgets/wacom_touch.py: the driver itself
+        only passes on vertical scrolling)."""
+        try:
+            from random_image_viewer.widgets.wacom_touch import WacomTwoFingerPan
+            pan = WacomTwoFingerPan(self)
+            why = pan.start()
+        except Exception as e:
+            why = str(e)
+            pan = None
+        if pan is None or why:
+            print(f"Wacom two-finger pan: off ({why})")
+            return
+        pan.panned.connect(self._on_touch_pan)
+        self._touch_pan = pan
+        # The pen near the tablet (hovering or drawing): touch is a resting
+        # hand then, not a gesture. Proximity events go to the application.
+        self._pen_near = False
+        self._pen_watch = _PenProximityWatch(self)
+        QApplication.instance().installEventFilter(self._pen_watch)
+        self._touch_pan_timer = QTimer(self)
+        self._touch_pan_timer.setSingleShot(True)
+        self._touch_pan_timer.setInterval(16)          # one redraw per frame, however many packets
+        self._touch_pan_timer.timeout.connect(self._smart_zoom_display)
+        print("Wacom two-finger pan: on")
+
+    def _on_touch_pan(self, dx_mm, dy_mm):
+        """Two fingers moved on the tablet: the zoomed picture follows them."""
+        label = getattr(self, 'image_label', None)
+        if (label is None or not self.isActiveWindow() or not self.current_image
+                or label.zoom_factor <= 1.0):
+            return
+        # Painting: a wrist or palm on the tablet must not move the picture.
+        # The pen near the tablet, a stroke or erase under way, a button held,
+        # or the pen heard from in the last half second - no touch pan.
+        if (getattr(self, '_pen_near', False) or getattr(self, 'is_drawing_free_stroke', False)
+                or getattr(self, 'is_erasing', False)
+                or QApplication.mouseButtons() != Qt.NoButton
+                or time.monotonic() - getattr(self, '_tablet_tilt_time', 0.0) < self._TOUCH_PEN_QUIET_S):
+            return
+        label.pan_offset_x += dx_mm * self._TOUCH_PAN_PX_PER_MM
+        label.pan_offset_y += dy_mm * self._TOUCH_PAN_PX_PER_MM
+        label._touch_pan_t = time.monotonic()
+        if not self._touch_pan_timer.isActive():
+            self._touch_pan_timer.start()
+
     def closeEvent(self, event):
         """Handle window close event"""
+        if getattr(self, '_touch_pan', None) is not None:
+            self._touch_pan.stop()
         self._close_pdf()
         self._close_epub()
         self._close_cbr()
@@ -12320,56 +15896,67 @@ class RandomImageViewer(QMainWindow):
             return
 
         file_path = self.current_image
-        file_name = os.path.basename(file_path)
-
-        # Determine next item to show before removing from playlist
         images = self.images
-        try:
-            idx = images.index(file_path)
-        except ValueError:
-            idx = -1
-
-        # Remove from playlist list
-        if idx >= 0:
-            images.pop(idx)
-        try:
-            all_idx = self._all_items.index(file_path)
-        except ValueError:
-            all_idx = -1
-        if all_idx >= 0:
-            self._all_items.pop(all_idx)
-
-        # Clean from history
-        self.history = [p for p in self.history if p != file_path]
-        self.history_index = max(0, min(self.history_index, len(self.history) - 1))
-
-        # Attempt trash
-        from PySide6.QtCore import QFile
-        ok = QFile.moveToTrash(file_path)
-
-        if not ok:
-            # Restore to playlist and report failure
-            if idx >= 0:
-                images.insert(idx, file_path)
-            if all_idx >= 0:
-                self._all_items.insert(all_idx, file_path)
-            self.statusBar().showMessage(f"Failed to move to Recycle Bin: {file_name}", 4000)
+        idx = images.index(file_path) if file_path in images else -1
+        # A playing video / GIF keeps its file open, which Windows will not trash.
+        self._release_current_media()
+        if not self._trash_playlist_item(file_path):
+            self._load_playlist_item(file_path, update_history=False)
             return
 
-        self._refresh_type_filter_panel()
-
-        self.statusBar().showMessage(f"Moved to Recycle Bin: {file_name}", 3000)
         self.current_image = None
-
         if not images:
             # Nothing left — clear display
             self.image_label.clear()
-            self._stop_current_animation()
             return
 
         # Advance: clamp index, then load
-        next_idx = min(idx, len(images) - 1)
+        next_idx = min(max(idx, 0), len(images) - 1)
         self._load_playlist_item(images[next_idx])
+
+    def _release_current_media(self):
+        """Stop the video / GIF on screen so its file is no longer open."""
+        self._stop_current_animation()
+        if self._video_playing:
+            self._stop_current_video()
+
+    def _trash_playlist_item(self, file_path):
+        """Move *file_path* to the Recycle Bin and take it out of the playlist
+        and history. True if it went; on failure everything stays."""
+        file_name = os.path.basename(file_path)
+        from PySide6.QtCore import QFile
+        if not QFile.moveToTrash(file_path):
+            self.statusBar().showMessage(f"Failed to move to Recycle Bin: {file_name}", 4000)
+            return False
+        if file_path in self.images:
+            self.images.remove(file_path)
+        if file_path in self._all_items:
+            self._all_items.remove(file_path)
+        self.history = [p for p in self.history if p != file_path]
+        self.history_index = max(0, min(self.history_index, len(self.history) - 1))
+        self._refresh_type_filter_panel()
+        self.statusBar().showMessage(f"Moved to Recycle Bin: {file_name}", 3000)
+        return True
+
+    def _delete_grid_item(self, path):
+        """Delete on a thumbnail: trash that file. The viewer only changes when
+        it was showing it; closing the grid then shows the grid's selection."""
+        current = path == self.current_image
+        if current and self._open_document() is not None:
+            self.status.showMessage("Close the document before deleting it")
+            return
+        if current:
+            self._release_current_media()
+            self._grid_paused_media = False
+        if not self._trash_playlist_item(path):
+            if current:
+                self._load_playlist_item(path, update_history=False)
+                self._grid_paused_media = self._pause_media_for_minimize()
+            return
+        if current:
+            self.current_image = None
+            self.image_label.clear()
+        self._thumb_grid.remove_item(path)
 
     def mousePressEvent(self, event):
         """Handle mouse press for window dragging and resizing in frameless mode."""
@@ -12805,6 +16392,7 @@ class RandomImageViewer(QMainWindow):
                 from random_image_viewer.widgets.thumb_grid import ThumbGrid
                 grid = ThumbGrid(self.image_label.parentWidget(), self._settings)
                 grid.activated.connect(self._on_grid_activated)
+                grid.delete_requested.connect(self._delete_grid_item)
                 grid.close_requested.connect(lambda: self.grid_view_btn.setChecked(False))
                 grid.open_folder_requested.connect(self.choose_folder)
                 grid.file_types_requested.connect(self._grid_show_file_types)
@@ -12839,6 +16427,8 @@ class RandomImageViewer(QMainWindow):
             # was on — or from the one just double-clicked.
             carry = grid.slideshow_running()
             item = getattr(self, '_grid_open_item', None) or (grid.slideshow_item() if carry else None)
+            if item is None and self.current_image is None:
+                item = grid.selected_item()     # the file on screen was deleted in the grid
             self._grid_open_item = None
             grid.hide()
             grid.suspend()
@@ -13501,7 +17091,7 @@ class RandomImageViewer(QMainWindow):
             "rect_fill_btn", "ellipse_fill_btn",
             "triangle_fill_btn",
             "antialiasing_btn", "pen_pressure_btn",
-            "brush_size_widget", "line_transparency_slider",
+            "brush_size_widget", "line_opacity_widget",
             "line_color_btn", "undo_line_btn",
         ):
             btn = getattr(self, name, None)

@@ -31,6 +31,21 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# Third-party brush textures (HeavyPaint packs, Toko Suzuki, Winter Brushes ...).
+# They are licensed to whoever bought them, not part of the app: the viewer
+# only remembers where they are (🖌 panel), so none belong in the repo.
+HEAVYPAINT/
+Textures/
+textures/
+Brushes/
+brushes/
+*Brushes_*.png
+*Brushes_*.jpg
+*Brushes_*.jpeg
+*Brushes_*.webp
+*Brushes*.zip
+*.abr
+
 # Logs / temp
 output.txt
 *.log

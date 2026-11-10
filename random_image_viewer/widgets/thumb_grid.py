@@ -129,6 +129,7 @@ class ThumbGrid(QAbstractScrollArea):
     """Scrollable, zoomable, pannable grid of every item in the playlist."""
 
     activated = Signal(str)          # open this path in the viewer
+    delete_requested = Signal(str)   # Delete on the selected item: trash this path
     close_requested = Signal()       # Esc / G / back button
     open_folder_requested = Signal()
     file_types_requested = Signal()
@@ -202,6 +203,8 @@ class ThumbGrid(QAbstractScrollArea):
 
         # In-place playback of one GIF / animated WebP / video at a time.
         self._playing = None                 # {'path', 'movie' | 'media', 'frame', 'paused'}
+        self._key_play = QTimer(self, singleShot=True, interval=150)   # see keyPressEvent
+        self._key_play.timeout.connect(self._play_selected)
 
         # Click-to-frame: the camera flies to fit the clicked picture.
         self._camera_anim = None
@@ -289,8 +292,40 @@ class ThumbGrid(QAbstractScrollArea):
         self._current = path
         self.viewport().update()
 
+    def selected_item(self):
+        if 0 <= self._selected < len(self._items):
+            return self._items[self._selected]
+        return None
+
+    def remove_item(self, path):
+        """Take *path* out of the grid (it was deleted). The one after it moves
+        into its place, on screen and as the selection."""
+        i = self._index.get(path, -1)
+        if i < 0:
+            return
+        before =self._screen_rect(i).center() if i < self._placed else None
+        del self._items[i]
+        self._index = {p: k for k, p in enumerate(self._items)}
+        t = self._thumbs.pop(path, None)
+        if t is not None:
+            self._bytes -= t.nbytes()
+        self._hover = -1
+        if self._selected > i:
+            self._selected -= 1
+        self._selected = min(self._selected, len(self._items) - 1)
+        self._reset_layout()
+        self._zoom = min(self._zoom, self._max_zoom())
+        self._update_ranges()
+        if before is not None and 0 <= self._selected < self._placed:
+            after = self._screen_rect(self._selected).center()
+            self._set_offset(self._ox() + after.x() - before.x(),
+                             self._oy() + after.y() - before.y())
+        self._schedule_requests()
+        self._update_status()
+
     def suspend(self):
         """Grid hidden: stop decoding, playback and motion, save what was measured."""
+        self._key_play.stop()
         self.stop_slideshow()
         self.stop_playback()
         self._loader.request([])
@@ -410,11 +445,13 @@ class ThumbGrid(QAbstractScrollArea):
             pl['movie'].frameChanged.disconnect(self._on_movie_frame)
             pl['movie'].finished.disconnect(self._on_media_cycle)
             pl['movie'].stop()
+            pl['movie'].setFileName("")     # close the file now, so it can be deleted
             pl['movie'].deleteLater()
         else:
             pl['sink'].videoFrameChanged.disconnect(self._on_video_frame)
             pl['media'].positionChanged.disconnect(self._on_video_position)
             pl['media'].stop()
+            pl['media'].setSource(QUrl())   # likewise
             pl['media'].deleteLater()
             pl['sink'].deleteLater()
         i = self._index.get(pl['path'], -1)
@@ -1794,7 +1831,13 @@ class ThumbGrid(QAbstractScrollArea):
         self._glide.stop()
         self.stop_slideshow()           # the user takes over
         if key == Qt.Key_Delete:
-            return          # never delete the viewer's file from inside the grid
+            # A document's pages are not files of their own.
+            path = self.selected_item()
+            if path is not None and not self._showing_pages():
+                if self._playing is not None and self._playing['path'] == path:
+                    self.stop_playback()        # it holds the file open
+                self.delete_requested.emit(path)
+            return
         n = self._placed
         if not n:
             return
@@ -1831,7 +1874,23 @@ class ThumbGrid(QAbstractScrollArea):
         else:
             super().keyPressEvent(event)
             return
-        old, self._selected = self._selected, max(0, min(n - 1, sel))
-        self._update_cell(old)
-        self._update_cell(self._selected)
-        self.ensure_visible(self._selected)
+        sel = max(0, min(n - 1, sel))
+        if self._focused >= 0:
+            self.focus_item(sel)        # framed: the camera hops on to the next one
+        else:
+            old, self._selected = self._selected, sel
+            self._update_cell(old)
+            self._update_cell(self._selected)
+            self.ensure_visible(self._selected)
+        # A GIF / video plays once the selection rests on it, as after a click;
+        # held arrows don't start a player for every clip passed on the way.
+        if self._playing is not None and self._playing['path'] != self._items[sel]:
+            self.stop_playback()
+        self._key_play.start()
+
+    def _play_selected(self):
+        sel = self._selected
+        if not self.isVisible() or not 0 <= sel < self._placed:
+            return
+        if self._playing is None or self._playing['path'] != self._items[sel]:
+            self.toggle_playback(sel)

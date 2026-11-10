@@ -205,6 +205,11 @@ class _Header(QLabel):
 
     def mouseReleaseEvent(self, event):
         self._offset = None
+        if self._moved:
+            self._moved = False
+            done = getattr(self._window, 'drag_finished', None)
+            if done is not None:
+                done.emit()
         event.accept()
 
 
@@ -212,6 +217,7 @@ class ColorPickerPopup(QWidget):
     color_picked = Signal(QColor)
     pinned_changed = Signal(bool)
     closed = Signal()
+    drag_finished = Signal()        # moved by hand (it leaves / rejoins the dock)
 
     def __init__(self, parent=None):
         # A frameless tool window rather than Qt.Popup: a popup is closed by Qt
@@ -312,6 +318,9 @@ class ColorPickerPopup(QWidget):
         self._strip.changed.connect(self._on_strip)
 
     # ── public API ──
+    def set_title(self, text):
+        self._title.setText(f"\U0001f3a8 {text}")
+
     def set_color(self, color):
         """Show *color* without emitting (used when opening / syncing)."""
         self._updating = True

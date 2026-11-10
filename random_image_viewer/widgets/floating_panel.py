@@ -172,6 +172,9 @@ class FloatingPanel(QWidget):
     def __init__(self, title, parent=None):
         super().__init__(parent)
         self.setObjectName("FloatingPanel")
+        # Panels lie inside the canvas, whose cursor (brush outline,
+        # crosshair) they would inherit; buttons want the plain arrow.
+        self.setCursor(Qt.ArrowCursor)
         self._title = title
         self._user_moved = False
         self._collapsed = False
@@ -462,14 +465,14 @@ class FloatingPanel(QWidget):
         if self._on_right_edge(pos):
             self.setCursor(Qt.SizeHorCursor)
         else:
-            self.unsetCursor()
+            self.setCursor(Qt.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         changed = False
         if self._resizing:
             self._resizing = False
-            self.unsetCursor()
+            self.setCursor(Qt.ArrowCursor)
             changed = True
         if self._drag_offset is not None:
             self._drag_offset = None

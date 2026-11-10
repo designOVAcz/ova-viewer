@@ -421,6 +421,119 @@ class GPULutProcessor:
             out[gid * 3 + 1] = (uchar)(clamp(palette[best * 3 + 1], 0.0f, 255.0f) + 0.5f);
             out[gid * 3 + 2] = (uchar)(clamp(palette[best * 3 + 2], 0.0f, 255.0f) + 0.5f);
         }
+
+        // One pass of a box blur over an RGB float image, along x or y. The
+        // window is clipped at the edges and averaged over what is inside.
+        __kernel void box_blur_rgb(
+            __global const float* src,
+            __global float* dst,
+            const int width,
+            const int height,
+            const int radius,
+            const int along_x
+        ) {
+            int x = get_global_id(0);
+            int y = get_global_id(1);
+            if (x >= width || y >= height) return;
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            int lo, hi, n = 0;
+            if (along_x) {
+                lo = max(0, x - radius); hi = min(width - 1, x + radius);
+                for (int k = lo; k <= hi; k++) {
+                    int i = (y * width + k) * 3;
+                    r += src[i]; g += src[i + 1]; b += src[i + 2]; n++;
+                }
+            } else {
+                lo = max(0, y - radius); hi = min(height - 1, y + radius);
+                for (int k = lo; k <= hi; k++) {
+                    int i = (k * width + x) * 3;
+                    r += src[i]; g += src[i + 1]; b += src[i + 2]; n++;
+                }
+            }
+            int o = (y * width + x) * 3;
+            float inv = 1.0f / (float)n;
+            dst[o] = r * inv; dst[o + 1] = g * inv; dst[o + 2] = b * inv;
+        }
+
+        // ---- Pigment (Kubelka-Munk) mixing, as drawing/pigment.py does it ----
+        // prim: 7 x 10 reflectance of W C M Y R G B; sense: 10 x 3 (to linear RGB).
+        float km_to_linear(float v) {
+            v = clamp(v / 255.0f, 0.0f, 1.0f);
+            return v <= 0.04045f ? v / 12.92f : pow((v + 0.055f) / 1.055f, 2.4f);
+        }
+        float km_to_srgb(float v) {
+            v = clamp(v, 0.0f, 1.0f);
+            v = v <= 0.0031308f ? v * 12.92f : 1.055f * pow(v, 1.0f / 2.4f) - 0.055f;
+            return v * 255.0f;
+        }
+        void km_latent(float3 c, __constant float* prim, __constant float* sense,
+                       float* ks, float3* residual, float* strength) {
+            float r = km_to_linear(c.x), g = km_to_linear(c.y), b = km_to_linear(c.z);
+            float3 lin = (float3)(r, g, b);
+            float w = fmin(fmin(r, g), b);
+            r -= w; g -= w; b -= w;
+            float cy = fmin(g, b), mg = fmin(r, b), ye = fmin(r, g);
+            float wt[7] = {w, cy, mg, ye, fmax(r - mg - ye, 0.0f), fmax(g - cy - ye, 0.0f),
+                           fmax(b - cy - mg, 0.0f)};
+            float3 back = (float3)(0.0f);
+            for (int k = 0; k < 10; k++) {
+                float refl = 0.0f;
+                for (int i = 0; i < 7; i++) refl += wt[i] * prim[i * 10 + k];
+                refl = clamp(refl, 0.01f, 1.0f);
+                ks[k] = (1.0f - refl) * (1.0f - refl) / (2.0f * refl);
+                back += refl * (float3)(sense[k * 3], sense[k * 3 + 1], sense[k * 3 + 2]);
+            }
+            *residual = lin - back;
+            *strength = sqrt(fmax(dot(lin, (float3)(0.2126f, 0.7152f, 0.0722f)), 0.002f));
+        }
+        float3 km_mix(float3 a, float3 b, float t, __constant float* prim, __constant float* sense) {
+            if (t <= 0.0f) return a;
+            if (t >= 1.0f) return b;
+            float3 d = fabs(a - b);
+            if (d.x + d.y + d.z <= 12.0f) return a + (b - a) * t;   // alike: light mixing
+            float ka[10], kb[10], sa, sb;
+            float3 ra, rb;
+            km_latent(a, prim, sense, ka, &ra, &sa);
+            km_latent(b, prim, sense, kb, &rb, &sb);
+            float wa = (1.0f - t) * sa, wb = t * sb;
+            float share = wb / fmax(wa + wb, 1e-12f);
+            float3 lin = ra + (rb - ra) * share;
+            for (int k = 0; k < 10; k++) {
+                float ks = ka[k] + (kb[k] - ka[k]) * share;
+                float refl = 1.0f + ks - sqrt(ks * ks + 2.0f * ks);
+                lin += refl * (float3)(sense[k * 3], sense[k * 3 + 1], sense[k * 3 + 2]);
+            }
+            return (float3)(km_to_srgb(lin.x), km_to_srgb(lin.y), km_to_srgb(lin.z));
+        }
+
+        // Premultiplied BGRA: src laid over dst at opacity (SourceOver), the
+        // colours mixed like paint; then tinted *amount* towards tint (RGB).
+        __kernel void pigment_over(
+            __global const uchar* dst, __global const uchar* src, __global uchar* out,
+            const int n, const float opacity, const float tr, const float tg, const float tb,
+            const float amount, __constant float* prim, __constant float* sense
+        ) {
+            int i = get_global_id(0);
+            if (i >= n) return;
+            int o = i * 4;
+            float da = (float)dst[o + 3];
+            float s_a = (float)src[o + 3];
+            float sa = s_a * opacity;
+            float out_a = sa + da * (1.0f - sa / 255.0f);
+            float share = out_a > 0.0f ? sa / fmax(out_a, 1e-6f) : 0.0f;
+            float kd = 255.0f / fmax(da, 1.0f), ks_ = 255.0f / fmax(s_a, 1.0f);
+            float3 d = (float3)(dst[o + 2], dst[o + 1], dst[o]) * kd;
+            float3 s = (float3)(src[o + 2], src[o + 1], src[o]) * ks_;
+            float3 c;
+            if (da > 0.0f && sa > 0.0f) c = km_mix(d, s, share, prim, sense);
+            else c = d + (s - d) * share;
+            if (amount > 0.0f && out_a > 0.0f) c = km_mix(c, (float3)(tr, tg, tb), amount, prim, sense);
+            float k = out_a / 255.0f;
+            out[o + 2] = (uchar)clamp(c.x * k + 0.5f, 0.0f, 255.0f);
+            out[o + 1] = (uchar)clamp(c.y * k + 0.5f, 0.0f, 255.0f);
+            out[o] = (uchar)clamp(c.z * k + 0.5f, 0.0f, 255.0f);
+            out[o + 3] = (uchar)clamp(out_a + 0.5f, 0.0f, 255.0f);
+        }
         """
 
     def apply_lut_gpu_quiet(self, image, lut_data, lut_size, strength_factor=1.0):
@@ -836,6 +949,81 @@ class GPULutProcessor:
             return out
         except Exception as e:
             print(f"GPU color groups failed: {e}")
+            return None
+
+    def box_blur_rgb_gpu(self, rgb, radius, passes=2):
+        """*rgb* (H, W, 3) float blurred with a box of *radius*, *passes*
+        times over (x then y each time) - as the CPU's _box_blur_2d does it,
+        edges included. Returns float32 (H, W, 3), or None (GPU unavailable /
+        failed: the caller blurs on the CPU)."""
+        if not self.is_available():
+            return None
+        import numpy as np
+        _cl = _constants.cl
+        try:
+            src = np.ascontiguousarray(rgb, dtype=np.float32)
+            h, w = src.shape[:2]
+            if h == 0 or w == 0 or radius < 1:
+                return None
+            mf = _cl.mem_flags
+            a = _cl.Buffer(self.context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=src)
+            b = _cl.Buffer(self.context, mf.READ_WRITE, src.nbytes)
+            kernel = self._kernel_cache.get('box_blur_rgb')
+            if not kernel:
+                kernel = self._kernel_cache['box_blur_rgb'] = _cl.Kernel(self.program, 'box_blur_rgb')
+            for _ in range(passes):
+                for along_x, (s, d) in ((1, (a, b)), (0, (b, a))):
+                    kernel.set_args(s, d, np.int32(w), np.int32(h), np.int32(int(radius)), np.int32(along_x))
+                    _cl.enqueue_nd_range_kernel(self.queue, kernel, (w, h), None)
+            out = np.empty_like(src)
+            _cl.enqueue_copy(self.queue, out, a)
+            self.queue.finish()
+            return out
+        except Exception as e:
+            print(f"GPU box blur failed: {e}")
+            return None
+
+    def pigment_over_gpu(self, dst, src, opacity, prim, sense, rgb=None, amount=0.0):
+        """pigment.over() on the GPU: premultiplied BGRA uint8 (h, w, 4)
+        *src* laid over *dst* at *opacity*, mixed like paint, then tinted
+        *amount* towards 0xRRGGBB *rgb*. *prim* / *sense*: pigment.py's
+        tables. Returns uint8 (h, w, 4), or None (no GPU / failed)."""
+        if not self.gpu_enabled:
+            return None
+        import numpy as np
+        _cl = _constants.cl
+        try:
+            d = np.ascontiguousarray(dst, dtype=np.uint8)
+            s = np.ascontiguousarray(src, dtype=np.uint8)
+            n = d.size // 4
+            if n == 0 or s.shape != d.shape:
+                return None
+            mf = _cl.mem_flags
+            tables = getattr(self, '_pigment_tables', None)
+            if tables is None:
+                tables = self._pigment_tables = (
+                    _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                               hostbuf=np.ascontiguousarray(prim, np.float32)),
+                    _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                               hostbuf=np.ascontiguousarray(sense, np.float32)))
+            d_buf = _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=d)
+            s_buf = _cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=s)
+            out = np.empty_like(d)
+            o_buf = _cl.Buffer(self.context, mf.WRITE_ONLY, out.nbytes)
+            kernel = self._kernel_cache.get('pigment_over')
+            if not kernel:
+                kernel = self._kernel_cache['pigment_over'] = _cl.Kernel(self.program, 'pigment_over')
+            c = rgb or 0
+            kernel.set_args(d_buf, s_buf, o_buf, np.int32(n), np.float32(opacity),
+                            np.float32((c >> 16) & 255), np.float32((c >> 8) & 255), np.float32(c & 255),
+                            np.float32(amount if rgb is not None else 0.0), tables[0], tables[1])
+            _cl.enqueue_nd_range_kernel(self.queue, kernel, (n,), None)
+            _cl.enqueue_copy(self.queue, out, o_buf)
+            self.queue.finish()
+            return out
+        except Exception as e:
+            print(f"GPU pigment mixing failed: {e}")
+            self._pigment_failed = True
             return None
 
     def get_device_info(self):
