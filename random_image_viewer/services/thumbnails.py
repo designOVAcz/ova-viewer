@@ -35,13 +35,16 @@ from PySide6.QtCore import QObject, Signal, QSize, QBuffer, QByteArray, QIODevic
 from PySide6.QtGui import QImage, QImageReader, QImageIOHandler
 
 from random_image_viewer.constants import (
-    IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DOCUMENT_EXTENSIONS,
+    IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DOCUMENT_EXTENSIONS, AUDIO_EXTENSIONS,
 )
 
 THUMB_EDGE = 384                    # long edge of a standard cached thumbnail, px
 SHARP_EDGES = (640, 960, 1440, 2160, 3200)       # larger tiers, made only for big cells near the view
 # Ratio assumed when no header can tell (a document before its first thumbnail).
-GUESS_ASPECT = {'image': 1.5, 'video': 16 / 9, 'doc': 0.72}
+# Music has no picture: the grid draws it as a title row this wide - in the
+# justified layout about one to a row, so a folder of songs reads as a list.
+AUDIO_ASPECT = 20.0
+GUESS_ASPECT = {'image': 1.5, 'video': 16 / 9, 'doc': 0.72, 'audio': AUDIO_ASPECT}
 CACHE_CAP_BYTES = 1024 ** 3         # 1 GB on disk, oldest entries evicted
 JPEG_QUALITY = 85
 
@@ -74,12 +77,14 @@ def display_name(item):
 
 
 def item_kind(path):
-    """'image', 'video' or 'doc' — drives the decoder and the placeholder."""
+    """'image', 'video', 'audio' or 'doc' — drives the decoder and the placeholder."""
     if PAGE_SEP in path:
         return 'image'          # a single page shows as a picture
     ext = os.path.splitext(path)[1].lower()
     if ext in VIDEO_EXTENSIONS:
         return 'video'
+    if ext in AUDIO_EXTENSIONS:
+        return 'audio'
     if ext in DOCUMENT_EXTENSIONS:
         return 'doc'
     return 'image'
@@ -359,6 +364,8 @@ def make_thumbnail(path, edge=THUMB_EDGE):
         if page is not None:
             return _decode_page(page[0], page[1], edge)
         ext = os.path.splitext(path)[1].lower()
+        if ext in AUDIO_EXTENSIONS:
+            return QImage()             # drawn as a title row by the grid, nothing to decode
         if ext in VIDEO_EXTENSIONS:
             return _decode_video(path, edge)
         if ext in DOCUMENT_EXTENSIONS:
@@ -398,6 +405,8 @@ def probe_aspect(path):
             a = None
         return a or GUESS_ASPECT['doc']
     kind = item_kind(path)
+    if kind == 'audio':
+        return AUDIO_ASPECT             # a title row, never a picture
     if kind == 'image':
         reader = QImageReader(path)
         reader.setAutoTransform(True)

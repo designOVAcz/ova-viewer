@@ -25,8 +25,10 @@ class LayerWindow(QWidget):
     opacity_changed = Signal(int)
     blend_changed = Signal(str)
     effects_changed = Signal(bool)
+    impasto_changed = Signal(object)        # ⛰ settings dict, or None (flat paint)
     add_requested = Signal()
     canvas_requested = Signal()
+    import_requested = Signal()             # 📥 a PNG / picture onto this layer
     remove_requested = Signal()
     move_requested = Signal(int)    # +1 up the stack, -1 down
     background_requested = Signal()
@@ -115,6 +117,41 @@ class LayerWindow(QWidget):
         self._effects.toggled.connect(self._on_effects)
         inner.addWidget(self._effects)
 
+        # ⛰ Impasto: the layer's paint lit as relief, its sliders under it
+        # while it is on.
+        self._impasto = QCheckBox("⛰ Impasto (paint relief)")
+        self._impasto.setToolTip(
+            "Light this layer's paint as thick relief, like Rebelle's bristle impasto: grooves "
+            "along the bristles, raised stroke edges, a wet highlight. Worked out on the GPU "
+            "and kept, so painting and zooming stay quick")
+        self._impasto.toggled.connect(self._on_impasto_toggled)
+        inner.addWidget(self._impasto)
+        self._impasto_box = QWidget()
+        box = QVBoxLayout(self._impasto_box)
+        box.setContentsMargins(14, 0, 0, 0)
+        box.setSpacing(2)
+        self._impasto_sliders = {}
+        for key, label, (lo, hi), unit, tip in self._IMPASTO_SLIDERS:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            name = QLabel(label)
+            name.setFixedWidth(54)
+            row.addWidget(name)
+            slider = ClickableSlider(Qt.Horizontal)
+            slider.setRange(lo, hi)
+            slider.setToolTip(tip)
+            value = QLabel("")
+            value.setFixedWidth(36)
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            slider.valueChanged.connect(
+                lambda v, k=key, u=unit, lab=value: self._on_impasto_slider(k, v, u, lab))
+            row.addWidget(slider, 1)
+            row.addWidget(value)
+            box.addLayout(row)
+            self._impasto_sliders[key] = (slider, value, unit)
+        self._impasto_box.hide()
+        inner.addWidget(self._impasto_box)
+
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._list.setEditTriggers(QAbstractItemView.DoubleClicked)
@@ -184,11 +221,17 @@ class LayerWindow(QWidget):
                   "on. Untick it to see the picture again; Opacity makes it tracing paper; the "
                   "eraser and 🕘 History cut through it; ✨ decides whether effects reach it",
             self.canvas_requested.emit)
+        self._import_btn = self._tool_button(
+            "📥", "Import a PNG (or other picture) onto this layer, transparency kept. It lands "
+                  "in the middle, ⬚ selected: drag to move, a corner to scale, outside to turn, "
+                  "Enter applies. Ctrl+Z takes it away",
+            self.import_requested.emit)
         self._remove_btn = self._tool_button(
             "−", "Delete this layer and its marks (no undo)", self.remove_requested.emit)
         self._up_btn = self._tool_button("▲", "Move up", lambda: self.move_requested.emit(1))
         self._down_btn = self._tool_button("▼", "Move down", lambda: self.move_requested.emit(-1))
-        for btn in (self._add_btn, self._canvas_btn, self._remove_btn, self._up_btn, self._down_btn):
+        for btn in (self._add_btn, self._canvas_btn, self._import_btn, self._remove_btn,
+                    self._up_btn, self._down_btn):
             buttons.addWidget(btn)
         buttons.addStretch(1)
         inner.addLayout(buttons)
@@ -220,6 +263,7 @@ class LayerWindow(QWidget):
         self._opacity.setValue(active.opacity)
         self._opacity_label.setText(f"{active.opacity}%")
         self._effects.setChecked(active.effects)
+        self._show_impasto(getattr(active, 'impasto', None))
         self._up_btn.setEnabled(position < len(self._layers) - 1)
         self._down_btn.setEnabled(position > 0)
         self._quiet = False
@@ -294,6 +338,46 @@ class LayerWindow(QWidget):
     def _on_effects(self, on):
         if not self._quiet:
             self.effects_changed.emit(on)
+
+    # ⛰ impasto
+    _IMPASTO_SLIDERS = (
+        ('depth', 'Depth', (0, 100), '%', "How high the paint stands: the strength of all the relief"),
+        ('grooves', 'Grooves', (0, 100), '%',
+         "Bristle grooves: relief from the fine streaks in the paint (the bristles' marks, "
+         "the colour each one carried)"),
+        ('edges', 'Edges', (0, 100), '%',
+         "A raised rim where the paint was pushed to the stroke's edge"),
+        ('edge_width', 'Edge px', (1, 40), 'px', "How wide that rim is, in picture pixels"),
+        ('light', 'Light', (0, 359), '°',
+         "Where the light comes from: 0° right, 90° below, 180° left, 270° above "
+         "(225°: top left)"),
+        ('gloss', 'Gloss', (0, 100), '%', "Wet highlight on the ridges facing the light"),
+    )
+
+    def _impasto_values(self):
+        return {key: slider.value() for key, (slider, _v, _u) in self._impasto_sliders.items()}
+
+    def _show_impasto(self, settings):
+        from random_image_viewer.drawing.impasto import DEFAULTS
+        values = dict(DEFAULTS, **(settings or {}))
+        self._impasto.setChecked(bool(settings))
+        for key, (slider, value, unit) in self._impasto_sliders.items():
+            slider.setValue(int(values[key]))
+            value.setText(f"{int(values[key])}{unit}")
+        if self._impasto_box.isVisibleTo(self) != bool(settings):
+            self._impasto_box.setVisible(bool(settings))
+
+    def _on_impasto_toggled(self, on):
+        if self._impasto_box.isVisibleTo(self) != on:
+            self._impasto_box.setVisible(on)
+            self.adjustSize()
+        if not self._quiet:
+            self.impasto_changed.emit(self._impasto_values() if on else None)
+
+    def _on_impasto_slider(self, key, value, unit, label):
+        label.setText(f"{value}{unit}")
+        if not self._quiet and self._impasto.isChecked():
+            self.impasto_changed.emit(self._impasto_values())
 
     # ── drag by the header ────────────────────────────────────────
 

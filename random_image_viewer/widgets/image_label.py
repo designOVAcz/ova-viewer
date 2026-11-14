@@ -2,7 +2,7 @@ import time
 
 from PySide6.QtWidgets import QLabel, QApplication, QMenu
 from PySide6.QtGui import (QPainter, QColor, QPen, QAction, QTabletEvent, QMovie,
-                           QPolygon, QRegion, QCursor)
+                           QPolygon, QRegion, QCursor, QPointingDevice)
 from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPointF, QRectF, QRect
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink, QAudioOutput
 
@@ -536,7 +536,9 @@ class ImageLabel(QLabel):
         if not getattr(viewer, 'dub_audio_enabled', False):
             return
         try:
-            from random_image_viewer.image_utils import find_dub_audio_file
+            from random_image_viewer.image_utils import find_dub_audio_file, is_audio_file
+            if is_audio_file(video_path):
+                return                  # a song is its own sound - it has no dub
             dub_path = find_dub_audio_file(video_path)
         except Exception:
             return
@@ -781,7 +783,9 @@ class ImageLabel(QLabel):
             # When not zoomed in and not in zoom mode, use wheel for image
             # navigation - unless that would throw away an unsaved drawing, in
             # which case fall through and zoom instead (see wheel_should_zoom).
-            if self.zoom_factor <= 1.0 and not zoom_mode:
+            # Fingers scrolling on a tablet or touchpad pan instead (below).
+            if (self.zoom_factor <= 1.0 and not zoom_mode
+                    and not self._touch_scroll(event, delta_x, delta_y)):
                 protect = False
                 try:
                     protect = self.parent_viewer.wheel_should_zoom()
@@ -808,7 +812,12 @@ class ImageLabel(QLabel):
             # only emits VERTICAL wheel deltas, so horizontal panning is unavailable
             # via this path. For full 2D panning, disable the Wacom Scroll/Zoom
             # gestures so raw QTouchEvents reach _handle_touch_event() instead.
-            if self.zoom_factor > 1.0 and not zoom_mode:
+            # At 100 % and below a two-finger scroll pans too (in the plain
+            # view as in ◧ Studio), while a mouse wheel still zooms or turns
+            # the page (see _touch_scroll).
+            finger_scroll = (self.zoom_factor <= 1.0
+                             and self._touch_scroll(event, delta_x, delta_y))
+            if (self.zoom_factor > 1.0 or finger_scroll) and not zoom_mode:
                 if time.monotonic() - getattr(self, '_touch_pan_t', 0.0) < 0.25:
                     # Two fingers on the tablet already pan (read straight from
                     # its touch surface); the driver's scroll for the same
@@ -869,8 +878,9 @@ class ImageLabel(QLabel):
                     new_zoom = 1.0
                 self.zoom_factor = new_zoom
 
-                # At the fit or smaller the picture sits centred
-                if self.zoom_factor <= 1.0:
+                # At the fit or smaller the picture sits centred - except in
+                # ◧ Studio, where it stays where it was panned to.
+                if self.zoom_factor <= 1.0 and not self._studio_pan():
                     self.pan_offset_x = 0
                     self.pan_offset_y = 0
 
@@ -952,6 +962,19 @@ class ImageLabel(QLabel):
             return
         super().mouseDoubleClickEvent(event)
 
+    @staticmethod
+    def _touch_scroll(event, delta_x, delta_y):
+        """A wheel event that is fingers on a tablet / touchpad, not a mouse
+        wheel: it moves sideways, comes in scroll phases or pixel steps, or
+        in steps finer than a wheel notch (120)."""
+        return bool(delta_x or event.phase() != Qt.NoScrollPhase
+                    or not event.pixelDelta().isNull() or delta_y % 120)
+
+    def _studio_pan(self):
+        """◧ Studio: the right button pans at any zoom, 100 % and below too."""
+        return bool(self.parent_viewer is not None
+                    and getattr(self.parent_viewer, 'studio_mode', False))
+
     def _no_tool_engaged(self):
         """True when no drawing, fill, eraser or colour-snap tool is on — the
         plain left button is then free for panning and opening the grid."""
@@ -967,8 +990,12 @@ class ImageLabel(QLabel):
     def mousePressEvent(self, event):
         # Handle middle-click for next image
         if event.button() == Qt.MiddleButton and self.parent_viewer:
-            self.parent_viewer.show_next_image()
             event.accept()
+            # Not over a drawing (or in ◧ Studio): the next image would wipe it.
+            if self.parent_viewer.wheel_should_zoom():
+                self.parent_viewer.note_wheel_nav_blocked()
+            else:
+                self.parent_viewer.show_next_image()
             return
 
         # ✂ Crop: the left button drags the frame
@@ -985,14 +1012,16 @@ class ImageLabel(QLabel):
             event.accept()
             return
 
-        # Handle right-click for panning when zoomed
+        # Handle right-click for panning when zoomed - in ◧ Studio at any zoom
         if (event.button() == Qt.RightButton and
-            self.zoom_factor > 1.0 and
+            (self.zoom_factor > 1.0 or self._studio_pan()) and
             self.pixmap() and
             not self.pixmap().isNull()):
 
             self.is_panning = True
             self.last_pan_point = event.position()
+            self._right_press_at = event.position()
+            self._right_dragged = False
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
@@ -1221,6 +1250,10 @@ class ImageLabel(QLabel):
             self.pan_offset_x += delta_x
             self.pan_offset_y += delta_y
             self.last_pan_point = current_point
+            start = getattr(self, '_right_press_at', None)
+            if start is not None and (abs(current_point.x() - start.x())
+                                      + abs(current_point.y() - start.y())) > 4:
+                self._right_dragged = True      # a drag, not a click: no menu after
 
             if self.parent_viewer and self.parent_viewer.current_image:
                 self.parent_viewer._smart_zoom_display()
@@ -1470,6 +1503,11 @@ class ImageLabel(QLabel):
             self.parent_viewer._tablet_tilt_time = time.monotonic()
             if hover and not self.parent_viewer.is_drawing_free_stroke:
                 self.parent_viewer.refresh_texture_cursor()   # hovering: turn with the lean
+            # The pen turned round: its eraser end rubs out (🧽 Erase mode).
+            if event.type() in (QTabletEvent.TabletEnterProximity, QTabletEvent.TabletMove,
+                                QTabletEvent.TabletPress):
+                self.parent_viewer.pen_end_changed(
+                    event.pointerType() == QPointingDevice.PointerType.Eraser)
         if not (self.parent_viewer and self.parent_viewer.free_draw_mode):
             event.ignore()
             return
@@ -1558,14 +1596,15 @@ class ImageLabel(QLabel):
                     self.pan_offset_y = self.pan_offset_y * zoom_ratio - oy * (zoom_ratio - 1)
                     self.zoom_factor  = new_zoom
 
-                    if self.zoom_factor <= 1.0:
+                    if old_zoom > 1.0 >= self.zoom_factor and not self._studio_pan():
+                        # Pinched back to the fit: centred again, once.
                         self.pan_offset_x = 0
                         self.pan_offset_y = 0
 
-                # Add midpoint translation (pan) on top — works even when scale==1
-                if self.zoom_factor > 1.0:
-                    self.pan_offset_x += dx
-                    self.pan_offset_y += dy
+                # Add midpoint translation (pan) on top — at any zoom, 100 %
+                # and below too (the fingers moved the picture only zoomed in).
+                self.pan_offset_x += dx
+                self.pan_offset_y += dy
 
             self.parent_viewer._smart_zoom_display()
             zoom_pct = int(self.zoom_factor * 100)
@@ -1667,6 +1706,11 @@ class ImageLabel(QLabel):
         # Hide context menu when zoomed in to avoid interfering with panning
         if hasattr(self, 'zoom_factor') and self.zoom_factor > 1.0:
             return
+        # ◧ Studio pans with the right button at any zoom: after a drag, no
+        # menu; a plain right click still opens it.
+        dragged, self._right_dragged = getattr(self, '_right_dragged', False), False
+        if dragged and self._studio_pan():
+            return
 
         menu = QMenu(self)
 
@@ -1758,6 +1802,17 @@ class ImageLabel(QLabel):
         menu.addAction(flip_v_action)
 
         menu.addSeparator()
+
+        # --- 🐧 Colours from ColorPenguin (its sync set to Rebelle) ---
+        if hasattr(self.parent_viewer, 'toggle_colour_sync'):
+            sync_action = QAction("🐧 Colours from ColorPenguin", self)
+            sync_action.setCheckable(True)
+            sync_action.setChecked(self.parent_viewer.colour_sync_enabled())
+            sync_action.setToolTip("ColorPenguin with its sync set to Rebelle sends the colour you "
+                                   "pick there to Ova Viewer as the brush colour")
+            sync_action.toggled.connect(self.parent_viewer.toggle_colour_sync)
+            menu.addAction(sync_action)
+            menu.addSeparator()
 
         # --- View actions ---
         if self.parent_viewer.is_fullscreen:

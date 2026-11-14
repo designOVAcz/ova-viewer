@@ -25,6 +25,7 @@ class SnappedPaletteWindow(QWidget):
 
     SWATCH_W = 18      # minimum width for a swatch
     SWATCH_H = 24      # minimum height for a swatch
+    PER_LINE = 10      # swatches side by side at most; more wrap to a new line
     DEFAULT_W = 260    # initial panel width
     DEFAULT_H = 140    # initial panel height
     MIN_W = 160
@@ -135,9 +136,12 @@ class SnappedPaletteWindow(QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
+        # At most PER_LINE swatches side by side; a longer row wraps on.
+        lines = []
         for row_colors in self._rows:
-            if not row_colors:
-                continue
+            for i in range(0, len(row_colors), self.PER_LINE):
+                lines.append((row_colors[i:i + self.PER_LINE], len(row_colors) > self.PER_LINE))
+        for row_colors, wrapped in lines:
             row_widget = QWidget(self._rows_container)
             row_widget.setStyleSheet("background: transparent;")
             row_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -162,6 +166,14 @@ class SnappedPaletteWindow(QWidget):
                     lambda _pos, c=hex_color: self.swatch_removed.emit(c)
                 )
                 row_layout.addWidget(sw, 1)
+            if wrapped:
+                # The last line of a wrapped row keeps the swatch width, so
+                # the colours stand in columns.
+                for _ in range(self.PER_LINE - len(row_colors)):
+                    gap = QWidget(row_widget)
+                    gap.setMinimumSize(self.SWATCH_W, self.SWATCH_H)
+                    gap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                    row_layout.addWidget(gap, 1)
             # Each row stretches equally vertically within the rows container
             self._rows_layout.addWidget(row_widget, 1)
         # Empty state visibility

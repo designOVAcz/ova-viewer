@@ -54,7 +54,7 @@ from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QPen, QFontMetrics, 
 from random_image_viewer.constants import ANIMATED_EXTENSIONS
 from random_image_viewer.platform_utils import is_windows_dark_mode
 from random_image_viewer.services.thumbnails import (
-    ThumbLoader, item_kind, THUMB_EDGE, SHARP_EDGES, GUESS_ASPECT,
+    ThumbLoader, item_kind, THUMB_EDGE, SHARP_EDGES, GUESS_ASPECT, AUDIO_ASPECT,
     load_aspect_index, save_aspect_index, display_name, release_documents, PAGE_SEP,
 )
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
@@ -134,6 +134,7 @@ class ThumbGrid(QAbstractScrollArea):
     open_folder_requested = Signal()
     file_types_requested = Signal()
     pages_toggled = Signal(bool)     # show the open document's pages (True) or the folder
+    audio_started = Signal(str)      # ♪ a song started playing in its row
     progress = Signal(int, int)      # thumbnails loaded / wanted around the view
 
     # Keys the grid handles itself even though the main window has global
@@ -262,6 +263,10 @@ class ThumbGrid(QAbstractScrollArea):
         self.stop_playback()
         self._items = list(paths)
         self._index = {p: i for i, p in enumerate(self._items)}
+        # ♪ Songs always lie as a title row, whatever shape was kept for them.
+        for p in self._items:
+            if item_kind(p) == 'audio':
+                self._aspect[p] = AUDIO_ASPECT
         self._hover = -1
         self._current = current
         self._selected = self._index.get(current, 0 if self._items else -1)
@@ -357,6 +362,8 @@ class ThumbGrid(QAbstractScrollArea):
         kind = item_kind(path)
         if kind == 'video':
             self._play_video(path)
+        elif kind == 'audio':
+            self._play_audio(path)
         elif os.path.splitext(path)[1].lower() in ANIMATED_EXTENSIONS:
             self._play_animation(i, path)
         if self._playing is not None:
@@ -401,6 +408,57 @@ class ThumbGrid(QAbstractScrollArea):
         self._playing = {'path': path, 'media': media, 'sink': sink, 'frame': None, 'paused': False}
         media.play()
 
+    def _play_audio(self, path):
+        """♪ A song clicked in the list: it plays right there, with sound,
+        once through (the row shows how far it got). With the slideshow's
+        autoplay-next, the next item follows when it ends."""
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        except ImportError:
+            return
+        media = QMediaPlayer(self)
+        out = QAudioOutput(self)
+        out.setVolume(0.6)
+        media.setAudioOutput(out)
+        media.positionChanged.connect(self._on_video_position)
+        media.durationChanged.connect(self._on_audio_duration)
+        media.mediaStatusChanged.connect(self._on_audio_status)
+        media.setSource(QUrl.fromLocalFile(path))
+        self._playing = {'path': path, 'media': media, 'sink': None, 'audio': out,
+                         'frame': None, 'paused': False}
+        media.play()
+        self.audio_started.emit(path)   # the viewer's own song makes way
+
+    _handoff = None     # (song, ms) a double-click took to the viewer
+
+    def audio_handoff(self):
+        """(path, position ms) of the song playing in its row, or None
+        (nothing, a clip, or the song paused)."""
+        pl = self._playing
+        if pl is None or 'audio' not in pl or pl['paused']:
+            return None
+        return pl['path'], int(pl['media'].position())
+
+    def take_handoff(self):
+        """The grid is closing: the song to go on in the viewer, and where -
+        the one double-clicked, else the one playing. Once."""
+        hand, self._handoff = self._handoff, None
+        return hand or self.audio_handoff()
+
+    def _on_audio_duration(self, ms):
+        pl = self._playing
+        if pl is not None and 'audio' in pl:
+            pl['duration'] = ms
+
+    def _on_audio_status(self, status):
+        from PySide6.QtMultimedia import QMediaPlayer
+        pl = self._playing
+        if pl is None or 'audio' not in pl or status != QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        pl['last_pos'] = pl.get('duration', 0)
+        self._update_cell(self._playing_index())
+        self._on_media_cycle()          # the slideshow moves on (autoplay-next)
+
     def _on_movie_frame(self, n):
         pl = self._playing
         if pl is not None and 'movie' in pl:
@@ -418,6 +476,9 @@ class ThumbGrid(QAbstractScrollArea):
         # The position jumping back to the start = one full play of the clip.
         if ms + 250 < pl.get('last_pos', 0):
             self._on_media_cycle()
+        if 'audio' in pl:
+            pl['last_pos'] = ms
+            self._update_cell(self._playing_index())     # ♪ the row's progress line
         pl['last_pos'] = ms
 
     def _on_media_cycle(self):
@@ -448,12 +509,16 @@ class ThumbGrid(QAbstractScrollArea):
             pl['movie'].setFileName("")     # close the file now, so it can be deleted
             pl['movie'].deleteLater()
         else:
-            pl['sink'].videoFrameChanged.disconnect(self._on_video_frame)
+            if pl['sink'] is not None:
+                pl['sink'].videoFrameChanged.disconnect(self._on_video_frame)
             pl['media'].positionChanged.disconnect(self._on_video_position)
             pl['media'].stop()
             pl['media'].setSource(QUrl())   # likewise
             pl['media'].deleteLater()
-            pl['sink'].deleteLater()
+            if pl['sink'] is not None:
+                pl['sink'].deleteLater()
+            if pl.get('audio') is not None:
+                pl['audio'].deleteLater()
         i = self._index.get(pl['path'], -1)
         if i >= 0:
             self._update_cell(i)
@@ -693,6 +758,9 @@ class ThumbGrid(QAbstractScrollArea):
         """Window minimised: hold the slideshow (keeping its remaining time)
         and pause the clip playing in place. True if anything was held."""
         held = False
+        pl = self._playing
+        if pl is not None and 'audio' in pl and not pl['paused']:
+            return False                # ♪ music plays on, and the list moves on with it
         if self._slideshow.isActive():
             self._slideshow_left = max(500, self._slideshow.remainingTime())
             self._slideshow.stop()
@@ -1258,8 +1326,8 @@ class ThumbGrid(QAbstractScrollArea):
                     if x + self._cell_w[i] < left or x > right:
                         continue
                     p = self._items[i]
-                    if p in window or p in self._failed:
-                        continue
+                    if p in window or p in self._failed or item_kind(p) == 'audio':
+                        continue        # (music is drawn as a title row: nothing to load)
                     window.add(p)
                     edge = self._edge_for(i, r, dpr) if n_area == 0 else THUMB_EDGE
                     t = self._thumbs.get(p)
@@ -1385,6 +1453,16 @@ class ThumbGrid(QAbstractScrollArea):
                     continue
                 cell = self._screen_rect(i, r)
                 path = self._items[i]
+                if item_kind(path) == 'audio':
+                    # ♪ Music: a title row, drawn sharp at any zoom.
+                    self._paint_audio_row(p, cell, path, i == self._hover)
+                    if path == self._current:
+                        self._paint_frame(p, cell, self._accent, 3)
+                    elif i == self._selected and has_focus:
+                        self._paint_frame(p, cell, QColor(255, 255, 255, 200), 2)
+                    if fade and i != self._spotlight:
+                        p.fillRect(cell, fade)
+                    continue
                 t = self._thumbs.get(path)
                 live = self._playing['frame'] if self._playing and self._playing['path'] == path else None
                 if live is not None:
@@ -1422,6 +1500,72 @@ class ThumbGrid(QAbstractScrollArea):
                     self._paint_frame(p, rect, QColor(255, 255, 255, 200), 2)
                 if fade and i != self._spotlight:
                     p.fillRect(cell, fade)      # one translucent fill per cell: cheap
+
+    def _paint_audio_row(self, p, rect, path, hover):
+        """A song: ♪, its title and, under it, the artist and album (from the
+        file's tags, else its name), the file type on the right; while it
+        plays here, how far it got along the bottom."""
+        from random_image_viewer.services.audio_tags import read_tags
+        tags = read_tags(path)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        bg = QColor(self._placeholder)
+        if hover:
+            bg = bg.lighter(125)
+        p.fillRect(rect, bg)
+        h, w = rect.height(), rect.width()
+        pad = max(4, min(18, int(h * 0.18)))
+        inner = rect.adjusted(pad, pad, -pad, -pad)
+        pl = self._playing
+        playing_here = pl is not None and pl['path'] == path
+        # the note (pause bars / ▶ while it plays here)
+        glyph_box = QRect(inner.left(), inner.top(), min(inner.height(), inner.width() // 4),
+                          inner.height())
+        gfont = QFont(self.font())
+        gfont.setPixelSize(max(8, int(glyph_box.height() * 0.62)))
+        p.setFont(gfont)
+        p.setPen(self._accent if playing_here else self._glyph)
+        glyph = ("▶" if pl['paused'] else "❚❚") if playing_here else "♪"
+        p.drawText(glyph_box, Qt.AlignCenter, glyph)
+        text = inner.adjusted(glyph_box.width() + pad, 0, 0, 0)
+        # the file type, right
+        ext = os.path.splitext(path)[1][1:].upper()
+        efont = QFont(self.font())
+        efont.setPixelSize(max(7, min(13, int(h * 0.16))))
+        efont.setBold(True)
+        efm = QFontMetrics(efont)
+        if text.width() > efm.horizontalAdvance(ext) * 4:
+            p.setFont(efont)
+            p.setPen(QColor(self._glyph.red(), self._glyph.green(), self._glyph.blue(), 150))
+            p.drawText(text, Qt.AlignRight | Qt.AlignVCenter, ext)
+            text = text.adjusted(0, 0, -(efm.horizontalAdvance(ext) + pad), 0)
+        # title, and the line under it
+        sub = " · ".join(x for x in (tags.get('artist'), tags.get('album')) if x)
+        tfont = QFont(self.font())
+        tfont.setPixelSize(max(8, int(text.height() * (0.42 if sub else 0.5))))
+        tfm = QFontMetrics(tfont)
+        p.setFont(tfont)
+        p.setPen(QColor(235, 235, 235) if self._bg.lightness() < 128 else QColor(30, 30, 30))
+        title = tfm.elidedText(tags.get('title') or display_name(path), Qt.ElideRight, max(10, text.width()))
+        if sub and text.height() > tfm.height() * 1.6:
+            top = text.adjusted(0, 0, 0, -text.height() // 2)
+            p.drawText(top, Qt.AlignLeft | Qt.AlignBottom, title)
+            sfont = QFont(self.font())
+            sfont.setPixelSize(max(7, int(text.height() * 0.3)))
+            sfm = QFontMetrics(sfont)
+            p.setFont(sfont)
+            p.setPen(self._glyph)
+            p.drawText(text.adjusted(0, text.height() // 2 + 2, 0, 0), Qt.AlignLeft | Qt.AlignTop,
+                       sfm.elidedText(sub, Qt.ElideRight, max(10, text.width())))
+        else:
+            p.drawText(text, Qt.AlignLeft | Qt.AlignVCenter, title)
+        # progress while it plays here
+        if playing_here and pl.get('duration'):
+            frac = max(0.0, min(1.0, pl.get('last_pos', 0) / pl['duration']))
+            bar = QRect(rect.left(), rect.bottom() - 2, int(w * frac), 3)
+            p.fillRect(QRect(rect.left(), rect.bottom() - 2, w, 3), QColor(255, 255, 255, 30))
+            p.fillRect(bar, self._accent)
+        p.restore()
 
     def _paint_placeholder(self, p, rect, path, font):
         p.fillRect(rect, self._placeholder)
@@ -1766,6 +1910,9 @@ class ThumbGrid(QAbstractScrollArea):
         self._press_item = -1
         if i >= 0:
             self._glide.stop()
+            # ♪ The song playing here goes on in the viewer from this point.
+            hand = self.audio_handoff()
+            self._handoff = hand if hand is not None and hand[0] == self._items[i] else None
             self.stop_playback()
             self._selected = i
             self.activated.emit(self._items[i])

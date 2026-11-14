@@ -7,7 +7,10 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp',
 # (Note .webp is a picture, .webm a video - they are different files.)
 ANIMATED_EXTENSIONS = {'.gif', '.webp'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv'}
-MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+# Music: played by the same media player as videos (timeline, volume, loop,
+# autoplay next), shown as a "now playing" card, listed by title in the grid.
+AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma'}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
 # Document-style files supported as single playlist items (each opens in its
 # own dedicated viewer mode: PDF, EPUB, or CBR/CBZ comic archive).

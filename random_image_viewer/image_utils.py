@@ -7,7 +7,8 @@ from PySide6.QtGui import QPixmap, QPainter, QFont, QIcon, QImageReader, QImage
 from PySide6.QtCore import Qt, QSize, QRect, QObject, Signal
 
 from random_image_viewer.constants import (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS,
-                                           PLAYLIST_EXTENSIONS, ANIMATED_EXTENSIONS)
+                                           PLAYLIST_EXTENSIONS, ANIMATED_EXTENSIONS,
+                                           AUDIO_EXTENSIONS)
 
 
 def is_animated_image(file_path):
@@ -29,10 +30,30 @@ is_animated_gif = is_animated_image
 
 
 def is_video_file(file_path):
-    """Check if a file is a supported video format"""
+    """True for a file the media player plays: a video, or music (see
+    is_audio_file) - music goes through the same player, timeline and
+    controls, with a "now playing" card for a picture."""
     if not file_path:
         return False
-    return os.path.splitext(file_path)[1].lower() in VIDEO_EXTENSIONS
+    ext = os.path.splitext(file_path)[1].lower()
+    return ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS
+
+
+def is_audio_file(file_path):
+    """True for music (mp3, flac, wav ...): played with no picture of its own."""
+    return bool(file_path) and os.path.splitext(file_path)[1].lower() in AUDIO_EXTENSIONS
+
+
+def drop_dub_tracks(paths):
+    """*paths* without the audio files that are a video's own soundtrack
+    (``clip.mp3`` beside ``clip.mp4``, see find_dub_audio_file): they belong
+    to the video, not in the list as songs of their own."""
+    videos = {os.path.normcase(os.path.splitext(p)[0]) for p in paths
+              if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS}
+    if not videos:
+        return list(paths)
+    return [p for p in paths if not (os.path.splitext(p)[1].lower() in AUDIO_EXTENSIONS
+                                     and os.path.normcase(os.path.splitext(p)[0]) in videos)]
 
 
 _SRT_TIME_RE = re.compile(
@@ -305,7 +326,7 @@ def get_images_in_folder(folder):
                 image_paths.append(os.path.join(root, f))
     # Final global sort using natural sorting so overall list is in proper order
     image_paths.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
-    return image_paths
+    return drop_dub_tracks(image_paths)
 
 
 def get_playlist_items_in_folder(folder):
@@ -321,7 +342,7 @@ def get_playlist_items_in_folder(folder):
             if os.path.splitext(f)[1].lower() in PLAYLIST_EXTENSIONS:
                 items.append(os.path.join(root, f))
     items.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
-    return items
+    return drop_dub_tracks(items)
 
 
 def emoji_icon(emoji="🎲", size=128):
@@ -413,6 +434,7 @@ class PlaylistScanner(QObject):
                 seen.add(it)
                 deduped.append(it)
         deduped.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+        deduped = drop_dub_tracks(deduped)      # a video's own soundtrack is not a song
 
         if self._cancel:
             self.cancelled.emit()

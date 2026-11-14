@@ -22,10 +22,15 @@ import os
 import random
 
 import numpy as np
-from PySide6.QtCore import Qt, QRect, QRectF
+from PySide6.QtCore import Qt, QPointF, QRect, QRectF
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
 from . import pigment
+
+try:
+    import cv2 as _cv2      # 🌊 Smear's per-pixel blend, several times numpy's speed
+except Exception:           # pragma: no cover - numpy does it then
+    _cv2 = None
 
 TEXTURE_MAX = 256       # px: larger PNGs are scaled down once, on load
 LEVEL_MIN = 16          # smallest of the scaled copies, see BrushTexture.level
@@ -64,9 +69,18 @@ DEFAULT_SETTINGS = {
     'rake_tines': 8,            # Rake tip: tines in the row
     'rake_tine': 45,            # Rake tip: each tine's thickness, % of the gap between them
     'rake_wobble': 25,          # Rake tip: % the tines differ in size, place and strength
+    'soft_softness': 60,        # Soft tip: % of the radius that fades out (100: all feather)
+    'smear_grab': 70,           # Smear: % how firmly hairs grab paint that stands out
+    'smear_edge': 25,           # Smear: % how much it must stand out to be grabbed
+    'smear_blur': 20,           # Smear: % how much the hairs also blend what they pass
+    'push_ice': 40,             # Push: % how unevenly the pixels move (cracks the paint like ice)
 }
 
-MODES = ('paint', 'blend', 'smudge', 'history', 'pick', 'erase')
+MODES = ('paint', 'blend', 'smudge', 'history', 'pick', 'erase', 'smear', 'push')
+# 'smear': drags the very pixels under it into streaks (see DragStroke)
+# 'push': liquify - moves the pixels under it along, crisp, cracking like ice (PushStroke)
+# Modes that work on the pixels under the pen and are kept as those pixels
+PIXEL_MODES = ('blend', 'pick', 'smear', 'push')
 # 'erase': the stroke - tip, size, pressure, opacity - rubs paint out of the
 # layer it is drawn on instead of laying any (see main_window: Stroke.erase)
 # Modes that blend like Blend ('pick': Blend with the colour picked under the
@@ -74,7 +88,8 @@ MODES = ('paint', 'blend', 'smudge', 'history', 'pick', 'erase')
 BLENDING = ('blend', 'pick')
 # Each mode keeps its own slider (Mix / Carry / Tint): what suits one makes
 # no sense in another - Carry 100 % made Blend invisible.
-MODE_MIX = {'paint': 50, 'blend': 50, 'smudge': 70, 'history': 0, 'pick': 50, 'erase': 0}
+MODE_MIX = {'paint': 50, 'blend': 50, 'smudge': 70, 'history': 0, 'pick': 50, 'erase': 0,
+            'smear': 60, 'push': 85}
 BLEND_SHOW_MAX = 0.65   # Blend at Mix 100 %: at most this much of what is under shows through
 OPACITY_STEPS = 32      # flat strokes: stamp opacities are rounded to these
 ROUND = ':round'        # the built-in soft round tip, for Round in Blend / Smudge
@@ -82,6 +97,7 @@ BRISTLES = ':bristles'  # the built-in bristle tip (a row of hairs)
 DUST = ':dust'          # the built-in airbrush / particle tip (a cloud of specks)
 SPRAY = ':spray'        # the procedural spray: specks drawn as dots, sharp at any size
 RAKE = ':rake'          # a rake: tines in a row, dragged into parallel lines (see rake_path)
+SOFT = ':soft'          # a feathered round: solid middle, edge fading by Softness (see soft_path)
 SPRAY_SPREAD_MAX = 20
 PARTICLE_COLOURS = 16   # 'particles' jitter: colours a stamp's specks are spread over
 PARTICLE_SETS = 16      # ... and the different colourings a stroke picks from
@@ -244,6 +260,11 @@ class BrushTexture:
         a = np.frombuffer(image.constBits(), np.uint8).reshape(h, image.bytesPerLine())
         a = a[:, :w * 4].reshape(h, w, 4).astype(np.float32)    # B G R A
         lum = a[..., 2] * 0.299 + a[..., 1] * 0.587 + a[..., 0] * 0.114
+        shown = a[..., 3] > 8
+        if shown.any() and not (a[..., 3] > 250).all() and lum[shown].max() < 24:
+            # Dark paint on transparent (many tip packs): the shape is in
+            # the alpha alone - read as brightness it would be empty.
+            lum = np.full_like(lum, 255.0)
         alpha = (a[..., 3] * lum / 255.0).clip(0, 255).astype(np.uint8)
         out = np.empty((h, w, 4), np.uint8)
         out[..., :3] = alpha[..., None]     # premultiplied white
@@ -786,6 +807,50 @@ def _rake_tip(path):
     return tip
 
 
+def _soft_image(softness=60, edge=256):
+    """A feathered round: solid out to (1 - *softness* %) of the radius,
+    then fading smoothly (a cosine, so neither the core nor the rim shows a
+    step) to nothing at the edge. 0 %: a hard disc; 100 %: all feather."""
+    soft = max(0.0, min(1.0, softness / 100.0))
+    c = (edge - 1) / 2.0
+    yy, xx = np.mgrid[0:edge, 0:edge].astype(np.float32)
+    r = np.sqrt((xx - c) ** 2 + (yy - c) ** 2) / (edge / 2.0)
+    core = 1.0 - soft
+    if soft <= 0.0:
+        # A hard disc, with a one-pixel antialiased rim.
+        alpha = np.clip((1.0 - r) * (edge / 2.0), 0.0, 1.0)
+    else:
+        t = np.clip((r - core) / soft, 0.0, 1.0)
+        alpha = 0.5 * (1.0 + np.cos(np.pi * t))
+        alpha[r >= 1.0] = 0.0
+    a8 = (alpha * 255.0 + 0.5).astype(np.uint8)
+    bgra = np.empty((edge, edge, 4), np.uint8)
+    bgra[..., 0] = bgra[..., 1] = bgra[..., 2] = 255
+    bgra[..., 3] = a8
+    return QImage(bgra.data, edge, edge, edge * 4, QImage.Format_ARGB32).copy()
+
+
+def soft_path(settings):
+    """The Soft tip with its Softness, as a path a stroke keeps (so it lays
+    the same feather again later): ':soft?s=<softness %>'."""
+    soft = max(0, min(100, int(settings.get('soft_softness', DEFAULT_SETTINGS['soft_softness']))))
+    return f"{SOFT}?s={soft}"
+
+
+def _soft_tip(path):
+    """A Soft tip for *path* (see soft_path, or SOFT for the default)."""
+    soft = DEFAULT_SETTINGS['soft_softness']
+    if '?' in path:
+        try:
+            soft = int(path.split('?', 1)[1].split('=', 1)[1])
+        except (IndexError, ValueError):
+            pass
+    soft = max(0, min(100, soft))
+    tip = BrushTexture(path, _soft_image(soft), f"Soft round ({soft} % feather)")
+    tip.stamp_max = True        # flat strokes: each stamp laid as is (see FlatStroke.add)
+    return tip
+
+
 _BUILT_IN = {ROUND: (_round_image, "Round"), BRISTLES: (_bristle_image, "Bristles"),
              DUST: (_dust_image, "Dust (airbrush)"), SPRAY: (_spray_image, "Spray (procedural)")}
 
@@ -830,6 +895,10 @@ def load_texture(path):
     if path and (path == RAKE or path.startswith(RAKE + '?')):
         if path not in _textures:
             _textures[path] = _rake_tip(path)
+        return _textures[path]
+    if path and (path == SOFT or path.startswith(SOFT + '?')):
+        if path not in _textures:
+            _textures[path] = _soft_tip(path)
         return _textures[path]
     if path in _BUILT_IN:
         if path not in _textures:
@@ -1008,6 +1077,11 @@ class StampTrail:
                     # Each Blend stamp moves pixels about: a few % of the tip
                     # apart is as smooth, and keeps it quick.
                     step = max(step, self._stamp_size(p) * 0.03)
+                elif self.settings['mode'] in ('smear', 'push'):
+                    # A smear moves the pixels a step at a time: further
+                    # apart, every speck is laid again in a dotted row
+                    # instead of a streak. Big tips may step a little more.
+                    step = min(step, max(self._unit * 1.5, self._stamp_size(p) * 0.008))
                 if self._streaks is not None and self._sampler is not None:
                     # Streaks picking up colour change it stamp by stamp:
                     # close stamps, so it flows instead of stepping in bands.
@@ -1261,6 +1335,7 @@ class FlatStroke:
     FLARE = 1.5     # how fast the body may widen / narrow, per length gone
     TURN_EASE = 0.35    # how quickly the motion's direction follows the pen
     REVERSE_COS = 0.5   # the pen this far off the body's way (60°): start afresh (see _body)
+    BODY_COLOUR_MIX = 0.35  # share of each body piece's colour laid over what is there
 
     def __init__(self, rect, source=None):
         self.rect = rect
@@ -1279,6 +1354,9 @@ class FlatStroke:
         self._width = None      # the body's width across the motion, last laid
         self._tail = None       # what compose() adds, see _draw_tail
         self._tail_box = None   # device box of the tail last laid
+        self._pend = None       # the body's last piece, drawn when the next is known
+        self._pend_view = None  # (view, scale) it was made under
+        self._restart = False   # the head just set starts the stroke afresh (turned back)
         self.head = None
 
     @staticmethod
@@ -1347,12 +1425,14 @@ class FlatStroke:
             # Turned back (or very sharply): the eased direction still points
             # the old way, and a piece from where the body got to would be
             # sheared across it into a long thin spike. Start afresh here
-            # instead, with the tip's front, as a brush pulled back does.
+            # instead, as a brush pulled back does: the tip as it is (its
+            # front filled out to a square edge stood out as a hard slab).
             self._dir = step
             frame = texture.motion_frame(level, self._turn(stamp, step))
             self._reach = (tx, ty)
             self._width = frame['h'] * k
             self.head = (stamp, self._turn(stamp, step), step)
+            self._restart = True
             return []
         if (tx - rx) * d[0] + (ty - ry) * d[1] < 0.25:
             return []
@@ -1361,22 +1441,108 @@ class FlatStroke:
         was = self._width
         width = min(max(width, was - self.FLARE * span), was + self.FLARE * span)
         self._width = width
-        turned = abs(math.atan2(old_dir[0] * d[1] - old_dir[1] * d[0],
-                                old_dir[0] * d[0] + old_dir[1] * d[1]))
-        back = 1.0 / max(scale, 1e-6) + width / 2 * math.sin(min(turned, math.pi / 4))
-        fx, fy = (tx - rx) / span, (ty - ry) / span
-        ax, ay = -d[1], d[0]                # across the motion
         pieces = max(1, min(32, math.ceil(span * scale / 6.0)))
         out = []
         for i in range(pieces):
             a, b = i / pieces, (i + 1) / pieces
-            wd = was + (width - was) * b
-            sx, sy = rx + (tx - rx) * a - fx * back, ry + (ty - ry) * a - fy * back
-            ex_, ey_ = rx + (tx - rx) * b, ry + (ty - ry) * b
-            m = QTransform(ex_ - sx, ey_ - sy, ax * wd / frame['h'], ay * wd / frame['h'],
-                           sx - ax * wd / 2, sy - ay * wd / 2)
-            out.append((m * view, turn))
+            out.append({'s': (rx + (tx - rx) * a, ry + (ty - ry) * a),
+                        'e': (rx + (tx - rx) * b, ry + (ty - ry) * b),
+                        'w0': was + (width - was) * a, 'w1': was + (width - was) * b,
+                        'd': d, 'turn': turn})
         return out
+
+    # The body is a ribbon: its pieces meet along the line halfway between
+    # their directions (a mitre), so round a curve no corner of one sticks
+    # out past the next - square-ended pieces left a row of small ticks
+    # along both edges of every curve (their ends cut through the soft rim,
+    # and the stroke's max blend keeps every hard cut). Each piece is a
+    # plain strip, cut to its two joints by a clip; it is drawn once the
+    # next piece is known (its far joint); the last waits, and compose()
+    # lays it square-ended meanwhile.
+
+    @staticmethod
+    def _bisector(d1, d2):
+        bx, by = d1[0] + d2[0], d1[1] + d2[1]
+        n = math.hypot(bx, by)
+        return (bx / n, by / n) if n > 1e-6 else d2
+
+    def _push_piece(self, piece, images, lay, view, scale):
+        """Queue *piece*; the one before it is drawn now, its end cut to the
+        joint between the two."""
+        pend = self._pend
+        piece['images'] = images
+        if pend is not None:
+            joint = self._bisector(pend['d'], piece['d'])
+            pend['end_cut'] = joint
+            piece['start_cut'] = joint
+            self._draw_piece(pend, lay, view, scale)
+        else:
+            piece['start_cut'] = None           # the chain starts here: square
+        self._pend = piece
+
+    def _piece_strip(self, piece, view, scale):
+        """(device transform of the 1-px profile over the piece, made long
+        enough to reach both cuts; clip path in picture coords or None)."""
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPainterPath, QPolygonF
+        d = piece['d']
+        ax, ay = -d[1], d[0]                    # across the motion
+        (sx, sy), (ex, ey) = piece['s'], piece['e']
+        half = max(piece['w0'], piece['w1']) / 2
+        px = 1.0 / max(scale, 1e-6)             # a device pixel, in picture units
+
+        def reach(cut):
+            # how far a cut along *cut* (a direction) leans past a square end
+            if cut is None:
+                return 0.0
+            c = abs(cut[0] * d[0] + cut[1] * d[1])
+            s = math.sqrt(max(0.0, 1.0 - c * c))
+            return half * s / max(c, 0.3)
+
+        back = reach(piece.get('start_cut')) + px
+        fwd = reach(piece.get('end_cut')) + px
+        bx, by = sx - d[0] * back, sy - d[1] * back
+        fx, fy = ex + d[0] * fwd, ey + d[1] * fwd
+        wd = piece['w1']
+        h = piece['images'][0].height()
+        m = QTransform(fx - bx, fy - by, ax * wd / h, ay * wd / h, bx - ax * wd / 2, by - ay * wd / 2)
+        # the clip: between the two joint lines, wide enough for the strip
+        side = half * 1.6 + px
+
+        def line(centre, cut, shift):
+            if cut is None:
+                cx, cy = -d[1], d[0]            # square: straight across
+            else:
+                cx, cy = -cut[1], cut[0]
+            k = side / max(abs(cx * ax + cy * ay), 0.3)
+            ox, oy = centre[0] + d[0] * shift, centre[1] + d[1] * shift
+            return (ox - cx * k, oy - cy * k), (ox + cx * k, oy + cy * k)
+
+        s0, s1 = line(piece['s'], piece.get('start_cut'), -px)
+        e0, e1 = line(piece['e'], piece.get('end_cut'), px)
+        # Joint lines that cross inside the stroke (a curve tighter than the
+        # brush is wide) would cut the piece away: leave the start uncut then,
+        # overlapping the last piece as it used to.
+        if (e0[0] - s0[0]) * d[0] + (e0[1] - s0[1]) * d[1] <= 0 \
+                or (e1[0] - s1[0]) * d[0] + (e1[1] - s1[1]) * d[1] <= 0:
+            s0 = (bx - ax * side * 2 - d[0] * half, by - ay * side * 2 - d[1] * half)
+            s1 = (bx + ax * side * 2 - d[0] * half, by + ay * side * 2 - d[1] * half)
+        path = QPainterPath()
+        path.addPolygon(QPolygonF([QPointF(*s0), QPointF(*e0), QPointF(*e1), QPointF(*s1)]))
+        path.closeSubpath()
+        return m * view, path
+
+    def _draw_piece(self, piece, lay, view, scale):
+        m, clip = self._piece_strip(piece, view, scale)
+        grey, colour = piece['images']
+        lay(m, grey, colour, clip=(clip, view))
+
+    def _flush_piece(self, lay, view, scale):
+        """Draw the waiting piece square-ended (the chain ends here)."""
+        pend, self._pend = self._pend, None
+        if pend is not None:
+            pend['end_cut'] = None
+            self._draw_piece(pend, lay, view, scale)
 
     def add(self, texture, stamps, view):
         """Lay *stamps* through *view* (picture -> device). Returns the device
@@ -1393,11 +1559,23 @@ class FlatStroke:
             nonlocal dirty
             dirty = box if dirty is None else dirty.united(box)
 
-        def lay(m, grey, colour):
-            mp.setTransform(m * offset)
-            mp.drawImage(0, 0, grey)
-            cp.setTransform(m * offset)
-            cp.drawImage(0, 0, colour)
+        def lay(m, grey, colour, clip=None):
+            for p, image in ((mp, grey), (cp, colour)):
+                if clip is not None:
+                    # a body piece: cut to its joints (clip in picture coords)
+                    p.setTransform(clip[1] * offset)
+                    p.setClipPath(clip[0])
+                    if p is cp:
+                        # Its colour goes in part of the way, like wet paint:
+                        # a jittered colour laid at full strength started as a
+                        # hard band across the stroke. (One colour: no change -
+                        # compose() takes the colour at full strength.)
+                        p.setOpacity(self.BODY_COLOUR_MIX)
+                p.setTransform(m * offset)
+                p.drawImage(0, 0, image)
+                if clip is not None:
+                    p.setClipping(False)
+                    p.setOpacity(1.0)
             grow(m.mapRect(QRectF(0, 0, grey.width(), grey.height())).toAlignedRect())
 
         for stamp in stamps:
@@ -1409,20 +1587,41 @@ class FlatStroke:
             step = min(OPACITY_STEPS, step)
             plain = texture.grey(level, step)
             tip_long = max(plain.width(), plain.height())
+            if getattr(texture, 'stamp_max', False):
+                # A soft round: every stamp as it is, the most any gave a
+                # pixel kept (the mask's Lighten) - a smooth capsule. The swept
+                # body and its front piece left seams across a feathered disc.
+                lay(_stamp_matrix(stamp, plain, view), plain, texture.coloured(level, stamp[5]))
+                continue
             is_first = self._first is None
+            self._restart = False
             pieces = self._body(texture, level, stamp, tip_long, view, scale)
             if is_first:
                 lay(_stamp_matrix(stamp, plain, view), plain, texture.coloured(level, stamp[5]))
                 continue
             if self.head is not None:
                 first, turn, d = self.head
-                frame = texture.motion_frame(level, turn)
-                lay(self._frame_matrix(first, frame, d, tip_long, view),
-                    texture.frame_variant(level, turn, 'front', step=step),
-                    texture.frame_variant(level, turn, 'front', rgb=first[5]))
-            for m, turn in pieces:
-                lay(m, texture.frame_variant(level, turn, 'profile', step=step),
-                    texture.frame_variant(level, turn, 'profile', rgb=stamp[5]))
+                if self._restart:
+                    # turned back: the ribbon so far ends here, a new one
+                    # starts from the tip as it is
+                    self._flush_piece(lay, view, scale)
+                    lay(_stamp_matrix(first, plain, view), plain, texture.coloured(level, first[5]))
+                else:
+                    frame = texture.motion_frame(level, turn)
+                    lay(self._frame_matrix(first, frame, d, tip_long, view),
+                        texture.frame_variant(level, turn, 'front', step=step),
+                        texture.frame_variant(level, turn, 'front', rgb=first[5]))
+            for piece in pieces:
+                turn = piece['turn']
+                images = (texture.frame_variant(level, turn, 'profile', step=step),
+                          texture.frame_variant(level, turn, 'profile', rgb=stamp[5]))
+                self._push_piece(piece, images, lay, view, scale)
+            if self._pend is not None:
+                self._pend_view = (view, scale)
+                # where the waiting piece is shown (square-ended, by compose)
+                m, _clip = self._piece_strip(self._pend, view, scale)
+                grow(m.mapRect(QRectF(0, 0, 1, self._pend['images'][0].height())).toAlignedRect()
+                     .adjusted(-2, -2, 2, 2))
             if self._reach is not None:
                 self._tail = (texture, level, step, stamp, view, self._dir)
                 frame = texture.motion_frame(level, self._turn(stamp, self._dir))
@@ -1484,14 +1683,35 @@ class FlatStroke:
         local = rect.translated(-self.rect.x(), -self.rect.y())
         colour = self.colour.copy(local)
         mask = self.mask.copy(local)
+        if self._pend is not None and self._pend_view is not None:
+            # the body's last piece, still waiting for its joint: square-ended
+            view, scale = self._pend_view
+            pend = self._pend
+            saved_cut = pend.get('end_cut')
+            pend['end_cut'] = None                       # square-ended for now
+            m, clip = self._piece_strip(pend, view, scale)
+            pend['end_cut'] = saved_cut
+            to_local = QTransform.fromTranslate(-self.rect.x() - local.x(), -self.rect.y() - local.y())
+            mp, cp = QPainter(mask), QPainter(colour)
+            mp.setCompositionMode(QPainter.CompositionMode_Lighten)
+            for p, image in ((mp, pend['images'][0]), (cp, pend['images'][1])):
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                p.setTransform(view * to_local)
+                p.setClipPath(clip)
+                p.setTransform(m * to_local)
+                p.drawImage(0, 0, image)
+            mp.end()
+            cp.end()
         if self._tail is not None:
             self._draw_tail(mask, colour, local)
         # The colour at full strength (un-premultiplied, then made opaque), so
         # a soft edge keeps its colour instead of darkening; the coverage
         # alone decides how strong it is.
-        out = (colour.convertToFormat(QImage.Format_ARGB32)
-               .convertToFormat(QImage.Format_RGB32)
-               .convertToFormat(QImage.Format_ARGB32_Premultiplied))
+        # (Read the straight colour as opaque - converting ARGB32 to RGB32
+        # would lay it over black first, darkening where it is part-laid.)
+        straight = colour.convertToFormat(QImage.Format_ARGB32)
+        straight.reinterpretAsFormat(QImage.Format_RGB32)
+        out = straight.convertToFormat(QImage.Format_ARGB32_Premultiplied)
         if self.source is not None:
             # History: the picture's own pixels under the stroke, pixel for
             # pixel, with the brush colour mixed in by the tint.
@@ -1644,6 +1864,400 @@ class SmearStroke:
         p.drawImage(0, 0, alpha)
         p.end()
         return out
+
+
+class DragStroke:
+    """🌊 Smear: a wet-paint drag, as in HeavyPaint. The tip is a row of
+    hairs across the stroke, half a pixel apart, touching the canvas along a
+    thin line. Each hair grabs paint that stands out from what it has been
+    passing - a line, a speck, an edge - and carries it on whole, laying it
+    as it goes until the load runs out: so lines and specks are transported
+    in thin, sharp streaks instead of being averaged away. (Dragging a patch
+    of pixels spread each speck into a soft, blurred dash; plain averaging
+    let a thin line fade out within a few pixels.)
+
+    *drag*: how far a load lasts (4 .. ~400 screen px). *grab*: how firmly
+    a hair takes up what stands out. *edge*: how much it must stand out.
+    *blur*: how far the plain blend of what a hair passes runs (0: none,
+    only grabbed paint moves). The tip's density along each hair sets its
+    strength, so a textured tip gives strong and weak hairs; Opacity how
+    much of the smear shows.
+
+    Same face as SmearStroke (add / compose). *work*: the view under the
+    stroke (as Sample reads it), device-sized; *rect*: the device area."""
+
+    def __init__(self, rect, work, drag, grab=0.7, edge=0.25, blur=0.2):
+        self.rect = rect
+        self.work = work.convertToFormat(QImage.Format_ARGB32_Premultiplied).copy()
+        w, h, line = self.work.width(), self.work.height(), self.work.bytesPerLine()
+        self.pixels = np.frombuffer(self.work.bits(), np.uint8, count=line * h).reshape(
+            h, line)[:, :w * 4].reshape(h, w, 4)
+        self.reached = np.zeros((h, w), np.uint8)     # where the tip went (compose's alpha)
+        # The stroke's ends feathered: how far along the stroke (device px)
+        # each pixel was laid, so compose() fades the smear in over the first
+        # stretch and out over the last - it began and ended in a straight cut.
+        self.laid_at = np.zeros((h, w), np.float32)
+        self.travel = 0.0       # device px the hairs have moved so far
+        self.fade = 0.0         # how long each end's feather is (half the tip, the widest yet)
+        self._recent = []       # (travel, device box) of the last stretch: its fade changes
+        clamp = lambda v: max(0.0, min(1.0, v))
+        # All in screen px moved (whatever the tip's size):
+        # how far a grabbed load lasts (Drag) ...
+        self.carry = 4.0 + 400.0 * clamp(drag) ** 2
+        # ... how firmly a hair grabs what stands out, per px (Grab) ...
+        self.grab = clamp(grab)
+        # ... how much it must stand out: a channel apart by this share of
+        # full scale from what the hair has been passing (Edge) ...
+        self.edge = 0.02 + 0.45 * clamp(edge)
+        # ... and how far the plain blend runs (Blur): what a hair passes,
+        # averaged. Long, it spread a thin line's colour too thin to see -
+        # the load is what carries it whole.
+        self.blend = 0.5 + 60.0 * clamp(blur) ** 2
+        self.hairs = None       # (S, 4) float32: each hair's blend of what it passed
+        self.load = None        # (S, 4) float32: the paint each hair grabbed and carries ...
+        self.amount = None      # (S,) float32: ... and how much of it is left, 0..1
+        self.around = None      # (S, 4) float32: what each hair has been passing, lately
+        self.last = None        # the last stamp's centre (local device px)
+        self.way = None         # the stroke's way, smoothed
+        self._masks = {}
+        self._grids = {}
+
+    def _mask(self, texture, level, tip, m):
+        """The tip's grey as the stamp lays it (turned and sized by *m*'s
+        linear part), centred on an odd square, as a uint8 array. Kept per
+        2° of turn and 1/32 of size: drawing it for every stamp was half the
+        time, and the stamps of a stroke turn and grow only a little."""
+        scale = math.hypot(m.m11(), m.m12())
+        turn = math.atan2(m.m12(), m.m11())
+        flip = m.determinant() < 0
+        key = (id(texture), level, round(turn / 0.035), round(scale * 32), flip)
+        mask = self._masks.get(key)
+        if mask is not None:
+            return mask
+        turn, scale = round(turn / 0.035) * 0.035, max(1, round(scale * 32)) / 32.0
+        w, h = tip.width(), tip.height()
+        half = int(math.hypot(w, h) * scale / 2) + 2
+        size = 2 * half + 1
+        t = QTransform()
+        t.translate(half + 0.5, half + 0.5)
+        t.rotateRadians(turn)
+        t.scale(scale, -scale if flip else scale)
+        t.translate(-w / 2.0, -h / 2.0)
+        grey = QImage(size, size, QImage.Format_Alpha8)
+        grey.fill(0)
+        p = QPainter(grey)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setTransform(t)
+        p.drawImage(0, 0, tip)
+        p.end()
+        line = grey.bytesPerLine()
+        mask = np.frombuffer(grey.constBits(), np.uint8, count=line * size).reshape(
+            size, line)[:, :size]
+        # Cut to what the tip covers, plus a rim it reads ahead from: the
+        # square round a turned tip's diagonal was half empty.
+        ys, xs = np.nonzero(mask)
+        if len(xs):
+            reach = int(max(abs(xs - half).max(), abs(ys - half).max())) + 3
+            if reach < half:
+                mask = mask[half - reach:half + reach + 1, half - reach:half + reach + 1]
+        mask = np.ascontiguousarray(mask)
+        found = (mask, mask.astype(np.float32) / 255.0)
+        if len(self._masks) > 400:
+            self._masks.clear()
+        self._masks[key] = found
+        return found
+
+    def _grid(self, size):
+        grid = self._grids.get(size)
+        if grid is None:
+            r = np.arange(size, dtype=np.float32) - size // 2
+            grid = self._grids[size] = (r[None, :].repeat(size, 0), r[:, None].repeat(size, 1))
+        return grid
+
+    def add(self, texture, stamps, view):
+        scale = math.sqrt(abs(view.determinant()))
+        h, w = self.reached.shape
+        ox, oy = self.rect.x(), self.rect.y()
+        dirty = None
+        for stamp in stamps:
+            on_screen = stamp[2] * scale
+            if on_screen < 0.4 or stamp[4] <= 0:
+                continue
+            level = texture.level(on_screen)
+            tip = texture._levels[level]
+            m = _stamp_matrix(stamp, tip, view)
+            centre = m.map(QPointF(tip.width() / 2.0, tip.height() / 2.0))
+            fx_c, fy_c = centre.x() - ox, centre.y() - oy
+            if self.last is None:
+                self.last = (fx_c, fy_c)
+                continue
+            dx, dy = fx_c - self.last[0], fy_c - self.last[1]
+            travelled = math.hypot(dx, dy)
+            if travelled < 1.0:
+                continue            # under a pixel: the next stamp moves it
+            self.last = (fx_c, fy_c)
+            self.travel += travelled
+            self.fade = max(self.fade, 0.5 * on_screen)
+            # Which way the hairs run: the stroke's way, smoothed a little.
+            ux, uy = dx / travelled, dy / travelled
+            if self.way is not None:
+                ux, uy = self.way[0] * 0.85 + ux * 0.15, self.way[1] * 0.85 + uy * 0.15
+                n = math.hypot(ux, uy) or 1.0
+                ux, uy = ux / n, uy / n
+            self.way = (ux, uy)
+            vx, vy = -uy, ux
+            _tip_a, grey = self._mask(texture, level, tip, m)
+            half = grey.shape[0] // 2
+            # The hairs, half a pixel apart across the stroke (whole pixels
+            # left holes on a slant), each as strong as the tip is dense on
+            # its line - a textured tip gives strong and weak hairs.
+            js = (np.arange(4 * half + 1, dtype=np.float32) - 2 * half) * 0.5
+            strength = self._profile(grey, half, ux, uy, vx, vy, js)
+            # Where they touch: the line swept from the last stamp to this,
+            # half a pixel at a time.
+            ss = np.arange(0.0, travelled, 0.5, dtype=np.float32)
+            ix = np.rint(fx_c - ux * ss[:, None] + vx * js[None, :]).astype(np.intp)
+            iy = np.rint(fy_c - uy * ss[:, None] + vy * js[None, :]).astype(np.intp)
+            inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+            if not inside.any():
+                continue
+            np.clip(ix, 0, w - 1, out=ix)
+            np.clip(iy, 0, h - 1, out=iy)
+            old = self.pixels[iy, ix].astype(np.float32)          # (steps, hairs, 4)
+            met = old.mean(0)
+            self._fit_hairs(met)
+            f32 = np.float32
+            # The load runs out as it is laid along ...
+            self.amount *= f32(math.exp(-travelled / self.carry))
+            carried, carrying = self.load.copy(), self.amount.copy()    # laid here
+            # ... and each hair grabs what stands out from what it has been
+            # passing: a line or speck it crosses is taken up whole and
+            # carried on, not averaged into the rest and lost.
+            apart = np.abs(met - self.around).max(1) / 255.0
+            stands = np.clip((apart - self.edge) / 0.12, 0.0, 1.0)
+            # A weak hair (a sparse part of the tip) moves less paint.
+            grabbed = 1.0 - (1.0 - self.grab * stands * strength) ** f32(travelled)
+            # What it takes leaves the canvas: the ground it lay on (what the
+            # hair has been passing) shows there instead - so a speck is
+            # moved, its old place left empty, not copied on from where it
+            # stays (as HeavyPaint's smudge moves its particles).
+            ground = met + (self.around - met) * grabbed[:, None]
+            room = (1.0 - self.amount) * grabbed
+            total = self.amount + room
+            safe = np.maximum(total, 1e-6)[:, None]
+            self.load = (self.load * self.amount[:, None] + met * room[:, None]) / safe
+            self.amount = total.astype(f32)
+            # The plain blend (Blur) - of what is left once the hair took its
+            # share - and what the hair has been passing.
+            self.hairs += (ground - self.hairs) * f32(1.0 - math.exp(-travelled / self.blend))
+            self.around += (met - self.around) * f32(1.0 - math.exp(-travelled / 12.0))
+            # Each hair lays the load it brought (what it grabs here goes
+            # down from the next step on, moved), its blend where it is spent.
+            # Laid whole; how strongly (the hair's strength, Opacity) is kept
+            # as the cover, the most any pass gave - mixed in on every pass,
+            # pixels the half-pixel rows hit twice came out stronger than
+            # their neighbours, a fine grid over the whole stroke.
+            lay = self.hairs + (carried - self.hairs) * (carrying * strength)[:, None]
+            # Shown at full strength (times Opacity) wherever the tip is: a
+            # weak hair moves less instead (above). Shown only as strong as
+            # the hair, the picture as it was showed through - a particle
+            # moved on still showed at its old place.
+            cover = np.where(strength > 0.02, 1.0, 0.0).astype(f32) * min(1.0, stamp[4])
+            touched = inside & (cover[None, :] > 0.02)
+            if not touched.any():
+                continue
+            colour = np.clip(np.broadcast_to(lay[None, :, :], old.shape) + 0.5, 0, 255).astype(np.uint8)
+            self.pixels[iy[touched], ix[touched]] = colour[touched]
+            shown = np.broadcast_to((cover * 255.0).astype(np.uint8)[None, :], touched.shape)[touched]
+            ys_t, xs_t = iy[touched], ix[touched]
+            self.reached[ys_t, xs_t] = np.maximum(self.reached[ys_t, xs_t], shown)
+            laid = np.broadcast_to((self.travel - ss)[:, None], touched.shape)[touched]
+            self.laid_at[ys_t, xs_t] = laid
+            box = QRect(int(xs_t.min()) + ox, int(ys_t.min()) + oy,
+                        int(xs_t.max() - xs_t.min()) + 1, int(ys_t.max() - ys_t.min()) + 1)
+            self._recent.append((self.travel, box))
+            dirty = box if dirty is None else dirty.united(box)
+        if dirty is not None:
+            # The stretch behind the tip fades out (its end feather) - as the
+            # tip moves on, its fade goes, so it is composed again too: left
+            # as it was, each redraw's end stayed faded in mid-stroke.
+            since = self.travel - self.fade - 2.0
+            self._recent = [(t, b) for t, b in self._recent if t >= since]
+            for _t, b in self._recent:
+                dirty = dirty.united(b)
+        return dirty
+
+    def _fit_hairs(self, met):
+        """Hairs for this many lines across: the first, or after the tip
+        changed size (pressure) - the middle ones kept, new ones at the rim."""
+        n_new = len(met)
+        if self.hairs is None:
+            self.hairs, self.around, self.load = met.copy(), met.copy(), met.copy()
+            self.amount = np.zeros(n_new, np.float32)
+            return
+        if len(self.hairs) == n_new:
+            return
+
+        def fit(prev, fresh):
+            n = min(len(prev), n_new)
+            a, b = (len(prev) - n) // 2, (n_new - n) // 2
+            fresh[b:b + n] = prev[a:a + n]
+            return fresh
+        self.hairs = fit(self.hairs, met.copy())
+        self.around = fit(self.around, met.copy())
+        self.load = fit(self.load, met.copy())
+        self.amount = fit(self.amount, np.zeros(n_new, np.float32))
+
+    @staticmethod
+    def _profile(grey, half, ux, uy, vx, vy, js):
+        """How dense the tip is along each hair's line (0..1, the densest 1)."""
+        ts = np.linspace(-half, half, 25, dtype=np.float32)
+        mx = np.clip(np.rint(half + vx * js[:, None] + ux * ts[None, :]), 0, 2 * half).astype(np.intp)
+        my = np.clip(np.rint(half + vy * js[:, None] + uy * ts[None, :]), 0, 2 * half).astype(np.intp)
+        dense = grey[my, mx].mean(1)
+        # Neighbouring half-pixel hairs share pixels: smoothed over a pixel
+        # or so, two of very different strength no longer take turns on the
+        # same pixel (a fine cross-hatch over the carried paint).
+        if len(dense) > 4:
+            dense = np.convolve(dense, np.array([0.25, 0.5, 0.25], np.float32), mode='same')
+        top = float(dense.max())
+        # Lifted (square root): a sparse tip's hairs were so weak that what
+        # they dragged away still showed through where it had been.
+        return np.sqrt(dense / top) if top > 0 else dense
+
+    def compose(self, rect):
+        """The dragged pixels inside device *rect*, where the brush went."""
+        local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        out = self.work.copy(local)
+        part = (slice(local.y(), local.y() + local.height()), slice(local.x(), local.x() + local.width()))
+        reached = self.reached[part].astype(np.float32)
+        if self.fade > 0.0:
+            # Feathered ends: faded in over the first self.fade px of the
+            # stroke and out over the last (smoothstep), so it neither starts
+            # nor stops in a straight cut.
+            laid = self.laid_at[part]
+            start = np.clip(laid / self.fade, 0.0, 1.0)
+            end = np.clip((self.travel - laid) / self.fade, 0.0, 1.0)
+            reached *= start * start * (3.0 - 2.0 * start) * end * end * (3.0 - 2.0 * end)
+        reached = np.ascontiguousarray((reached + 0.5).astype(np.uint8))
+        alpha = QImage(reached.data, local.width(), local.height(), local.width(),
+                       QImage.Format_Alpha8)
+        p = QPainter(out)
+        p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        p.drawImage(0, 0, alpha)
+        p.end()
+        return out
+
+
+class PushStroke(DragStroke):
+    """🧊 Push: liquify. The pixels under the tip move along with it - the
+    tip's middle carries them as far as it goes (Strength), its rim less, so
+    the paint bends, shears and is shoved along as a mass; nothing is picked
+    up or blended. They move by whole pixels only (each one when the push
+    it has had adds up to a pixel, as a fixed random threshold decides), so
+    it never blurs: lines stay crisp, broken into pieces.
+
+    *ice*: neighbouring pixels move unevenly - each lags by its own (fixed,
+    slightly clumped) share, so the paint cracks into icy fragments as it is
+    pushed (HeavyPaint's Blur Ice); 0 is a clean liquify push.
+
+    Same face as DragStroke (add / compose, feathered ends)."""
+
+    def __init__(self, rect, work, strength, ice=0.4):
+        super().__init__(rect, work, 0.5)
+        clamp = lambda v: max(0.0, min(1.0, v))
+        self.strength = clamp(strength)
+        self.ice = clamp(ice)
+        h, w = self.reached.shape
+        rng = np.random.default_rng(20261112)
+        # When a pixel's push adds up to a whole pixel (stochastic rounding,
+        # fixed per place so a slow stroke and a fast one move alike).
+        self._step = rng.random((h, w), dtype=np.float32)
+        lag = rng.random((h, w), dtype=np.float32)
+        if _cv2 is not None:
+            lag = _cv2.GaussianBlur(lag, (0, 0), 1.2)       # small clumps, not single pixels
+            lo, hi = float(lag.min()), float(lag.max())
+            lag = (lag - lo) / max(1e-6, hi - lo)
+        self._lag = lag
+
+    def add(self, texture, stamps, view):
+        scale = math.sqrt(abs(view.determinant()))
+        h, w = self.reached.shape
+        ox, oy = self.rect.x(), self.rect.y()
+        dirty = None
+        for stamp in stamps:
+            on_screen = stamp[2] * scale
+            if on_screen < 0.4 or stamp[4] <= 0:
+                continue
+            level = texture.level(on_screen)
+            tip = texture._levels[level]
+            m = _stamp_matrix(stamp, tip, view)
+            centre = m.map(QPointF(tip.width() / 2.0, tip.height() / 2.0))
+            fx_c, fy_c = centre.x() - ox, centre.y() - oy
+            if self.last is None:
+                self.last = (fx_c, fy_c)
+                continue
+            dx, dy = fx_c - self.last[0], fy_c - self.last[1]
+            travelled = math.hypot(dx, dy)
+            if travelled < 1.0:
+                continue
+            self.last = (fx_c, fy_c)
+            self.travel += travelled
+            self.fade = max(self.fade, 0.5 * on_screen)
+            ux, uy = dx / travelled, dy / travelled
+            if self.way is not None:
+                ux, uy = self.way[0] * 0.85 + ux * 0.15, self.way[1] * 0.85 + uy * 0.15
+                n = math.hypot(ux, uy) or 1.0
+                ux, uy = ux / n, uy / n
+            self.way = (ux, uy)
+            tip_a, grey = self._mask(texture, level, tip, m)
+            size = grey.shape[0]
+            half = size // 2
+            cx, cy = round(fx_c), round(fy_c)
+            x0, y0 = cx - half, cy - half
+            ax0, ay0 = max(0, x0), max(0, y0)
+            ax1, ay1 = min(w, x0 + size), min(h, y0 + size)
+            if ax0 >= ax1 or ay0 >= ay1:
+                continue
+            sx0, sy0, sx1, sy1 = ax0 - x0, ay0 - y0, ax1 - x0, ay1 - y0
+            # How far each pixel goes this step: the brush's move, times the
+            # tip's grey there and Strength, less its own lag (Ice) ...
+            share = grey[sy0:sy1, sx0:sx1] * np.float32(self.strength)
+            if self.ice:
+                share = share * (1.0 - np.float32(self.ice) * self._lag[ay0:ay1, ax0:ax1])
+            # One threshold for every pixel this step (an evenly spread
+            # sequence, so the moves add up right over the steps), with Ice
+            # each pixel's own mixed in: with its own alone, pixels pushed
+            # alike still moved on different steps - noise even at Ice 0.
+            self._even = (getattr(self, '_even', 0.0) + 0.6180339887) % 1.0
+            step = np.float32((1.0 - self.ice) * self._even) + \
+                np.float32(self.ice) * self._step[ay0:ay1, ax0:ax1]
+            # ... in whole pixels (rounded up where the threshold says so).
+            mx = np.floor(np.float32(ux * travelled) * share + step).astype(np.intp)
+            my = np.floor(np.float32(uy * travelled) * share + step).astype(np.intp)
+            ys = np.arange(ay0, ay1, dtype=np.intp)[:, None]
+            xs = np.arange(ax0, ax1, dtype=np.intp)[None, :]
+            # Each pixel takes what was that far behind it (a backward warp:
+            # no holes), all from the paint as it was before this step.
+            src_y = np.clip(ys - my, 0, h - 1)
+            src_x = np.clip(xs - mx, 0, w - 1)
+            self.pixels[ay0:ay1, ax0:ax1] = self.pixels[src_y, src_x]
+            touched = tip_a[sy0:sy1, sx0:sx1] > 5
+            if not touched.any():
+                continue
+            cover = np.uint8(round(255 * min(1.0, stamp[4])))
+            region = self.reached[ay0:ay1, ax0:ax1]
+            region[touched] = np.maximum(region[touched], cover)
+            self.laid_at[ay0:ay1, ax0:ax1][touched] = self.travel
+            box = QRect(ax0 + ox, ay0 + oy, ax1 - ax0, ay1 - ay0)
+            self._recent.append((self.travel, box))
+            dirty = box if dirty is None else dirty.united(box)
+        if dirty is not None:
+            since = self.travel - self.fade - 2.0
+            self._recent = [(t, b) for t, b in self._recent if t >= since]
+            for _t, b in self._recent:
+                dirty = dirty.united(b)
+        return dirty
 
 
 def _image_array(image):

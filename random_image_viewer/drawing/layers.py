@@ -40,6 +40,10 @@ class Layer:
         self.opacity = 100      # percent
         self.blend = 'Normal'
         self.effects = True     # the view's effects (LUT, curves ...) apply to it too
+        # ⛰ Impasto: None (flat paint), or its settings (see impasto.DEFAULTS):
+        # the paint lit as relief - bristle grooves, raised edges.
+        self.impasto = None
+        self.impasto_lit = None     # (key, image): the last lit image, see _impasto_layer
         # A canvas layer: a sheet of paper (this colour) over the picture,
         # under the layer's own marks. None: a plain, see-through layer.
         self.fill = None
@@ -71,7 +75,7 @@ class Layer:
         apply to the layer as a whole, and erasing must remove the layer's own
         pixels without touching the picture or the layers below.
         """
-        return (self.opacity == 100 and self.blend == 'Normal'
+        return (self.opacity == 100 and self.blend == 'Normal' and not self.impasto
                 and not self.marks['erase_strokes'] and self.fill is None
                 and not any(getattr(s, 'erase', False) for s in self.marks['drawn_free_strokes']))
 
@@ -91,5 +95,6 @@ class Layer:
         """Everything about this layer that changes what is on screen."""
         counts = '.'.join(str(len(self.marks[field])) for field in MARK_FIELDS)
         paper = self.fill.rgba() if self.fill is not None else '-'
+        impasto = '.'.join(str(v) for v in sorted(self.impasto.items())) if self.impasto else '-'
         return (f"{id(self)}-{int(self.visible)}-{self.opacity}-{self.blend}-{int(self.effects)}"
-                f"-{paper}-{counts}")
+                f"-{paper}-{counts}-{impasto}")

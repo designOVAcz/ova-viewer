@@ -23,6 +23,7 @@ class BrushWindow(QWidget):
     texture_chosen = Signal(str)            # '' = the round brush
     setting_changed = Signal(str, object)
     size_changed = Signal(int, bool)        # slider position, and whether the drag is over
+    opacity_changed = Signal(int)           # opacity of the next marks, 0-100 %
     folder_requested = Signal()
     files_requested = Signal()
     remove_requested = Signal(str)
@@ -34,6 +35,23 @@ class BrushWindow(QWidget):
 
     # key, label, range, unit, tooltip
     _SLIDERS = (
+        ('smear_grab', 'Grab', (0, 100), '%',
+         "Smear: how firmly each hair grabs paint that stands out from what is around it "
+         "(a line, a speck, an edge) and carries it along whole - Drag sets how far. "
+         "0 %: it only blends what it passes"),
+        ('smear_edge', 'Edge', (0, 100), '%',
+         "Smear: how much a colour must stand out to be grabbed. Low: faint detail and "
+         "soft edges are carried too. High: only strong lines and specks"),
+        ('smear_blur', 'Blur', (0, 100), '%',
+         "Smear: how much the hairs also mix what they pass into a soft smudge. "
+         "0 %: no blur - only what is grabbed moves"),
+        ('push_ice', 'Ice', (0, 100), '%',
+         "Push: how unevenly the pixels move - 0 % a clean liquify push (the paint bends "
+         "and is shoved along whole), higher cracks it into icy fragments (HeavyPaint's "
+         "Blur Ice). A textured tip breaks it up more"),
+        ('soft_softness', 'Softness', (0, 100), '%',
+         "Soft tip: how much of its radius fades out - 0 % a hard disc, 100 % all feather "
+         "(an airbrush)"),
         ('spray_spread', 'Spread', (1, 20), '×',
          "Spray: the cloud is the brush size times this - up to 20x (400 px -> 8000 px)"),
         ('spray_density', 'Specks', (1, 3000), '', "Spray: specks per stamp - few for a sparse dusting"),
@@ -113,10 +131,14 @@ class BrushWindow(QWidget):
         self._mode.addItem("🕘 History", 'history')
         self._mode.addItem("🎯 Pick blend", 'pick')
         self._mode.addItem("🧽 Erase", 'erase')
+        self._mode.addItem("🌊 Smear", 'smear')
+        self._mode.addItem("🧊 Push (liquify)", 'push')
         self._mode.setToolTip("Paint: the brush colour. Blend: mixed with what is under it. "
                               "Smudge: drags the colours under the pen along. Pick blend: Blend "
                               "with the colour under the pen where the stroke starts. Erase: the "
-                              "brush rubs out what is drawn on this layer (keys 1-6)")
+                              "brush rubs out what is drawn on this layer. Smear: drags the paint "
+                              "under it into sharp streaks. Push: liquify - moves the paint "
+                              "under it along as a mass, Ice cracks it (keys 1-8)")
         self._mode.currentIndexChanged.connect(self._on_mode)
         mode_row.addWidget(self._mode, 1)
         inner.addLayout(mode_row)
@@ -140,6 +162,24 @@ class BrushWindow(QWidget):
         size_row.addWidget(self._size, 1)
         size_row.addWidget(self._size_value)
         inner.addLayout(size_row)
+
+        # Opacity of the next marks, the DRAW panel's slider's twin.
+        opacity_row = QHBoxLayout()
+        opacity_row.setContentsMargins(0, 0, 0, 0)
+        opacity_name = QLabel("Opacity")
+        opacity_name.setFixedWidth(52)
+        opacity_row.addWidget(opacity_name)
+        self._opacity = ClickableSlider(Qt.Horizontal)
+        self._opacity.setRange(0, 100)
+        self._opacity.setToolTip("Opacity of the next marks (0-100 %), the same as the DRAW panel's")
+        self._opacity_value = QLabel("")
+        self._opacity_value.setFixedWidth(36)
+        self._opacity_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._opacity.valueChanged.connect(
+            lambda pct: self._quiet or self.opacity_changed.emit(pct))
+        opacity_row.addWidget(self._opacity, 1)
+        opacity_row.addWidget(self._opacity_value)
+        inner.addLayout(opacity_row)
 
         mix_row = QHBoxLayout()
         mix_row.setContentsMargins(0, 0, 0, 0)
@@ -320,6 +360,14 @@ class BrushWindow(QWidget):
         self._size_value.setText(f"{int(px)}px")
         self._quiet = quiet
 
+    def show_opacity(self, pct):
+        """Put the opacity slider at *pct* % - without echoing it back."""
+        quiet, self._quiet = self._quiet, True
+        if not self._opacity.isSliderDown():
+            self._opacity.setValue(int(pct))
+        self._opacity_value.setText(f"{int(pct)}%")
+        self._quiet = quiet
+
     def set_textures(self, textures, current):
         """*textures*: [(path, name, QImage thumbnail)]; *current*: the path in
         use, '' for Round."""
@@ -351,10 +399,15 @@ class BrushWindow(QWidget):
         mode = self._mode_value
         self._mix.setEnabled(mode not in ('paint', 'erase'))
         if hasattr(self, '_sample'):
-            self._sample.setEnabled(mode in ('blend', 'smudge', 'pick'))
+            self._sample.setEnabled(mode in ('blend', 'smudge', 'pick', 'smear', 'push'))
             self._pigment.setEnabled(mode in ('blend', 'smudge', 'pick'))
-        self._mix_name.setText({'smudge': "Carry", 'history': "Tint"}.get(mode, "Mix"))
+        self._mix_name.setText({'smudge': "Carry", 'history': "Tint", 'smear': "Drag",
+                                'push': "Strength"}.get(mode, "Mix"))
         self._mix.setToolTip({
+            'push': "How far the paint follows the brush: 100 % the tip's middle carries it "
+                    "all the way, less lets it slip and stretch",
+            'smear': "How far grabbed paint is carried before it runs out (a few px at 0 %, "
+                     "about 400 px at 100 %). Grab, Edge and Blur below shape the rest",
             'smudge': "How far the picked-up colour is dragged",
             'blend': "Blender brush: it drags the pixels under it along and mixes them. "
                      "Low: more of the brush colour goes in and it drags less far. "
@@ -405,7 +458,10 @@ class BrushWindow(QWidget):
         rake = bool(path) and path.startswith(':rake')       # ... and the Rake's with it
         changed = False
         for key, widgets in self._slider_rows.items():
-            for prefix, shown in (('spray_', spray), ('rake_', rake)):
+            for prefix, shown in (('spray_', spray), ('rake_', rake),
+                                  ('soft_', bool(path) and path.startswith(':soft')),
+                                  ('smear_', self._mode_value == 'smear'),
+                                  ('push_', self._mode_value == 'push')):
                 if key.startswith(prefix) and widgets[0].isVisibleTo(self) != shown:
                     for widget in widgets:
                         widget.setVisible(shown)
