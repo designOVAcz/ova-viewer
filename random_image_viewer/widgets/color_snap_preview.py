@@ -11,7 +11,7 @@ from PySide6.QtGui import QPainter, QColor, QPen, QFont
 
 
 class ColorSnapPreview(QWidget):
-    SWATCH_SIZE = 50
+    SWATCH_SIZE = 72
     LABEL_HEIGHT = 16
     MARGIN = 4
 
@@ -39,6 +39,11 @@ class ColorSnapPreview(QWidget):
         self._hex = self._color.name().upper()
         self.update()
 
+    def set_current(self, color):
+        """The brush colour now, shown in a corner to compare with."""
+        self._current = QColor(color) if color is not None else None
+        self.update()
+
     def color(self) -> QColor:
         return QColor(self._color)
 
@@ -62,6 +67,14 @@ class ColorSnapPreview(QWidget):
         p.setPen(QPen(QColor(0, 0, 0, 200), 1))
         p.setBrush(Qt.NoBrush)
         p.drawRect(inner)
+        # The brush colour now, a small patch in the lower right to compare
+        current = getattr(self, '_current', None)
+        if current is not None:
+            side = self.SWATCH_SIZE // 3
+            patch = QRect(swatch_rect.right() - side, swatch_rect.bottom() - side, side, side)
+            p.setPen(QPen(QColor(255, 255, 255, 220), 1))
+            p.setBrush(QColor(current.red(), current.green(), current.blue()))
+            p.drawRect(patch)
 
         # Hex label
         label_rect = QRect(0, self.MARGIN + self.SWATCH_SIZE,

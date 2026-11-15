@@ -215,6 +215,207 @@ def _read(path, mtime, want_cover):
     return tags
 
 
+# -- how long a song is (seconds), from the file's own headers --------------
+
+_MPEG_BITRATES = {   # (version is 1, layer) -> kbit/s by index
+    (True, 3): (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
+    (True, 2): (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384),
+    (True, 1): (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320),
+    (False, 3): (0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256),
+    (False, 2): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+    (False, 1): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+}
+_MPEG_RATES = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
+
+
+def _mp3_seconds(f, size):
+    f.seek(0)
+    head = f.read(10)
+    start = 0
+    if head[:3] == b'ID3':
+        start = 10 + _syncsafe(head[6:10]) + (10 if head[5] & 0x10 else 0)
+    f.seek(start)
+    data = f.read(64 * 1024)
+    i = 0
+    while i + 4 <= len(data):
+        if data[i] == 0xFF and (data[i + 1] & 0xE0) == 0xE0:
+            b1, b2, b3 = data[i + 1], data[i + 2], data[i + 3]
+            version = (b1 >> 3) & 3            # 3: MPEG1, 2: MPEG2, 0: MPEG2.5
+            layer_bits = (b1 >> 1) & 3         # 3: layer I, 2: II, 1: III
+            bi, ri = b2 >> 4, (b2 >> 2) & 3
+            if version != 1 and layer_bits and 0 < bi < 15 and ri < 3:
+                layer = {3: 1, 2: 2, 1: 3}[layer_bits]
+                rate = _MPEG_RATES[version][ri]
+                kbps = _MPEG_BITRATES[(version == 3, {1: 3, 2: 2, 3: 1}[layer])][bi]
+                per_frame = 384 if layer == 1 else (1152 if layer == 2 or version == 3 else 576)
+                # A VBR header (Xing / Info / VBRI) says how many frames there are.
+                mono = (b3 >> 6) == 3
+                side = (17 if mono else 32) if version == 3 else (9 if mono else 17)
+                x = i + 4 + side
+                if data[x:x + 4] in (b'Xing', b'Info'):
+                    flags = struct.unpack('>I', data[x + 4:x + 8])[0]
+                    if flags & 1:
+                        frames = struct.unpack('>I', data[x + 8:x + 12])[0]
+                        return frames * per_frame / rate
+                v = i + 36
+                if data[v:v + 4] == b'VBRI':
+                    frames = struct.unpack('>I', data[v + 14:v + 18])[0]
+                    return frames * per_frame / rate
+                # Constant bitrate: the audio's size over its rate.
+                end = size - (128 if _has_id3v1(f) else 0)
+                return max(0, end - start - i) * 8 / (kbps * 1000)
+        i += 1
+    return None
+
+
+def _has_id3v1(f):
+    try:
+        f.seek(-128, os.SEEK_END)
+        return f.read(3) == b'TAG'
+    except OSError:
+        return False
+
+
+def _flac_seconds(f):
+    f.seek(0)
+    if f.read(4) != b'fLaC':
+        return None
+    head = f.read(4)
+    if len(head) < 4 or head[0] & 0x7F != 0:
+        return None
+    info = f.read(34)
+    bits = int.from_bytes(info[10:18], 'big')
+    rate = bits >> 44
+    total = bits & ((1 << 36) - 1)
+    return total / rate if rate else None
+
+
+def _wav_seconds(f):
+    f.seek(0)
+    head = f.read(12)
+    if head[:4] != b'RIFF' or head[8:12] != b'WAVE':
+        return None
+    byte_rate = None
+    while True:
+        ch = f.read(8)
+        if len(ch) < 8:
+            return None
+        cid, csize = ch[:4], struct.unpack('<I', ch[4:])[0]
+        if cid == b'fmt ':
+            fmt = f.read(csize)
+            byte_rate = struct.unpack('<I', fmt[8:12])[0]
+            if csize % 2:
+                f.read(1)
+        elif cid == b'data':
+            return csize / byte_rate if byte_rate else None
+        else:
+            f.seek(csize + (csize % 2), os.SEEK_CUR)
+
+
+def _mp4_seconds(f, size):
+    """The movie header (moov/mvhd): its duration over its time scale."""
+    def find(start, end, name):
+        pos = start
+        while pos + 8 <= end:
+            f.seek(pos)
+            head = f.read(8)
+            if len(head) < 8:
+                return None
+            asize, aname = struct.unpack('>I4s', head)
+            hdr = 8
+            if asize == 1:
+                asize = struct.unpack('>Q', f.read(8))[0]
+                hdr = 16
+            elif asize == 0:
+                asize = end - pos
+            if asize < hdr:
+                return None
+            if aname == name:
+                return pos + hdr, pos + asize
+            pos += asize
+        return None
+    moov = find(0, size, b'moov')
+    if moov is None:
+        return None
+    mvhd = find(moov[0], moov[1], b'mvhd')
+    if mvhd is None:
+        return None
+    f.seek(mvhd[0])
+    version = f.read(4)[0]
+    if version == 1:
+        f.read(16)
+        scale, duration = struct.unpack('>IQ', f.read(12))
+    else:
+        f.read(8)
+        scale, duration = struct.unpack('>II', f.read(8))
+    return duration / scale if scale else None
+
+
+def _ogg_seconds(f, size):
+    """Ogg (Vorbis / Opus): the last page's sample position over the rate."""
+    f.seek(0)
+    first = f.read(4096)
+    if first[:4] != b'OggS':
+        return None
+    rate = None
+    v = first.find(b'\x01vorbis')
+    if v >= 0:
+        rate = struct.unpack('<I', first[v + 12:v + 16])[0]
+    elif first.find(b'OpusHead') >= 0:
+        rate = 48000            # Opus counts its samples at 48 kHz
+    if not rate:
+        return None
+    f.seek(max(0, size - 65536))
+    tail = f.read()
+    at = tail.rfind(b'OggS')
+    if at < 0 or at + 14 > len(tail):
+        return None
+    granule = struct.unpack('<q', tail[at + 6:at + 14])[0]
+    return granule / rate if granule > 0 else None
+
+
+@lru_cache(maxsize=8192)
+def _seconds(path, mtime):
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == '.mp3':
+                return _mp3_seconds(f, size)
+            if ext == '.flac':
+                return _flac_seconds(f)
+            if ext == '.wav':
+                return _wav_seconds(f)
+            if ext in ('.m4a', '.mp4', '.aac'):
+                got = _mp4_seconds(f, size)
+                return got if got is not None else (_mp3_seconds(f, size) if ext == '.aac' else None)
+            if ext in ('.ogg', '.opus'):
+                return _ogg_seconds(f, size)
+    except (OSError, struct.error, ValueError, IndexError, KeyError, ZeroDivisionError):
+        pass
+    return None
+
+
+def read_seconds(path):
+    """How long the song at *path* lasts, in seconds, or None when its type
+    is not read here (wma) or its headers make no sense. Read once per file
+    (the grid asks on every repaint)."""
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+    got = _seconds(path, mtime)
+    return got if got and 0 < got < 24 * 3600 else None
+
+
+def format_seconds(seconds):
+    """3:45, or 1:02:03 past the hour."""
+    s = int(round(seconds))
+    h, rest = divmod(s, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def read_tags(path, cover=False):
     """{'title', and 'artist' / 'album' / 'track' when the file has them,
     'cover': image bytes when *cover* and it has one}."""

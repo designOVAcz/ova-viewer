@@ -1505,8 +1505,9 @@ class ThumbGrid(QAbstractScrollArea):
         """A song: ♪, its title and, under it, the artist and album (from the
         file's tags, else its name), the file type on the right; while it
         plays here, how far it got along the bottom."""
-        from random_image_viewer.services.audio_tags import read_tags
+        from random_image_viewer.services.audio_tags import format_seconds, read_seconds, read_tags
         tags = read_tags(path)
+        seconds = read_seconds(path)
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
         bg = QColor(self._placeholder)
@@ -1528,7 +1529,7 @@ class ThumbGrid(QAbstractScrollArea):
         glyph = ("▶" if pl['paused'] else "❚❚") if playing_here else "♪"
         p.drawText(glyph_box, Qt.AlignCenter, glyph)
         text = inner.adjusted(glyph_box.width() + pad, 0, 0, 0)
-        # the file type, right
+        # the file type, right, small and dim ...
         ext = os.path.splitext(path)[1][1:].upper()
         efont = QFont(self.font())
         efont.setPixelSize(max(7, min(13, int(h * 0.16))))
@@ -1539,6 +1540,17 @@ class ThumbGrid(QAbstractScrollArea):
             p.setPen(QColor(self._glyph.red(), self._glyph.green(), self._glyph.blue(), 150))
             p.drawText(text, Qt.AlignRight | Qt.AlignVCenter, ext)
             text = text.adjusted(0, 0, -(efm.horizontalAdvance(ext) + pad), 0)
+        # ... and before it how long the song is, easy to read ("3:45")
+        if seconds:
+            length = format_seconds(seconds)
+            lfont = QFont(self.font())
+            lfont.setPixelSize(max(8, min(18, int(h * 0.24))))
+            lfm = QFontMetrics(lfont)
+            if text.width() > lfm.horizontalAdvance(length) * 3:
+                p.setFont(lfont)
+                p.setPen(QColor(220, 220, 220) if self._bg.lightness() < 128 else QColor(50, 50, 50))
+                p.drawText(text, Qt.AlignRight | Qt.AlignVCenter, length)
+                text = text.adjusted(0, 0, -(lfm.horizontalAdvance(length) + pad), 0)
         # title, and the line under it
         sub = " · ".join(x for x in (tags.get('artist'), tags.get('album')) if x)
         tfont = QFont(self.font())

@@ -59,6 +59,11 @@ class LayerWindow(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        # Always exactly as tall as what it holds: when the ⛰ sliders went
+        # away it stayed tall a moment, and the spare height stretched the
+        # rows above the list - the list jumped down.
+        from PySide6.QtWidgets import QLayout
+        outer.setSizeConstraint(QLayout.SetFixedSize)
 
         bg = QWidget(self)
         bg.setObjectName("layerBg")
@@ -125,7 +130,6 @@ class LayerWindow(QWidget):
             "along the bristles, raised stroke edges, a wet highlight. Worked out on the GPU "
             "and kept, so painting and zooming stay quick")
         self._impasto.toggled.connect(self._on_impasto_toggled)
-        inner.addWidget(self._impasto)
         self._impasto_box = QWidget()
         box = QVBoxLayout(self._impasto_box)
         box.setContentsMargins(14, 0, 0, 0)
@@ -150,7 +154,7 @@ class LayerWindow(QWidget):
             box.addLayout(row)
             self._impasto_sliders[key] = (slider, value, unit)
         self._impasto_box.hide()
-        inner.addWidget(self._impasto_box)
+        # (Placed at the bottom, under the buttons - see below.)
 
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -236,6 +240,28 @@ class LayerWindow(QWidget):
         buttons.addStretch(1)
         inner.addLayout(buttons)
 
+        # ⛰ Impasto at the very bottom: its sliders come and go with the
+        # layer chosen, and above the list they made the list jump each time.
+        rule = QWidget()
+        rule.setFixedHeight(1)
+        rule.setStyleSheet("background: #4a4d50;")
+        inner.addWidget(rule)
+        inner.addWidget(self._impasto)
+        inner.addWidget(self._impasto_box)
+
+    @staticmethod
+    def _dot(colour):
+        from PySide6.QtGui import QIcon, QPainter, QPixmap
+        pix = QPixmap(12, 12)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(colour)
+        p.drawEllipse(1, 1, 10, 10)
+        p.end()
+        return QIcon(pix)
+
     @staticmethod
     def _tool_button(text, tip, slot):
         btn = QToolButton()
@@ -252,6 +278,9 @@ class LayerWindow(QWidget):
         self._list.clear()
         for layer in reversed(self._layers):
             item = QListWidgetItem(layer.name)
+            tag = getattr(layer, 'tag', None)
+            if tag is not None:
+                item.setIcon(self._dot(tag))     # the same dot as on the ✎ badge
             item.setFlags(item.flags() | Qt.ItemIsEditable | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if layer.visible else Qt.Unchecked)
             self._list.addItem(item)

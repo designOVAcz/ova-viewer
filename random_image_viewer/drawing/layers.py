@@ -10,7 +10,18 @@ objects (see ``RandomImageViewer._bind_layer``), so the drawing tools only ever
 see "the marks" and need to know nothing about layers.
 """
 
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QColor, QPainter
+
+_tags_given = 0
+
+
+def _next_tag():
+    """Each new layer its own colour (spread round the wheel), so its dot in
+    📚 Layers and on the ✎ badge tell layers apart at a glance."""
+    global _tags_given
+    hue = (0.58 + _tags_given * 0.6180339887) % 1.0
+    _tags_given += 1
+    return QColor.fromHsvF(hue, 0.62, 0.97)
 
 # What a layer holds. _undo_stack is per layer because it also records the
 # order its marks were made in, which is the order they are painted in.
@@ -36,6 +47,7 @@ BLEND_MODES = {
 class Layer:
     def __init__(self, name):
         self.name = name
+        self.tag = _next_tag()      # its colour dot in 📚 Layers and on the ✎ badge
         self.visible = True
         self.opacity = 100      # percent
         self.blend = 'Normal'

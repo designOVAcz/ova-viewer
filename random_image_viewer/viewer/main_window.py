@@ -1091,6 +1091,7 @@ class RandomImageViewer(QMainWindow):
     def set_layer_impasto(self, settings):
         """⛰ Impasto on the selected layer: its settings, or None (flat)."""
         self.active_layer.impasto = dict(settings) if settings else None
+        self._update_layer_badge()
         self._layer_redraw_timer.start()     # a slider drag: at most one per 30 ms
 
     def _under_sheet_layer(self):
@@ -2119,6 +2120,10 @@ class RandomImageViewer(QMainWindow):
         # port); started after the window is up, see _start_colour_sync.
         self._colour_sync = None
         QTimer.singleShot(1500, self._start_colour_sync)
+        # 🟥 The colour swatch comes back if it was open when the app closed.
+        QTimer.singleShot(1600, lambda: self.toggle_colour_swatch(True)
+                          if str(self._settings.value("colour_swatch_open", "false")).lower()
+                          in ("true", "1") else None)
         self._stamp_trail = None    # the textured stroke being drawn
         self._flat_live = None      # its buffers, when it does not build up
         # Fixed overlay tools (non-interactive, passive overlays over the image)
@@ -8377,6 +8382,35 @@ class RandomImageViewer(QMainWindow):
             f" QToolButton:hover {{ border-color: #8a9096; }}")
         chip.show()
 
+    def _update_layer_badge(self, flash=False):
+        """◧ Studio: the ✎ badge at the top of the canvas - the layer painted
+        on now, its colour dot, place in the stack, ⛰ / blend / opacity,
+        struck through while hidden. *flash*: it just changed."""
+        import html
+        label = getattr(self, 'image_label', None)
+        if label is None or not getattr(self, 'layers', None):
+            return
+        badge = self.__dict__.get('_layer_badge')
+        if not getattr(self, 'studio_mode', False):
+            if badge is not None:
+                badge.dismiss()
+            return
+        if badge is None:
+            from random_image_viewer.widgets.layer_badge import LayerBadge
+            badge = self._layer_badge = LayerBadge(label)
+        layer = self.active_layer
+        extras = []
+        if layer.impasto:
+            extras.append("⛰")
+        if layer.blend != 'Normal':
+            extras.append(layer.blend)
+        if layer.opacity != 100:
+            extras.append(f"{layer.opacity}%")
+        name = ("📄 " if layer.fill is not None else "") + html.escape(layer.name)
+        badge.show_layer(name, getattr(layer, 'tag', QColor("#8ab4f8")),
+                         len(self.layers) - self.layers.index(layer), len(self.layers),
+                         hidden=not layer.visible, extras=" · ".join(extras), flash=flash)
+
     def _flash_layer_name(self, layer):
         """The layer's name over the picture's corner for a moment, fading
         out - the cue at the moment it changes, where the eye is."""
@@ -8415,6 +8449,7 @@ class RandomImageViewer(QMainWindow):
 
     def _refresh_layer_window(self):
         self._update_layer_chip()
+        self._update_layer_badge()
         if self._layer_window is not None:
             self._layer_window.set_layers(self.layers, self.active_layer)
             self._layer_window.set_background(self.canvas_color)
@@ -8502,7 +8537,10 @@ class RandomImageViewer(QMainWindow):
         self._refresh_layer_window()
         self.status.showMessage(f"Drawing on {layer.name}", 2000)
         if changed:
-            self._flash_layer_name(layer)
+            if getattr(self, 'studio_mode', False):
+                self._update_layer_badge(flash=True)    # ◧ the badge at the top lights up
+            else:
+                self._flash_layer_name(layer)
 
     def add_layer(self):
         self._layer_count += 1
@@ -8646,14 +8684,17 @@ class RandomImageViewer(QMainWindow):
 
     def set_layer_visible(self, layer, visible):
         layer.visible = visible
+        self._update_layer_badge()
         self._redraw_layers()
 
     def set_layer_opacity(self, value):
         self.active_layer.opacity = value
+        self._update_layer_badge()
         self._layer_redraw_timer.start()     # a slider drag: at most one per 30 ms
 
     def set_layer_blend(self, mode):
         self.active_layer.blend = mode
+        self._update_layer_badge()
         self._redraw_layers()
 
     def set_layer_effects(self, on):
@@ -10789,10 +10830,17 @@ class RandomImageViewer(QMainWindow):
         """
         self._color_snap_pending_label_pos = label_pos
         self._color_snap_pending_global_pos = global_pos
-        prev = self._color_snap_preview
-        if prev is not None and prev.isVisible():
-            prev.hide()
-        self._color_snap_hover_timer.start(self._color_snap_hover_ms)
+        # Live: the swatch follows the cursor and shows the colour under it
+        # as it moves (about 30 times a second; the last position is always
+        # caught). Waiting for the cursor to rest first, it was never there
+        # while looking for a colour.
+        now = time.monotonic()
+        if now - getattr(self, '_color_snap_live_t', 0.0) >= 0.033:
+            self._color_snap_live_t = now
+            self._color_snap_hover_timer.stop()
+            self._on_color_snap_hover_timeout()
+        else:
+            self._color_snap_hover_timer.start(35)
 
     def _on_color_snap_hover_timeout(self):
         """Fired when cursor has been still long enough — sample + show preview."""
@@ -10805,11 +10853,11 @@ class RandomImageViewer(QMainWindow):
         if not (hasattr(self, 'image_label') and self.image_label):
             return
         ox, oy = self.image_label._map_label_pos_to_display(label_pos)
-        if ox is None:
-            return
-        color = self._sample_screen_color(label_pos)
+        color = self._sample_screen_color(label_pos) if ox is not None else None
         if color is not None:
             self._update_color_snap_preview(global_pos, color, label_pos)
+        elif self._color_snap_preview is not None and self._color_snap_preview.isVisible():
+            self._color_snap_preview.hide()         # off the picture: nothing to show
 
     def _update_color_snap_preview(self, global_pos, color, label_point):
         """Reposition + recolor the floating preview swatch."""
@@ -10819,6 +10867,7 @@ class RandomImageViewer(QMainWindow):
             self._color_snap_preview = ColorSnapPreview(self)
         prev = self._color_snap_preview
         prev.set_color(color)
+        prev.set_current(getattr(self, 'line_color', None))
         try:
             screen = self.screen() if hasattr(self, 'screen') else None
             screen_rect = screen.availableGeometry() if screen else None
@@ -10884,7 +10933,22 @@ class RandomImageViewer(QMainWindow):
         if not self.snapped_rows:
             self.snapped_rows.append([])
         self.snapped_rows[-1].append(h)
+        self._trim_snapped_palette()
         self._rebuild_snap_palette_ui()
+
+    SNAP_PALETTE_LINES = 3      # lines of swatches the palette shows at most
+
+    def _trim_snapped_palette(self):
+        """At most SNAP_PALETTE_LINES lines of swatches (each line up to the
+        panel's PER_LINE): past that the oldest colours make room."""
+        per_line = SnappedPaletteWindow.PER_LINE
+
+        def lines():
+            return sum(-(-len(row) // per_line) for row in self.snapped_rows if row)
+
+        while self.snapped_rows and lines() > self.SNAP_PALETTE_LINES:
+            self.snapped_rows[0].pop(0)
+            self.snapped_rows = [r for r in self.snapped_rows if r]
 
     def _remove_from_snapped_palette(self, hex_color):
         h = (hex_color or "").lower()
@@ -11062,9 +11126,8 @@ class RandomImageViewer(QMainWindow):
                 self._show_snap_palette_window()
                 return
             self.snapped_rows.append(new_row)
-            # Enforce row FIFO cap
-            if len(self.snapped_rows) > self.snapped_rows_max:
-                self.snapped_rows = self.snapped_rows[-self.snapped_rows_max:]
+            # At most three lines of swatches: the oldest make room
+            self._trim_snapped_palette()
             self._rebuild_snap_palette_ui()
             # Auto-show panel so user can see the new row
             self._show_snap_palette_window()
@@ -11617,6 +11680,53 @@ class RandomImageViewer(QMainWindow):
         waiting, self._synced_waiting = getattr(self, '_synced_waiting', None), None
         if waiting is not None:
             self._on_synced_colour(*waiting)
+
+    # -- 🟥 the brush colour as a big floating square ---------------------------
+
+    @property
+    def line_color(self):
+        return self._line_color
+
+    @line_color.setter
+    def line_color(self, colour):
+        # Whatever sets the brush colour (picker, palette, eyedropper,
+        # ColorPenguin, F8 ...), the floating swatch follows it.
+        self._line_color = colour
+        swatch = self.__dict__.get('_colour_swatch')
+        if swatch is not None and swatch.isVisible():
+            swatch.set_colour(colour)
+
+    def colour_swatch_shown(self):
+        swatch = self.__dict__.get('_colour_swatch')
+        return swatch is not None and swatch.isVisible()
+
+    def toggle_colour_swatch(self, on):
+        """🟥 The current brush colour in a big, resizable floating square."""
+        from random_image_viewer.widgets.colour_swatch_window import ColourSwatchWindow
+        swatch = self.__dict__.get('_colour_swatch')
+        if on:
+            if swatch is None:
+                swatch = self._colour_swatch = ColourSwatchWindow(self)
+                swatch.closed.connect(lambda: self._settings.setValue("colour_swatch_open", False))
+                swatch.moved_or_resized.connect(self._save_colour_swatch_place)
+                geo = self._settings.value("colour_swatch_geometry")
+                if geo:
+                    swatch.restoreGeometry(geo)
+                else:
+                    origin = self.image_label.mapToGlobal(QPoint(0, 0))
+                    swatch.move(origin.x() + self.image_label.width() // 2 - swatch.width() // 2,
+                                origin.y() + 40)
+            swatch.set_colour(self.line_color)
+            swatch.show()
+            swatch.raise_()
+        elif swatch is not None:
+            swatch.hide()
+        self._settings.setValue("colour_swatch_open", bool(on))
+
+    def _save_colour_swatch_place(self):
+        swatch = self.__dict__.get('_colour_swatch')
+        if swatch is not None and swatch.isVisible():
+            self._settings.setValue("colour_swatch_geometry", swatch.saveGeometry())
 
     def set_line_color(self, color_hex):
         """Set line color from hex string (used by preset color buttons)"""
@@ -13020,6 +13130,7 @@ class RandomImageViewer(QMainWindow):
             if brush_btn is not None and brush_btn.isChecked():
                 brush_btn.setChecked(False)
         self._studio_draw_panel(on)
+        self._update_layer_badge()          # ◧ the ✎ layer badge comes and goes with Studio
         if on:
             still = path and not is_video_file(path) and not is_animated_image(path)
             self.status.showMessage(
@@ -16491,7 +16602,7 @@ class RandomImageViewer(QMainWindow):
             label.gif_toggle_play_pause()
 
     _TOUCH_PAN_PX_PER_MM = 8.0     # screen px the picture moves per mm the fingers move
-    _TOUCH_PEN_QUIET_S = 0.5       # touch pans only once the pen has been quiet this long
+    _TOUCH_PEN_QUIET_S = 0.4       # touch pans only once the pen has been off the tablet this long
 
     def _start_touch_pan(self):
         """Two fingers on a Wacom tablet's touch surface pan the zoomed
@@ -16527,12 +16638,16 @@ class RandomImageViewer(QMainWindow):
         if label is None or not self.isActiveWindow() or not self.current_image:
             return
         # Painting: a wrist or palm on the tablet must not move the picture.
-        # The pen near the tablet, a stroke or erase under way, a button held,
-        # or the pen heard from in the last half second - no touch pan.
-        if (getattr(self, '_pen_near', False) or getattr(self, 'is_drawing_free_stroke', False)
+        # A stroke or erase under way, a button held, or the pen on the
+        # tablet in the last moment - no touch pan. The pen only hovering
+        # does not count: with the freehand tool on, the canvas follows a
+        # hovering pen all the time (its cursor, its lean), and that alone
+        # kept two fingers from ever panning while painting (the driver
+        # already ignores a touch it takes for a resting hand).
+        if (getattr(self, 'is_drawing_free_stroke', False)
                 or getattr(self, 'is_erasing', False)
                 or QApplication.mouseButtons() != Qt.NoButton
-                or time.monotonic() - getattr(self, '_tablet_tilt_time', 0.0) < self._TOUCH_PEN_QUIET_S):
+                or time.monotonic() - getattr(self, '_pen_touch_time', 0.0) < self._TOUCH_PEN_QUIET_S):
             return
         label.pan_offset_x += dx_mm * self._TOUCH_PAN_PX_PER_MM
         label.pan_offset_y += dy_mm * self._TOUCH_PAN_PX_PER_MM

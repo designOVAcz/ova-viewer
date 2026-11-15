@@ -1501,6 +1501,11 @@ class ImageLabel(QLabel):
             # mouse events that follow carry no tilt, so it is kept here.
             self.parent_viewer._tablet_tilt = (event.xTilt(), event.yTilt())
             self.parent_viewer._tablet_tilt_time = time.monotonic()
+            if event.pressure() > 0 and event.type() in (QTabletEvent.TabletPress,
+                                                         QTabletEvent.TabletMove):
+                # The pen on the tablet (not hovering): a two-finger pan
+                # waits a moment after (see _on_touch_pan).
+                self.parent_viewer._pen_touch_time = time.monotonic()
             if hover and not self.parent_viewer.is_drawing_free_stroke:
                 self.parent_viewer.refresh_texture_cursor()   # hovering: turn with the lean
             # The pen turned round: its eraser end rubs out (🧽 Erase mode).
@@ -1802,6 +1807,14 @@ class ImageLabel(QLabel):
         menu.addAction(flip_v_action)
 
         menu.addSeparator()
+
+        # --- 🟥 The brush colour as a big floating square ---
+        if hasattr(self.parent_viewer, 'toggle_colour_swatch'):
+            swatch_action = QAction("🟥 Colour swatch (current colour, resizable)", self)
+            swatch_action.setCheckable(True)
+            swatch_action.setChecked(self.parent_viewer.colour_swatch_shown())
+            swatch_action.toggled.connect(self.parent_viewer.toggle_colour_swatch)
+            menu.addAction(swatch_action)
 
         # --- 🐧 Colours from ColorPenguin (its sync set to Rebelle) ---
         if hasattr(self.parent_viewer, 'toggle_colour_sync'):
