@@ -970,6 +970,44 @@ class ImageLabel(QLabel):
         return bool(delta_x or event.phase() != Qt.NoScrollPhase
                     or not event.pixelDelta().isNull() or delta_y % 120)
 
+    _pen_pan_last = None    # where a pen-button pan last was (label coords), or None
+
+    def _pen_button_pan(self, event):
+        """The pen's side button held and the pen dragged: pan, wherever a
+        right-drag pans (◧ Studio, or zoomed in) - straight from the pen's
+        own events. Left to Windows, the button (Wacom: "click & tap") did
+        not always come through as a mouse right-drag, so the pen could not
+        pan. True when the event was taken for it."""
+        t = event.type()
+        if self._pen_pan_last is None:
+            if (t == QTabletEvent.TabletPress
+                    and event.button() in (Qt.RightButton, Qt.MiddleButton)
+                    and self.parent_viewer is not None and self.parent_viewer.current_image
+                    and (self.zoom_factor > 1.0 or self._studio_pan())):
+                self._pen_pan_last = event.position()
+                self.setCursor(Qt.ClosedHandCursor)
+                event.accept()
+                return True
+            return False
+        if t == QTabletEvent.TabletMove:
+            pos = event.position()
+            self.pan_offset_x += pos.x() - self._pen_pan_last.x()
+            self.pan_offset_y += pos.y() - self._pen_pan_last.y()
+            self._pen_pan_last = pos
+            self.parent_viewer._smart_zoom_display()
+            event.accept()
+            return True
+        if t in (QTabletEvent.TabletRelease, QTabletEvent.TabletLeaveProximity):
+            self._pen_pan_last = None
+            self._right_dragged = True      # no right-click menu after a pan
+            try:
+                self.parent_viewer.apply_tool_cursor()
+            except Exception:
+                self.unsetCursor()
+            event.accept()
+            return True
+        return False
+
     def _studio_pan(self):
         """◧ Studio: the right button pans at any zoom, 100 % and below too."""
         return bool(self.parent_viewer is not None
@@ -988,6 +1026,12 @@ class ImageLabel(QLabel):
             or viewer.crop_mode or viewer.select_mode)
 
     def mousePressEvent(self, event):
+        # 🎮 A stroke or click while the GPU view still shows a zoom: the
+        # plain canvas for this view first (see _finish_view_motion).
+        if event.button() == Qt.LeftButton and self.parent_viewer is not None:
+            finish = getattr(self.parent_viewer, '_finish_view_motion', None)
+            if finish is not None:
+                finish()
         # Handle middle-click for next image
         if event.button() == Qt.MiddleButton and self.parent_viewer:
             event.accept()
@@ -1413,8 +1457,10 @@ class ImageLabel(QLabel):
             widget_at_pos = QApplication.widgetAt(global_point)
 
             # If there's a widget at this position and it's not the ImageLabel itself,
-            # then we're over a UI element - return False immediately
-            if widget_at_pos and widget_at_pos != self:
+            # then we're over a UI element - return False immediately. (The
+            # GPU view lying over the canvas lets input through: not one.)
+            if (widget_at_pos and widget_at_pos != self
+                    and not getattr(widget_at_pos.window(), 'passes_input', False)):
                 return False
 
             # Additional specific checks for main UI areas
@@ -1486,6 +1532,12 @@ class ImageLabel(QLabel):
 
     def tabletEvent(self, event):
         """Handle tablet events ONLY for pen pressure during active drawing"""
+        if self._pen_button_pan(event):
+            return
+        if event.type() == QTabletEvent.TabletPress and self.parent_viewer is not None:
+            finish = getattr(self.parent_viewer, '_finish_view_motion', None)
+            if finish is not None:
+                finish()        # 🎮 the plain canvas before the pen paints
         # Only with the canvas itself under the pen: a tool panel or palette
         # lying over it gets these events passed on too, and pushing the
         # canvas cursor to Windows there hid the normal arrow over it.

@@ -9,8 +9,8 @@ A fast media viewer and painting companion for Windows, built with PySide6. Imag
 **Viewing**
 - 🖼 Images (JPEG, PNG, BMP, WebP, JPEG 2000), 📄 PDF (book spreads), 📚 EPUB, 🗜 CBR/CBZ, 🎞 GIF/WebP animations, 🎬 video
 - ▦ Thumbnail grid (**G**): instant on huge folders, zoom and pan like PureRef, with a fly-through slideshow
-- ⚡ Slideshow and film playback (seconds or fps), ⏭ autoplay-next, 🔁 loop
-- 🔍 Zoom, pan, rotate, flip, fullscreen. Two-finger Wacom / touchpad pan works at any zoom
+- ⚡ Slideshow and film playback (seconds or fps), ⏭ autoplay-next, 🔁 loop. Videos: ← → seek, ↑ ↓ previous / next clip
+- 🔍 Zoom, pan, rotate, flip, fullscreen: drawn on the GPU while the view moves, with each layer kept as one picture-resolution image, so they are instant even over a big painting. ⟲ shows the real size (100 %), click again to fit. Two-finger Wacom / touchpad pan works at any zoom
 - ➕ Add mode for combining folders, 🗂 file-type filter, history, alphabetical or random order
 
 **Music**

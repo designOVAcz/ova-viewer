@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 import json
 import math
@@ -81,11 +81,15 @@ class Stroke(list):
     ``list`` keeps it a plain sequence of points for every other consumer.
     """
 
-    __slots__ = ('thickness', 'color', 'texture', 'stamps', 'flat', 'render', 'history', 'erase')
+    __slots__ = ('thickness', 'color', 'texture', 'stamps', 'flat', 'render', 'history', 'erase',
+                 'pic_width')
 
     def __init__(self, points=(), thickness=None, color=None, texture=None, stamps=None,
                  flat=False):
         super().__init__(points)
+        # A round-pen stroke's width in picture pixels as drawn (its layer's
+        # image keeps it so); None for older ones and textured strokes.
+        self.pic_width = None
         # (view transform, image, top-left): the stroke as drawn live, reused
         # while the view is unchanged (see RandomImageViewer._paint_layer_marks).
         self.render = None
@@ -1150,14 +1154,24 @@ class RandomImageViewer(QMainWindow):
     def _update_zoom_readout(self):
         """The status bar's zoom: the picture as shown, in % of its real size."""
         label = getattr(self, 'zoom_label', None)
-        pic = getattr(self, 'original_pixmap', None)
         if label is None:
             return
-        if pic is None or pic.isNull() or not self.current_image:
+        per = self._real_pixel_scale()
+        if per is None:
             label.setText("")
             return
+        percent = per * self.image_label.zoom_factor * 100
+        label.setText(f"{percent:.0f}%" if percent >= 10 else f"{percent:.1f}%")
+
+    def _real_pixel_scale(self):
+        """Physical screen pixels per pixel of the file, at zoom 1 (fitted):
+        what the zoom readout shows, and what 1:1 (⟲) undoes. None without
+        a picture."""
+        pic = getattr(self, 'original_pixmap', None)
+        if pic is None or pic.isNull() or not self.current_image:
+            return None
         fitted = pic.size().scaled(self.image_label.size(), Qt.KeepAspectRatio)
-        percent = fitted.width() / max(1, pic.width()) * self.image_label.zoom_factor * 100
+        per = fitted.width() / max(1, pic.width())
         # Large pictures are held smaller than the file: count against the
         # file's own size, read from its header once.
         kept = getattr(self, '_real_size', None)
@@ -1166,9 +1180,21 @@ class RandomImageViewer(QMainWindow):
             real = QImageReader(self.current_image).size()
             kept = self._real_size = (self.current_image, real if real.isValid() else None)
         real = kept[1]
-        if real is not None and max(real.width(), real.height()) > 0:
-            percent *= max(pic.width(), pic.height()) / max(real.width(), real.height())
-        label.setText(f"{percent:.0f}%" if percent >= 10 else f"{percent:.1f}%")
+        if real is not None and min(real.width(), real.height()) > 0:
+            if getattr(self, 'studio_mode', False):
+                # ◧ The sheet is the canvas and the picture side by side:
+                # as tall as the picture, twice as wide.
+                held = min(pic.width(), pic.height())
+                per *= held / min(real.width(), real.height())
+            else:
+                per *= max(pic.width(), pic.height()) / max(real.width(), real.height())
+        # On a scaled display (Windows at 150 % ...) a window pixel is more
+        # than one pixel of the screen: 100 % is one picture pixel per screen pixel.
+        try:
+            per *= self.image_label.devicePixelRatioF()
+        except Exception:
+            pass
+        return per
 
     @staticmethod
     def _marks_follow_pen(marks):
@@ -1244,6 +1270,7 @@ class RandomImageViewer(QMainWindow):
                 busy.show_progress(1.0)
             if self.current_image:
                 self._smart_zoom_display(settled=True)
+            self._hide_gpu_view()           # the plain canvas is there now, for this view
             if busy is not None:
                 busy.hide()
 
@@ -1275,70 +1302,430 @@ class RandomImageViewer(QMainWindow):
 
         step()
 
-    def _layer_image(self, layer, device, view):
-        """*layer*'s marks as a transparent image, for this view.
+    # -- 🖼 each layer as one image at the picture's resolution -------------
+    #
+    # As in a paint program (HeavyPaint ...): a layer's paint is kept as one
+    # image in picture coordinates, a little finer than the picture, and every
+    # mark goes into it once, when it is made. A zoom, pan, turn or flip only
+    # draws that image differently - instant, whole, nothing to wait for. (Laid
+    # again for every view instead, a few hundred strokes took a second or more
+    # after each zoom, the edges came in late and painting had to wait.)
+    # Guides - ruler lines, free lines, polylines - stay lines on the screen,
+    # drawn over it as they always were, so they keep their width at any zoom.
 
-        Marks are only ever added or taken off the end (undo), so the last image
-        stays good until the view changes and just needs what is new painted
-        onto it. Finishing a line then costs that line, not the whole drawing.
-        """
-        marks = list(self._ordered_marks(layer))
-        key, fixed = self._layer_raster_key(device.width(), device.height(), view, len(marks), marks)
-        kept = layer.raster
-        if (getattr(self, '_view_in_motion', False) and kept is not None and kept['key'] != key
-                and kept.get('fixed') == fixed and kept.get('view_tf') is not None):
-            # Zooming / panning: the last image, moved and scaled to the new
-            # view - a few ms, where laying every mark again took most of a
-            # second with a few dozen textured strokes. The real one is made
-            # once the view comes to rest (see _settle_view).
-            back, ok = kept['view_tf'].inverted()
-            self._settle_wanted[id(layer)] = (device.width(), device.height(), view)
-            if ok:
-                # ⛰ An impasto layer moves its lit image (lighting every
-                # frame of a zoom would cost ~50 ms each).
-                source, lit = kept['image'], False
-                was_lit = layer.impasto_lit
-                if (layer.impasto and was_lit is not None and was_lit[2] is source
-                        and was_lit[0][0] == source.cacheKey()):
-                    source, lit = was_lit[1], True
-                quick = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
-                quick.fill(Qt.transparent)
-                qp = QPainter(quick)
-                qp.setTransform(back * self._layer_view_transform(view))
-                qp.drawImage(0, 0, source)
-                qp.end()
-                if lit:
-                    if self._prelit is None or len(self._prelit) > 64:
-                        self._prelit = set()
-                    self._prelit.add(quick.cacheKey())
-                return quick
-        if (kept is not None and kept['key'] == key and kept['count'] <= len(marks)
+    _CANVAS_MAX_SCALE = 1.25            # layer pixels per picture pixel, at most ...
+    _CANVAS_MAX_SIDE = 6144             # ... and its longest side ...
+    _CANVAS_MAX_PIXELS = 30_000_000     # ... and its size
+    _canvas_k = None                    # laying into a layer image: its pixels per picture pixel
+    _canvas_fit = 1.0                   # ... and the fitted view's scale (old pen widths)
+
+    def _sheet_unrotated(self):
+        """(w, h) of the picture (◧ the sheet) as marks are stored, unturned."""
+        pic = self.original_pixmap
+        if self.rotation_angle in (90, 270):
+            return pic.height(), pic.width()
+        return pic.width(), pic.height()
+
+    def _canvas_geometry(self, marks, room=False):
+        """(QRect in picture coords, scale) of a layer image holding *marks*:
+        the picture, and whatever is painted past its edges."""
+        from random_image_viewer.drawing import transform as mark_transform
+        uw, uh = self._sheet_unrotated()
+        area = QRectF(0, 0, uw, uh)
+        drawn = mark_transform.bounds(marks)
+        if not drawn.isEmpty():
+            area = area.united(drawn.adjusted(-4, -4, 4, 4))
+        rect = area.toAlignedRect()
+        k = self._canvas_scale_for(rect)
+        if room:
+            # Growing: room around it, so the next strokes past the edge
+            # fit too - but never so much that it would be coarser.
+            pad = int(max(128, 0.12 * max(uw, uh)))
+            while pad >= 32:
+                padded = rect.adjusted(-pad, -pad, pad, pad)
+                if self._canvas_scale_for(padded) >= k - 1e-9:
+                    return padded, k
+                pad //= 2
+        return rect, k
+
+    def _canvas_scale_for(self, rect):
+        w, h = max(1.0, rect.width()), max(1.0, rect.height())
+        k = min(self._CANVAS_MAX_SCALE, self._CANVAS_MAX_SIDE / max(w, h),
+                math.sqrt(self._CANVAS_MAX_PIXELS / (w * h)))
+        return max(0.05, k)
+
+    def _grown_canvas(self, layer, kept, need, k):
+        """*kept* (a layer image) moved whole into a bigger one holding the
+        picture area *need*, at the same scale *k*: a copy, not every mark
+        laid again (seconds with a few hundred strokes, at every stroke past
+        the edge). Its undo patches move with it. (image, rect) or None
+        where the scale is not the same."""
+        if abs(k - kept['k']) > 1e-9:
+            return None
+        old = QRectF(kept['rect'])
+        need = QRectF(need).united(old)
+        # Whole pixels of offset, so the old image is copied, not resampled.
+        dx = max(0, math.ceil((old.x() - need.x()) * k - 1e-6))
+        dy = max(0, math.ceil((old.y() - need.y()) * k - 1e-6))
+        x, y = old.x() - dx / k, old.y() - dy / k
+        rect = QRectF(x, y, need.right() - x, need.bottom() - y)
+        w, h = self._canvas_view(rect, k)[:2]
+        image = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.drawImage(dx, dy, kept['image'])
+        painter.end()
+        for patch in getattr(layer, 'canvas_patches', None) or []:
+            patch['box'] = patch['box'].translated(dx, dy)
+        return image, rect
+
+    def _canvas_view(self, rect, k):
+        """The _paint_marks view tuple that lays picture coords into a layer
+        image of *rect* at *k* (turns and flips off while laying)."""
+        uw, uh = self._sheet_unrotated()
+        return (max(1, math.ceil(rect.width() * k)), max(1, math.ceil(rect.height() * k)),
+                QSize(uw, uh), k, k, -rect.x() * k, -rect.y() * k)
+
+    def _laying_canvas(self, k):
+        """Context: marks laid into a layer image - unturned, unflipped, pen
+        widths in picture pixels (see _paint_layer_marks)."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def ctx():
+            saved = (self.rotation_angle, self.flipped_h, self.flipped_v, self._canvas_k, self._canvas_fit)
+            fit = self._fitted_scale()
+            self.rotation_angle, self.flipped_h, self.flipped_v = 0, False, False
+            self._canvas_k, self._canvas_fit = k, fit
+            try:
+                yield
+            finally:
+                (self.rotation_angle, self.flipped_h, self.flipped_v,
+                 self._canvas_k, self._canvas_fit) = saved
+        return ctx()
+
+    def _fitted_scale(self):
+        """Screen pixels per picture pixel with the picture fitted (zoom 1)."""
+        try:
+            pic = self.original_pixmap
+            fitted = pic.size().scaled(self.image_label.size(), Qt.KeepAspectRatio)
+            return max(1e-3, fitted.width() / max(1, pic.width()))
+        except Exception:
+            return 1.0
+
+    def _view_scale(self):
+        """Screen pixels per picture pixel now."""
+        try:
+            return max(1e-3, self._fx_view_params()[1])
+        except Exception:
+            return 1.0
+
+    def _layer_canvas(self, layer, marks):
+        """*layer*'s paint (*marks*, guides left out) as its image in picture
+        coordinates: (image, rect, k). Kept; new marks go onto it, undo takes
+        a kept step or lays it again (see _lay_marks)."""
+        hidden = self._sel_hidden
+        if hidden:
+            marks = [(kind, m) for kind, m in marks if id(m) not in hidden]
+        pen = ((self.line_color.rgba(), self.line_thickness)
+               if self._marks_follow_pen(marks) else ())
+        kept = layer.raster if (layer.raster or {}).get('canvas') else None
+        rect, k = (kept['rect'], kept['k']) if kept is not None else self._canvas_geometry(marks)
+        uw, uh = self._sheet_unrotated()
+
+        def key_for(rect, k):
+            return ('canvas', uw, uh, rect.x(), rect.y(), rect.width(), rect.height(), round(k, 5),
+                    *pen, self.line_antialiasing, self.pen_pressure_enabled,
+                    frozenset(hidden) if hidden else None,
+                    layer.fill.rgba() if layer.fill is not None else None)
+
+        if kept is not None and len(marks) > kept['count']:
+            # Something new past the image's edge: a bigger image - the one
+            # there moved into it when nothing else changed (see _grown_canvas).
+            from random_image_viewer.drawing import transform as mark_transform
+            new = mark_transform.bounds(marks[kept['count']:])
+            if not new.isEmpty() and not QRectF(rect).contains(new):
+                need, k = self._canvas_geometry(marks, room=True)
+                rect = need
+                if (kept['key'] == key_for(kept['rect'], kept['k']) and layer.fill is None
+                        and (not kept['count'] or marks[kept['count'] - 1][1] is kept['last'])):
+                    grown = self._grown_canvas(layer, kept, need, k)
+                    if grown is not None:
+                        image, rect = grown
+                        new_key = key_for(rect, k)
+                        for patch in getattr(layer, 'canvas_patches', None) or []:
+                            if patch['key'] == kept['key']:
+                                patch['key'] = new_key
+                        kept = dict(kept, image=image, rect=rect, key=new_key)
+                        layer.raster = kept
+        key = key_for(rect, k)
+        view = self._canvas_view(rect, k)
+        if (kept is not None and kept['key'] == key and len(marks) < kept['count']
+                and self._undo_patches(layer, kept, marks)):
+            # Undo: the patches the last marks covered, put back - not the
+            # whole image laid again (2 s with a few hundred strokes).
+            image, done = kept['image'], len(marks)
+        elif (kept is not None and kept['key'] == key and kept['count'] <= len(marks)
                 and (not kept['count'] or marks[kept['count'] - 1][1] is kept['last'])):
             image, done = kept['image'], kept['count']
-            if done < len(marks) and done:
-                # The image is painted on in place: keep it as it is now, so
-                # undoing what comes next is a copy, not the whole drawing.
-                self._keep_raster_step(layer, key, marks, done, image)
+            if done < len(marks):
+                self._keep_patch(layer, key, kept, marks, done, rect, k, image)
         else:
+            layer.canvas_patches = []
             step = self._raster_step_for(layer, key, marks)
             if step is not None:
-                # Undo (or the drawing as it was a few marks ago): from the
-                # image kept before those marks, not from nothing.
                 image, done = step['image'].copy(), step['count']
             else:
-                image = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
+                image = QImage(view[0], view[1], QImage.Format_ARGB32_Premultiplied)
                 image.fill(Qt.transparent)
                 done = 0
                 if layer.fill is not None:
-                    paper = QPainter(image)
-                    self._paint_layer_fill(paper, layer, view)
-                    paper.end()
+                    with self._laying_canvas(k):
+                        paper = QPainter(image)
+                        self._paint_layer_fill(paper, layer, view)
+                        paper.end()
         if done < len(marks):
-            self._lay_marks(layer, image, marks, done, view, key)
-        layer.raster = {'key': key, 'image': image, 'count': len(marks),
-                        'last': marks[-1][1] if marks else None,
-                        'fixed': fixed, 'view_tf': self._layer_view_transform(view)}
-        return image
+            self.__dict__.pop('_refine_wanted', None)
+            with self._laying_canvas(k):
+                self._lay_marks(layer, image, marks, done, view, key)
+        layer.raster = {'canvas': True, 'key': key, 'image': image, 'count': len(marks),
+                        'last': marks[-1][1] if marks else None, 'rect': rect, 'k': k}
+        self._queue_refines(layer, key)
+        return image, rect, k
+
+    # -- 🔥 a stroke burnt in as drawn ------------------------------------
+    #
+    # A stroke just drawn is on screen already, every stamp laid. When the
+    # pen lifts that picture goes into the layer's image (one drawImage) -
+    # laying its stamps again there took seconds after a long scribble
+    # (~8000 stamps: 3.4 s), every time. Where the screen was coarser than
+    # the layer's image (zoomed out, turned), the stroke is laid again
+    # exactly in the background, a few ms at a time while nothing else
+    # happens, and put in place of the burnt one - unless something was
+    # painted after it meanwhile (then the burnt one stays).
+
+    _REFINE_SLICE_S = 0.008     # background work per turn of the event loop
+    _REFINE_CHUNK = 12          # stamps per step
+
+    def _burn_render(self, painter, mark, render, view):
+        """Lay *mark* into a layer image from its live render (screen
+        pixels) through *view*. False when it cannot."""
+        inv, ok = render[0].inverted()
+        if not ok:
+            return False
+        burn = inv * view
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setTransform(burn, True)
+        painter.drawImage(QPointF(render[2]), render[1])
+        painter.restore()
+        mark.render = None          # it is in the layer now: its screen picture not needed
+        scale_render = math.sqrt(abs(render[0].determinant()))
+        scale_view = math.sqrt(abs(view.determinant()))
+        exact = (abs(burn.m12()) < 1e-6 and abs(burn.m21()) < 1e-6
+                 and scale_render >= scale_view * 0.98)
+        if not exact and mark.stamps and getattr(mark, 'history', None) is None:
+            self.__dict__.setdefault('_refine_wanted', []).append((mark, QTransform(view)))
+        return True
+
+    def _queue_refines(self, layer, key):
+        """The strokes just burnt coarser than the layer: to lay again exactly."""
+        wanted = self.__dict__.pop('_refine_wanted', None)
+        if not wanted:
+            return
+        jobs = [j for j in getattr(self, '_refine_jobs', []) if j['layer'] is not layer]
+        mark, view = wanted[-1]     # only the newest can be put back (see _refine_valid)
+        jobs.append({'layer': layer, 'mark': mark, 'key': key, 'view': view, 'work': None, 'done': 0})
+        self._refine_jobs = jobs
+        timer = getattr(self, '_refine_timer', None)
+        if timer is None:
+            timer = self._refine_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._refine_tick)
+        timer.start(150)
+
+    def _refine_valid(self, job):
+        """Its layer image unchanged since: the stroke still the last thing
+        in it, its undo patch (the image before it) there."""
+        kept = job['layer'].raster
+        if not kept or not kept.get('canvas') or kept['key'] != job['key'] or kept['last'] is not job['mark']:
+            return None
+        patches = getattr(job['layer'], 'canvas_patches', None) or []
+        if not patches:
+            return None
+        patch = patches[-1]
+        if patch['key'] != job['key'] or patch['count'] != kept['count'] - 1:
+            return None
+        return kept, patch
+
+    def _refine_tick(self):
+        jobs = getattr(self, '_refine_jobs', None)
+        if not jobs:
+            return
+        timer = self._refine_timer
+        if (getattr(self, 'is_drawing_free_stroke', False) or getattr(self, '_view_in_motion', False)
+                or getattr(self, '_settle_job', None) is not None):
+            timer.start(120)        # not while painting or zooming
+            return
+        job = jobs[0]
+        valid = self._refine_valid(job)
+        if valid is None:
+            jobs.pop(0)
+            if jobs:
+                timer.start(0)
+            return
+        kept, patch = valid
+        mark, view = job['mark'], job['view']
+        try:
+            if job['work'] is None:
+                texture = brushes.load_texture(mark.texture)
+                if texture is None or getattr(texture, 'procedural', False):
+                    jobs.pop(0)
+                    return
+                scale = math.sqrt(abs(view.determinant()))
+                box = brushes._stamps_box(mark.stamps, view, scale).intersected(patch['box'])
+                if box.isEmpty():
+                    jobs.pop(0)
+                    return
+                if mark.flat:
+                    work = brushes.FlatStroke(box, None)
+                else:
+                    work = QImage(box.size(), QImage.Format_ARGB32_Premultiplied)
+                    work.fill(Qt.transparent)
+                job.update(work=work, box=box, texture=texture, image=kept['image'])
+            if kept['image'] is not job['image']:
+                jobs.pop(0)
+                return
+            stamps, box, work = mark.stamps, job['box'], job['work']
+            started = time.perf_counter()
+            while job['done'] < len(stamps) and time.perf_counter() - started < self._REFINE_SLICE_S:
+                chunk = stamps[job['done']:job['done'] + self._REFINE_CHUNK]
+                if mark.flat:
+                    work.add(job['texture'], chunk, view)
+                else:
+                    p = QPainter(work)
+                    p.translate(-box.x(), -box.y())
+                    brushes.paint_stamps(p, job['texture'], chunk, view)
+                    p.end()
+                job['done'] += len(chunk)
+            if job['done'] < len(stamps):
+                timer.start(0)
+                return
+            # Laid exactly: the image before the stroke back, the stroke on it.
+            stroke = work.compose(box) if mark.flat else work
+            p = QPainter(kept['image'])
+            p.setClipRect(patch['box'])
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            p.drawImage(patch['box'].topLeft(), patch['image'])
+            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            p.drawImage(box.topLeft(), stroke)
+            p.end()
+            jobs.pop(0)
+            if self.current_image:
+                self.display_image(self.current_image)
+        except Exception as e:
+            print(f"🔥 Stroke refine skipped: {e}")
+            jobs.pop(0)
+        if jobs:
+            timer.start(0)
+
+    _PATCHES_KEPT = 80                  # undo patches per layer ...
+    _PATCHES_BYTES = 400 << 20          # ... and at most this much memory for all layers
+
+    def _keep_patch(self, layer, key, kept, marks, done, rect, k, image):
+        """Before marks[done:] go onto *image*: the part of it they will
+        cover, kept, so undo puts that back (as a paint program does)."""
+        from random_image_viewer.drawing import transform as mark_transform
+        area = mark_transform.bounds(marks[done:])
+        if area.isEmpty():
+            return
+        box = QRectF((area.x() - rect.x()) * k, (area.y() - rect.y()) * k,
+                     area.width() * k, area.height() * k).toAlignedRect().adjusted(-4, -4, 4, 4)
+        box = box.intersected(image.rect())
+        if box.isEmpty():
+            return
+        patches = getattr(layer, 'canvas_patches', None) or []
+        patches.append({'key': key, 'count': done, 'last': marks[done - 1][1] if done else None,
+                        'box': box, 'image': image.copy(box)})
+        patches = patches[-self._PATCHES_KEPT:]
+        layer.canvas_patches = patches
+        total = sum(p['image'].sizeInBytes() for l in self.layers
+                    for p in (getattr(l, 'canvas_patches', None) or []))
+        while total > self._PATCHES_BYTES and patches:
+            total -= patches.pop(0)['image'].sizeInBytes()      # the oldest go first
+
+    def _undo_patches(self, layer, kept, marks):
+        """*layer*'s image back to *marks* (fewer than it holds) by putting
+        back the patches kept before the ones gone. False when they are not
+        all there (then it is laid again)."""
+        patches = getattr(layer, 'canvas_patches', None) or []
+        want = len(marks)
+        need = []
+        for p in reversed(patches):
+            if p['key'] != kept['key'] or p['count'] < want:
+                break
+            need.append(p)
+            if p['count'] == want:
+                break
+        if not need or need[-1]['count'] != want or (
+                want and marks[want - 1][1] is not need[-1]['last']):
+            return False
+        painter = QPainter(kept['image'])
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        for p in need:                      # newest first, back to *want*
+            painter.drawImage(p['box'].topLeft(), p['image'])
+        painter.end()
+        layer.canvas_patches = patches[:len(patches) - len(need)]
+        return True
+
+    def _canvas_lit(self, layer, image, k):
+        """⛰ *layer*'s image lit as impasto, once per change of its paint or
+        settings - not for every zoom."""
+        from random_image_viewer.drawing import impasto
+        key = (image.cacheKey(), impasto.settings_key(layer.impasto), round(k, 5))
+        kept = layer.impasto_lit
+        if kept is not None and kept[0] == key:
+            return kept[1]
+        if not getattr(self, '_impasto_gpu_set', False):
+            self._impasto_gpu_set = True
+            gpu = getattr(self, 'gpu_processor', None)
+            try:
+                if gpu is not None and gpu.is_available():
+                    impasto.use_gpu(gpu)
+            except Exception as e:
+                print(f"⛰ Impasto: no GPU ({e}), on the CPU")
+        lit = impasto.light(image, layer.impasto, k)
+        layer.impasto_lit = (key, lit, image)
+        return lit
+
+    def _layer_image(self, layer, device, view):
+        """*layer* as a transparent image for this view: its picture-sized
+        image (see _layer_canvas) drawn to the view, the guides over it."""
+        marks = list(self._ordered_marks(layer))
+        paint = [(kind, m) for kind, m in marks if not self._is_guide(kind, m)]
+        guides = [(kind, m) for kind, m in marks if self._is_guide(kind, m)]
+        canvas, rect, k = self._layer_canvas(layer, paint)
+        lit = bool(layer.impasto)
+        source = self._canvas_lit(layer, canvas, k) if lit else canvas
+        out = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        to_picture = QTransform()
+        to_picture.translate(rect.x(), rect.y())
+        to_picture.scale(1.0 / k, 1.0 / k)
+        p.setTransform(to_picture * self._layer_view_transform(view))
+        p.drawImage(0, 0, source)
+        p.resetTransform()
+        if guides:
+            self._paint_layer_marks(p, guides, *view)
+        p.end()
+        if lit:
+            if self._prelit is None or len(self._prelit) > 64:
+                self._prelit = set()
+            self._prelit.add(out.cacheKey())        # already lit: not again at screen size
+        return out
 
     _RASTER_STEPS = 12                  # images kept per layer for undo ...
     _RASTER_STEPS_BYTES = 200 << 20     # ... and at most this much memory for all of them
@@ -1354,6 +1741,8 @@ class RandomImageViewer(QMainWindow):
 
     def _keep_raster_step(self, layer, key, marks, count, image):
         """Keep *image* - *layer*'s first *count* marks, for *key* - for undo."""
+        if key and key[0] == 'canvas':
+            return      # a layer's own image: undo puts patches back (see _keep_patch)
         steps = [s for s in layer.raster_steps if s['key'] == key and s['count'] != count]
         steps.append({'key': key, 'count': count, 'last': marks[count - 1][1], 'image': image.copy()})
         steps.sort(key=lambda s: s['count'])
@@ -1602,6 +1991,10 @@ class RandomImageViewer(QMainWindow):
                         # again. Just drawn, it is the live render itself.
                         painter.drawImage(render[2] + shift, render[1])
                         continue
+                    if (render is not None and on_screen and self._canvas_k is not None
+                            and not getattr(mark, 'erase', False)
+                            and self._burn_render(painter, mark, render, view)):
+                        continue
                     tint = getattr(mark, 'history', None)
                     picture = self._history_picture() if tint is not None else None
                     made = brushes.paint_stamps(
@@ -1619,6 +2012,12 @@ class RandomImageViewer(QMainWindow):
                 # Size and colour come from the stroke itself when it carries
                 # them, so editing the brush never restyles older strokes.
                 base = (getattr(mark, 'thickness', None) or self.line_thickness) * self._export_pen_scale
+                if self._canvas_k is not None:
+                    # Into a layer image: the width the stroke had on screen
+                    # when drawn, in picture pixels (older strokes: as at the
+                    # fitted view), so it zooms with the paint.
+                    width = getattr(mark, 'pic_width', None)
+                    base = (width if width else base / self._canvas_fit) * self._canvas_k
                 ink = getattr(mark, 'color', None) or self.line_color
                 smooth = bool(self.line_antialiasing) and base > 1
                 painter.setRenderHint(QPainter.Antialiasing, smooth)
@@ -2120,6 +2519,9 @@ class RandomImageViewer(QMainWindow):
         # port); started after the window is up, see _start_colour_sync.
         self._colour_sync = None
         QTimer.singleShot(1500, self._start_colour_sync)
+        # Floating panels hide while another program is in front (see _on_app_state).
+        self._panels_hidden_for_away = []
+        QApplication.instance().applicationStateChanged.connect(self._on_app_state)
         # 🟥 The colour swatch comes back if it was open when the app closed.
         QTimer.singleShot(1600, lambda: self.toggle_colour_swatch(True)
                           if str(self._settings.value("colour_swatch_open", "false")).lower()
@@ -2283,9 +2685,21 @@ class RandomImageViewer(QMainWindow):
         self.timer.timeout.connect(self._on_timer_tick)
 
         self.init_ui()
-        # Set initial window geometry — a bit wider than before.
+        # Initial window: big enough that the Brush panel and the Layers
+        # panel under it fit down the left side of the canvas - within the
+        # screen, centred on it.
         try:
-            self.resize(1200, 760)
+            w, h = 1450, 1060
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                w = min(w, avail.width() - 40)
+                h = min(h, avail.height() - 72)     # room for the title bar
+                self.resize(w, h)
+                self.move(avail.x() + max(0, (avail.width() - w) // 2),
+                          avail.y() + max(0, (avail.height() - h - 32) // 2))
+            else:
+                self.resize(w, h)
         except Exception as _e:
             pass
         
@@ -2428,6 +2842,10 @@ class RandomImageViewer(QMainWindow):
         self.image_label.setMinimumSize(400, 400)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setToolTip("")
+        # 🎮 Zoom / pan drawn on the graphics card, in a window of its own laid
+        # over the canvas (see GpuView, _gpu_frame) - made on the first zoom.
+        self._gpu_view = None
+        self._gpu_view_tried = False
 
         image_layout.addWidget(self.image_label)
         image_widget.setLayout(image_layout)
@@ -2464,9 +2882,10 @@ class RandomImageViewer(QMainWindow):
         self.zoom_reset_btn = QToolButton()
         self.zoom_reset_btn.setText("⟲")
         self.zoom_reset_btn.setAutoRaise(True)
-        self.zoom_reset_btn.setToolTip("Fit the picture to the window (Ctrl+0)")
+        self.zoom_reset_btn.setToolTip("Real size: 100 %, one picture pixel per screen pixel. "
+                                       "Click again to fit the window (Ctrl+0 fits too)")
         self.zoom_reset_btn.setCursor(Qt.PointingHandCursor)
-        self.zoom_reset_btn.clicked.connect(lambda: self.reset_zoom())
+        self.zoom_reset_btn.clicked.connect(lambda: self.zoom_actual_size())
         zoom_row.addWidget(self.zoom_reset_btn)
         self.zoom_label = QLabel("")
         self.zoom_label.setToolTip("Zoom: the picture shown at this % of its real size")
@@ -2669,6 +3088,13 @@ class RandomImageViewer(QMainWindow):
 
         self.right_shortcut = QShortcut("Right", self)
         self.right_shortcut.activated.connect(lambda: self._video_shortcut_seek(5000))
+
+        # ↑ / ↓ with a video or song open: the previous / next clip (← / →
+        # seek within it then). Pictures: unused, as before.
+        self.up_shortcut = QShortcut("Up", self)
+        self.up_shortcut.activated.connect(lambda: self._clip_step(-1))
+        self.down_shortcut = QShortcut("Down", self)
+        self.down_shortcut.activated.connect(lambda: self._clip_step(1))
 
         # Delete current file (move to Recycle Bin)
         self.delete_shortcut = QShortcut("Delete", self)
@@ -4619,6 +5045,17 @@ class RandomImageViewer(QMainWindow):
         if self._video_playing:
             self._toggle_video_mute()
 
+    def _clip_step(self, step):
+        """↑ / ↓: with a video or song open (playing or paused), the
+        previous / next item in the list."""
+        path = self.current_image
+        if not path or not (is_video_file(path) or is_audio_file(path)):
+            return
+        if step < 0:
+            self.show_previous_image()
+        else:
+            self._manual_next_image()
+
     def _video_shortcut_seek(self, offset_ms):
         if self._video_playing and self.image_label._media_player is not None:
             pos = self.image_label._media_player.position()
@@ -4992,8 +5429,9 @@ class RandomImageViewer(QMainWindow):
             # Cache the enhanced and rotated version
             self._manage_cache(self.enhancement_cache, cache_key, pixmap)
         
-        # Cache the original for line drawing reference
-        self.original_pixmap = pixmap.copy()
+        # Kept for line drawing reference - shared with the cache, not
+        # copied (nothing paints into it; a copy every redraw cost ms).
+        self.original_pixmap = pixmap
         self._update_layer_chip()       # ✨ there follows the effects being on
         self._update_zoom_readout()
         
@@ -5011,7 +5449,7 @@ class RandomImageViewer(QMainWindow):
         
         # Draw lines on the scaled pixmap if any exist AND lines are visible
         if self.lines_visible and (self.has_marks()):
-            final_pixmap = scaled_pixmap.copy()
+            final_pixmap = QPixmap(scaled_pixmap)     # copied by the painter (shared until then)
             painter = QPainter(final_pixmap)
             painter.setRenderHint(QPainter.Antialiasing, False)
             
@@ -5027,7 +5465,8 @@ class RandomImageViewer(QMainWindow):
             
             # UNIFIED coordinate calculation - use the same logic for ALL zoom levels
             # Calculate the base scaled size that would be used at 100% zoom
-            base_scaled = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # (its size only - scaling the whole picture to read it cost ms)
+            base_scaled = pixmap.size().scaled(label_size, Qt.KeepAspectRatio)
             
             # Apply zoom factor to get the actual displayed size
             zoomed_width = int(base_scaled.width() * zoom_factor)
@@ -5070,7 +5509,7 @@ class RandomImageViewer(QMainWindow):
                 label_size = self.image_label.size()
                 zoom_factor = self.image_label.zoom_factor
                 
-                base_scaled = self.original_pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                base_scaled = self.original_pixmap.size().scaled(label_size, Qt.KeepAspectRatio)
                 zoomed_width = int(base_scaled.width() * zoom_factor)
                 zoomed_height = int(base_scaled.height() * zoom_factor)
                 
@@ -5093,6 +5532,14 @@ class RandomImageViewer(QMainWindow):
         self.image_label.setPixmap(scaled_pixmap)
         self.image_label.setToolTip("")
         self.current_image = img_path
+        # Kept with its view: while the view moves, frames are this one moved
+        # (see _motion_frame) instead of the effects run again each time.
+        try:
+            size = scaled_pixmap.size()
+            self._shown_frame = (img_path, scaled_pixmap, self._layer_view_transform(
+                (size.width(), size.height(), *self._fx_view_params())))
+        except Exception:
+            self._shown_frame = None
 
     def _effect_chain(self, base_pixmap, cached=True):
         """*base_pixmap* through the view's effects, in order: LUT and the
@@ -5241,8 +5688,10 @@ class RandomImageViewer(QMainWindow):
         if view is None:
             return None
         self._fx_palette_last = None
-        out = self._effect_chain_over_paint(view, self._fx_paint_signature())
         area = self._studio_canvas_path(view.width(), view.height())
+        out = self._studio_fx_picture_part(img_path, view) if area is not None else None
+        if out is None:
+            out = self._effect_chain_over_paint(view, self._fx_paint_signature())
         if area is not None:
             # ◧ The canvas (and what is painted on it) as it is, untouched by
             # the effects - they are for looking at the picture.
@@ -5254,6 +5703,44 @@ class RandomImageViewer(QMainWindow):
         # running the whole view through the effects again (see
         # _show_live_with_effects) - hundreds of ms with the slow ones.
         self._fx_last_full = (self._fx_full_key(img_path, view.size()), out, self._fx_palette_last)
+        return out
+
+    def _studio_fx_picture_part(self, img_path, view):
+        """◧ Studio, effects on the picture only: *view* with the effects run
+        over the picture's part of it alone - and run again only when that
+        part changed. Painting or erasing on the canvas then costs no effects
+        pass at all (each was ~70 ms for a full screen with a value filter,
+        several a second while erasing). None to do it the plain way."""
+        import zlib
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return None
+        try:
+            to_view = self._layer_view_transform((view.width(), view.height(), *self._fx_view_params()))
+            x = self._studio_offset(base)
+            rect = to_view.mapRect(QRectF(x, 0, base.width(), base.height())).toAlignedRect()
+            rect = rect.intersected(view.rect())
+        except Exception:
+            return None
+        out = view.copy()
+        if rect.isEmpty():
+            return out              # the picture is off screen: nothing to filter
+        crop = view.copy(rect)
+        image = crop.toImage()
+        line = image.bytesPerLine() * image.height()
+        crc = zlib.crc32(memoryview(image.constBits())[:line])
+        key = list(self._fx_full_key(img_path, view.size()))
+        key[8] = None               # the paint signature: the pixels say it
+        key = (tuple(key), rect.x(), rect.y(), rect.width(), rect.height(), crc)
+        kept = getattr(self, '_fx_picture_kept', None)
+        if kept is not None and kept[0] == key:
+            filtered, self._fx_palette_last = kept[1], kept[2]
+        else:
+            filtered = self._effect_chain_over_paint(crop, self._fx_paint_signature())
+            self._fx_picture_kept = (key, filtered, getattr(self, '_fx_palette_last', None))
+        p = QPainter(out)
+        p.drawPixmap(rect.topLeft(), filtered)
+        p.end()
         return out
 
     _FX_SETTING_PREFIXES = ('grayscale_', 'contrast_', 'gamma_', 'lut_', 'current_lut',
@@ -5317,8 +5804,6 @@ class RandomImageViewer(QMainWindow):
             btn.blockSignals(True); btn.setChecked(self.studio_fx_canvas); btn.blockSignals(False)
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
-        for layer in self.layers:
-            layer.raster = None
         if self.current_image:
             self.display_image(self.current_image)
         if self.studio_mode:
@@ -5384,13 +5869,15 @@ class RandomImageViewer(QMainWindow):
             fits = self._fit_cache = {}
         if fit_key in fits:
             self.last_size = size
-            return fits[fit_key].copy()
+            # Shared, not copied: a painter on it copies it then (Qt's
+            # implicit sharing) - a copy every redraw was ~4 ms for nothing.
+            return QPixmap(fits[fit_key])
         scaled = self._scale_pixmap_now(pixmap, size, zoom_factor, pan_x, pan_y)
         if len(fits) >= 4:
             fits.pop(next(iter(fits)))
         fits[fit_key] = scaled
         self.last_size = size
-        return scaled.copy()
+        return QPixmap(scaled)
 
     def _scale_pixmap_now(self, pixmap, size, zoom_factor, pan_x, pan_y):
         """The picture fitted to the view: zoomed, panned, on the background."""
@@ -6333,29 +6820,31 @@ class RandomImageViewer(QMainWindow):
             image = pixmap.toImage()
             if image.isNull():
                 return pixmap
-            if image.format() != QImage.Format.Format_RGBA8888:
-                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+            if image.format() not in (QImage.Format.Format_ARGB32, QImage.Format.Format_RGB32,
+                                      QImage.Format.Format_ARGB32_Premultiplied):
+                image = image.convertToFormat(QImage.Format.Format_ARGB32)
 
             w, h = image.width(), image.height()
             bpl = image.bytesPerLine()
-            ptr = image.constBits()
-            buf = bytes(ptr)[: bpl * h]
-            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
-
-            # Rec. 709 luminance
-            r = arr[:, :, 0].astype(np.float32)
-            g = arr[:, :, 1].astype(np.float32)
-            b = arr[:, :, 2].astype(np.float32)
-            lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-            # Quantize into N bands then map to N evenly spaced output levels in [0, 255]
-            bins = np.clip(np.floor(lum * n / 256.0), 0, n - 1).astype(np.uint8)
-            output_levels = np.linspace(0, 255, n, dtype=np.uint8)
-            quantized = output_levels[bins]
-
-            # Build a Grayscale8 QImage; copy to detach from the numpy buffer
-            quantized = np.ascontiguousarray(quantized)
-            out = QImage(quantized.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+            # Read in place (BGRA bytes), no copy of the whole frame.
+            arr = np.frombuffer(image.constBits(), dtype=np.uint8,
+                                count=bpl * h).reshape(h, bpl)[:, : w * 4].reshape(h, w, 4)
+            # Rec. 709 luminance, then N bands mapped to N evenly spaced
+            # tones - by a 256-entry table. Two OpenCV passes: the float
+            # arrays channel by channel took ~70 ms a full-screen frame, and
+            # ran on every redraw while painting with the filter on.
+            levels = np.linspace(0, 255, n, dtype=np.uint8)
+            table = levels[np.clip(np.arange(256) * n // 256, 0, n - 1)].astype(np.uint8)
+            try:
+                import cv2
+                lum = cv2.transform(arr, np.array([[0.0722, 0.7152, 0.2126, 0.0]], np.float32))
+                quantized = cv2.LUT(lum, table)
+            except Exception:
+                lum = (0.0722 * arr[:, :, 0] + 0.7152 * arr[:, :, 1]
+                       + 0.2126 * arr[:, :, 2]).astype(np.uint8)
+                quantized = table[lum]
+            quantized = np.ascontiguousarray(quantized.reshape(h, w))
+            out = QImage(quantized.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
             return self._blend_effect(pixmap, QPixmap.fromImage(out),
                                       self.value_filter_opacity)
         except Exception as e:
@@ -8878,6 +9367,19 @@ class RandomImageViewer(QMainWindow):
         pixels = pixels[:, :w * 4].reshape(h, w, 4)
         scale = math.sqrt(abs(to_screen.determinant()))
         t = to_screen
+        # A summed-area table of the view (made once, as the stroke starts):
+        # the average over any square is 4 lookups however big the brush -
+        # averaged pixel by pixel, a big tip read ~15 000 pixels per stamp.
+        try:
+            import cv2
+            sat = cv2.integral(np.ascontiguousarray(pixels), sdepth=cv2.CV_32S)     # ~ms, in C
+        except Exception:
+            sat = np.zeros((h + 1, w + 1, 4), np.int32)
+            np.cumsum(np.cumsum(pixels, axis=0, dtype=np.int32), axis=1, dtype=np.int32, out=sat[1:, 1:])
+
+        def box_mean(x0, x1, y0, y1):
+            total = (sat[y1, x1].astype(np.int64) - sat[y0, x1] - sat[y1, x0] + sat[y0, x0])
+            return total / np.maximum((x1 - x0) * (y1 - y0), 1)[..., None] if np.ndim(x0) else                 total / max(1, (x1 - x0) * (y1 - y0))
 
         def sample(x, y, size, _keep=image):
             sx = t.m11() * x + t.m21() * y + t.dx()
@@ -8887,7 +9389,7 @@ class RandomImageViewer(QMainWindow):
             y0, y1 = max(0, int(sy) - r), min(h, int(sy) + r + 1)
             if x0 >= x1 or y0 >= y1:
                 return None
-            b, g, r_, a = pixels[y0:y1, x0:x1].reshape(-1, 4).mean(axis=0)
+            b, g, r_, a = box_mean(x0, x1, y0, y1)
             if a < brushes.SAMPLE_MIN_ALPHA:
                 return None
             k = 255.0 / a                           # premultiplied -> plain colour
@@ -8897,22 +9399,15 @@ class RandomImageViewer(QMainWindow):
                                    | min(255, round(b * k)), brushes.picked_up(a / 255.0))
 
         def many(points, size):
-            """sample() for many spots of one size at once (a stamp's streaks):
-            one array gather instead of a slice and a mean each."""
+            """sample() for many spots of one size at once (a stamp's streaks)."""
             xy = np.asarray(points, np.float64)
-            sx = t.m11() * xy[:, 0] + t.m21() * xy[:, 1] + t.dx()
-            sy = t.m12() * xy[:, 0] + t.m22() * xy[:, 1] + t.dy()
+            sx = (t.m11() * xy[:, 0] + t.m21() * xy[:, 1] + t.dx()).astype(np.int64)
+            sy = (t.m12() * xy[:, 0] + t.m22() * xy[:, 1] + t.dy()).astype(np.int64)
             r = max(1, int(size * scale * 0.2))
-            step = max(1, -(-r // 6))               # a big spot: every few pixels
-            off = np.arange(-r, r + 1, step)
-            gx = sx.astype(np.int64)[:, None, None] + off[None, None, :]
-            gy = sy.astype(np.int64)[:, None, None] + off[None, :, None]
-            gx, gy = np.broadcast_arrays(gx, gy)
-            inside = (gx >= 0) & (gx < w) & (gy >= 0) & (gy < h)
-            px = pixels[np.clip(gy, 0, h - 1), np.clip(gx, 0, w - 1)].astype(np.float32)
-            px *= inside[..., None]
-            count = inside.sum((1, 2)).astype(np.float32)
-            mean = px.sum((1, 2)) / np.maximum(count, 1.0)[:, None]
+            x0, x1 = np.clip(sx - r, 0, w), np.clip(sx + r + 1, 0, w)
+            y0, y1 = np.clip(sy - r, 0, h), np.clip(sy + r + 1, 0, h)
+            count = np.maximum(x1 - x0, 0) * np.maximum(y1 - y0, 0)
+            mean = box_mean(x0, np.maximum(x1, x0), y0, np.maximum(y1, y0))
             a = mean[:, 3]
             k = 255.0 / np.maximum(a, 1.0)
             rgb = np.minimum(255, np.round(mean[:, 2::-1] * k[:, None])).astype(np.int64)
@@ -9192,11 +9687,17 @@ class RandomImageViewer(QMainWindow):
             self.brush_settings, texture, QColor(self.line_color), self.line_thickness,
             to_picture, self.pen_pressure_enabled, sampler=sampler)
         live = getattr(self, '_stroke_image', None)
-        if live is not None and live.format() != QImage.Format_ARGB32_Premultiplied:
-            # Stamps go down premultiplied, as on the layer's own image: the
-            # stroke kept from this buffer (see _live_stroke_render) is then
-            # the same pixels as it laid again later, not rounded differently.
-            self._stroke_image = QImage(live.size(), QImage.Format_ARGB32_Premultiplied)
+        # Stamps go down premultiplied, as on the layer's own image: the
+        # stroke kept from this buffer (see _live_stroke_render) is then the
+        # same pixels as it laid again later, not rounded differently. A
+        # stroke whose stamps build up gathers them at 16 bits a channel,
+        # rounded to 8 once (see brushes.paint_stamps): rounded at every
+        # faint stamp, a soft or see-through build-up came out in bands.
+        wanted = (QImage.Format_RGBA64_Premultiplied
+                  if not self._stamp_trail.settings['flat'] and not self._live_with_effects()
+                  else QImage.Format_ARGB32_Premultiplied)
+        if live is not None and live.format() != wanted:
+            self._stroke_image = QImage(live.size(), wanted)
             self._stroke_image.fill(Qt.transparent)
         self._stamp_trail.add(x, y, None, self._current_tilt())
         image = getattr(self, '_stroke_image', None)
@@ -9204,6 +9705,15 @@ class RandomImageViewer(QMainWindow):
         history = mode == 'history'
         picture = self._history_picture() if history else None
         source = (picture, to_screen, self.brush_settings['mix'] / 100.0) if picture is not None else None
+        if mode in ('push', 'smear') and self._blend_under is not None and image is not None:
+            # 🌊🧊 Their pixels worked on the graphics card when it is up (see drag_gpu).
+            gpu = getattr(self, 'gpu_processor', None)
+            try:
+                if gpu is not None and gpu.is_available():
+                    from random_image_viewer.drawing import drag_gpu
+                    drag_gpu.use_gpu(gpu)
+            except Exception:
+                pass
         if mode == 'push' and self._blend_under is not None and image is not None:
             # 🧊 Push: liquify - moves the pixels under it (see PushStroke).
             s = self.brush_settings
@@ -11601,7 +12111,10 @@ class RandomImageViewer(QMainWindow):
     # -- 🐧 colour sync (ColorPenguin) -----------------------------------------
 
     def colour_sync_enabled(self):
-        return str(self._settings.value("colorpenguin_sync", "true")).lower() in ("true", "1")
+        # Off unless switched on in this window (right-click → 🐧), and not
+        # remembered: with several windows of this app open, only the one it
+        # was switched on in takes the colours.
+        return bool(self.__dict__.get('_colour_sync_on', False))
 
     def _start_colour_sync(self):
         """Answer on Rebelle's WebSocket port, so ColorPenguin (sync set to
@@ -11636,7 +12149,7 @@ class RandomImageViewer(QMainWindow):
             self.status.showMessage(text, 6000)
 
     def toggle_colour_sync(self, on):
-        self._settings.setValue("colorpenguin_sync", bool(on))
+        self._colour_sync_on = bool(on)
         if on:
             first = self._colour_sync is None
             self._start_colour_sync()
@@ -11977,6 +12490,7 @@ class RandomImageViewer(QMainWindow):
             # frame of lag). Under the effects or erasing, the view is made
             # again each frame, so that keeps its pace.
             self._live_direct, self._live_dirty = False, None
+            self._erase_live = None
             self.stroke_update_timer.setInterval(0 if self._live_direct_ok() else 8)
             # The round pen's transparency, for the stroke as a whole (it is
             # drawn solid into the buffer). Textured stamps carry their own.
@@ -12262,6 +12776,136 @@ class RandomImageViewer(QMainWindow):
             # Clear the reference to allow garbage collection
             self._stroke_image = None
 
+    def _erase_partial(self):
+        """🧽 An erase stroke's frame, made only where it changed: what is
+        under the active layer, the layer itself and what is over it are
+        made once when the stroke starts; each frame puts the changed piece
+        together from them (the layer with the rub taken out) and the label
+        repaints just that. Making the whole view again for every move -
+        all the layers and effects - cost ~35-60 ms. False where it cannot
+        (effects over the paint, overlays, blend modes over the layer)."""
+        live = self.__dict__.get('_erase_live')
+        if live is None:
+            try:
+                live = self._erase_parts()
+            except Exception as e:
+                print(f"🧽 Erase: whole redraws ({e})")
+                live = False
+            self._erase_live = live
+        if not live:
+            return False
+        rub = getattr(self, '_stroke_image', None)
+        frame = live['frame']
+        if rub is None or rub.size() != frame.size():
+            self._erase_live = False
+            return False
+        dirty, self._live_dirty = self._live_dirty, None
+        self._live_direct = True
+        label = self.image_label
+        if dirty is None:
+            label.update()
+            return True
+        area = dirty.adjusted(-2, -2, 2, 2).intersected(frame.rect())
+        if area.isEmpty():
+            return True
+        origin = QPoint(0, 0)
+        piece = QImage(area.size(), QImage.Format_ARGB32_Premultiplied)
+        p = QPainter(piece)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.drawImage(origin, live['under'], area)
+        layer_part = live['active'].copy(area)
+        lp = QPainter(layer_part)
+        lp.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+        lp.setOpacity(getattr(self, '_live_ink_alpha', 1.0))
+        lp.drawImage(origin, rub, area)
+        lp.end()
+        p.setCompositionMode(live['mode'])
+        p.setOpacity(live['opacity'])
+        p.drawImage(origin, layer_part)
+        p.setOpacity(1.0)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        if live['above'] is not None:
+            p.drawImage(origin, live['above'], area)
+        p.end()
+        fp = QPainter(frame)
+        fp.setCompositionMode(QPainter.CompositionMode_Source)
+        fp.drawImage(area.topLeft(), piece)
+        fp.end()
+        pm = label.pixmap()
+        dpr = pm.devicePixelRatio() if pm is not None and not pm.isNull() else 1.0
+        ox = (label.width() - round(frame.width() / dpr)) // 2
+        oy = (label.height() - round(frame.height() / dpr)) // 2
+        label.update(QRect(int(area.x() / dpr) + ox - 1, int(area.y() / dpr) + oy - 1,
+                           int(area.width() / dpr) + 3, int(area.height() / dpr) + 3))
+        return True
+
+    def _erase_parts(self):
+        """The three images _erase_partial puts together, or False."""
+        rub = getattr(self, '_stroke_image', None)
+        label = self.image_label
+        pm = label.pixmap()
+        if (rub is None or pm is None or pm.isNull() or not self.current_image
+                or self._fx_layers_on() or self._live_with_effects()
+                or self.crosshair_overlay or self.grid_overlay or not self.lines_visible
+                or self._sel is not None):
+            return False
+        layer = self.active_layer
+        if layer not in self.layers or not layer.visible:
+            return False
+        index = self.layers.index(layer)
+        above = [l for l in self.layers[index + 1:] if l.visible and l.has_content()]
+        if any(l.blend != 'Normal' for l in above):
+            return False
+        if not self.image_visible and any(l.blend != 'Normal' for l in self.layers
+                                          if l.visible and l.has_content()):
+            return False
+        w, h = rub.width(), rub.height()
+        if (pm.width(), pm.height()) != (w, h):
+            return False
+        params = self._fx_view_params()
+        view = (w, h, *params)
+        fmt = QImage.Format_ARGB32_Premultiplied
+        if self.image_visible:
+            under = self._scale_pixmap(self.original_pixmap, self.current_image).toImage().convertToFormat(fmt)
+            if (under.width(), under.height()) != (w, h):
+                return False
+        else:
+            under = QImage(w, h, fmt)
+            under.fill(self.canvas_color)
+        sheet = self._under_sheet_layer()
+        below = {id(l) for l in self.layers[:index]}
+        p = QPainter(under)
+        self._paint_marks(p, w, h, *params,
+                          which=lambda l: id(l) in below or (sheet is not None and l is sheet))
+        p.end()
+        active = self._layer_image(layer, under, view) if layer.has_content() else None
+        if active is None:
+            active = QImage(w, h, fmt)
+            active.fill(Qt.transparent)
+        top = None
+        if above:
+            top = QImage(w, h, fmt)
+            top.fill(Qt.transparent)
+            ids = {id(l) for l in above}
+            p = QPainter(top)
+            self._paint_marks(p, w, h, *params, which=lambda l: id(l) in ids)
+            p.end()
+        mode = (BLEND_MODES[layer.blend] if self.image_visible
+                else QPainter.CompositionMode_SourceOver)
+        # The frame as on screen now (the layer whole), changed piece by piece.
+        frame = under.copy()
+        p = QPainter(frame)
+        p.setCompositionMode(mode)
+        p.setOpacity(layer.opacity / 100)
+        p.drawImage(0, 0, active)
+        p.setOpacity(1.0)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        if top is not None:
+            p.drawImage(0, 0, top)
+        p.end()
+        return {'under': under, 'active': active, 'above': top, 'frame': frame,
+                'mode': mode, 'opacity': layer.opacity / 100}
+
     def _live_direct_ok(self):
         """The stroke being drawn can go straight over the view: it is not
         rubbing paint out (🧽) and not drawn under the effects."""
@@ -12272,6 +12916,9 @@ class RandomImageViewer(QMainWindow):
         the view while a stroke is drawn, or None."""
         if not (getattr(self, 'is_drawing_free_stroke', False) and getattr(self, '_live_direct', False)):
             return None
+        erase = self.__dict__.get('_erase_live')
+        if erase:
+            return erase['frame'], 1.0, None        # 🧽 the view with the rub so far (see _erase_partial)
         image = getattr(self, '_stroke_image', None)
         if image is None or image.isNull():
             return None
@@ -12322,8 +12969,10 @@ class RandomImageViewer(QMainWindow):
 
         if self._brush_erasing():
             # 🧽 Erase: the stroke is not laid over the view but taken out of
-            # the active layer, so the view is made again with it (see
-            # _live_rub_image), the way the ⌫ eraser shows its stroke.
+            # the active layer - only where it changed (see _erase_partial),
+            # else the view is made again with it (see _live_rub_image).
+            if self._erase_partial():
+                return
             if self.current_image:
                 self.display_image(self.current_image)
             return
@@ -12400,7 +13049,9 @@ class RandomImageViewer(QMainWindow):
             painter.end()
         try:
             import numpy as np
-            alpha = self._image_words(image) >> 24
+            words = (image if image.format() == QImage.Format_ARGB32_Premultiplied
+                     else image.convertToFormat(QImage.Format_ARGB32_Premultiplied))
+            alpha = self._image_words(words) >> 24
             rows = np.flatnonzero(alpha.any(1))
             if not len(rows):
                 return None
@@ -12434,7 +13085,13 @@ class RandomImageViewer(QMainWindow):
 
     def _live_with_effects(self):
         """Whether the stroke being drawn goes under the effects as it is
-        drawn (an effects layer, an effect on, a still picture)."""
+        drawn (an effects layer, an effect on, a still picture). Not in
+        ◧ Studio while the effects are for the picture only: the canvas
+        never gets them, and running them over the whole view several times
+        a second (a value filter ~70 ms each) made painting and erasing
+        there stall - a stroke over the picture gets them when the pen lifts."""
+        if self._studio_fx_picture_only():
+            return False
         return (self.active_layer.effects and self._any_effect_on()
                 and self.lines_visible and self.image_visible and self.current_image
                 and not is_video_file(self.current_image)
@@ -12619,6 +13276,9 @@ class RandomImageViewer(QMainWindow):
                 thickness=max(1, int(self.line_thickness)),
                 color=QColor(self.line_color))
             stroke.erase = rubbing
+            # Its width in picture pixels as drawn now: in the layer's image
+            # it stays exactly as seen when the pen lifted, and zooms with it.
+            stroke.pic_width = max(1, int(self.line_thickness)) / self._view_scale()
             self.drawn_free_strokes.append(stroke)
             self._undo_stack.append('free_stroke')
             print(f"Stroke completed with {len(self.current_stroke)} points, total strokes: {len(self.drawn_free_strokes)}")
@@ -12631,6 +13291,7 @@ class RandomImageViewer(QMainWindow):
         self.current_stroke = None
         self.is_drawing_free_stroke = False
         self._live_direct, self._live_dirty = False, None
+        self._erase_live = None
         self.stroke_update_timer.stop()
         self.drawing_cache = None
         self.temp_stroke_overlay = None
@@ -12814,8 +13475,8 @@ class RandomImageViewer(QMainWindow):
             btn.setText("👁" if checked else "🙈")  # Eye open/closed
             btn.setToolTip("Hide guides (ruler lines, free lines, polylines) - what is painted stays"
                            if checked else "Show guides (ruler lines, free lines, polylines)")
-        for layer in self.layers:
-            layer.raster = None         # laid again with / without them
+        # (Guides are drawn over each layer's image, never into it: nothing
+        # to lay again.)
         # Clear LUT cache since line visibility changed
         if hasattr(self, '_lut_process_cache'):
             self._lut_process_cache.clear()
@@ -12918,10 +13579,16 @@ class RandomImageViewer(QMainWindow):
         try:
             import tempfile
 
+            # The drawing area's size in screen pixels (Windows scaling in):
+            # the sketch covers the window at 100 %, a pixel a pixel.
             label = getattr(self, 'image_label', None)
             size = label.size() if label is not None else None
-            width = max(640, size.width() if size is not None else 1280)
-            height = max(480, size.height() if size is not None else 800)
+            try:
+                dpr = float(label.devicePixelRatioF()) if label is not None else 1.0
+            except Exception:
+                dpr = 1.0
+            width = max(640, round(size.width() * dpr) if size is not None else 1280)
+            height = max(480, round(size.height() * dpr) if size is not None else 800)
 
             canvas = QPixmap(width, height)
             canvas.fill(QColor(*self._CANVAS_FILL))
@@ -15612,6 +16279,30 @@ class RandomImageViewer(QMainWindow):
             else:
                 self.status.showMessage(f"LUT strength: {value}% (no LUT selected)")
 
+    def zoom_actual_size(self):
+        """⟲: the picture at its real size - 100 %, one pixel of the file per
+        pixel of the screen. Clicked again at 100 %: fitted to the window."""
+        label = getattr(self, 'image_label', None)
+        per = self._real_pixel_scale() if label is not None else None
+        if per is None or per <= 0:
+            return self.reset_zoom()
+        target = 1.0 / per
+        if abs(label.zoom_factor - target) <= 0.01 * target:
+            self.reset_zoom()
+            self.status.showMessage("Fitted to the window - ⟲ again for the real size (100 %)", 3000)
+            return
+        clamped = max(label.min_zoom, min(label.max_zoom, target))
+        label.zoom_factor = clamped
+        label.pan_offset_x = label.pan_offset_y = 0
+        if self.current_image:
+            self._smart_zoom_display()
+        self._update_zoom_readout()
+        if clamped != target:
+            self.status.showMessage(f"As close to the real size as the zoom goes ({clamped * per * 100:.0f} %)", 3000)
+        else:
+            self.status.showMessage("Real size: 100 %, one picture pixel per screen pixel - "
+                                    "⟲ again to fit the window", 3000)
+
     def reset_zoom(self):
         """Reset image zoom and pan to 100% with smart LUT caching"""
         if self.image_label:
@@ -15835,6 +16526,220 @@ class RandomImageViewer(QMainWindow):
             timer.timeout.connect(self._settle_view)
         timer.start()
 
+    def _heavy_view(self):
+        """True when a full redraw runs effects over the view each time:
+        layers under the effects, or an effect the fast path cannot keep."""
+        return bool(self._fx_layers_on() or getattr(self, 'value_filter_enabled', False)
+                    or getattr(self, 'edge_detection_enabled', False)
+                    or getattr(self, 'color_groups_enabled', False)
+                    or getattr(self, 'object_groups_enabled', False)
+                    or getattr(self, 'form_lines_enabled', False)
+                    or getattr(self, 'curves_enabled', False))
+
+    def _gpu_view_get(self):
+        """The GPU window (made once), or None where OpenGL will not."""
+        gpu = getattr(self, '_gpu_view', None)
+        label = getattr(self, 'image_label', None)
+        if gpu is None and not getattr(self, '_gpu_view_tried', True) and label is not None:
+            self._gpu_view_tried = True
+            try:
+                from random_image_viewer.widgets.gpu_view import GpuView
+                gpu = self._gpu_view = GpuView(self, label)
+            except Exception as e:
+                print(f"🎮 GPU view off: {e}")
+                gpu = None
+        return gpu if gpu is not None and not gpu.failed else None
+
+    def _gpu_scene(self):
+        """(background, items, overlay) of the view now for the GPU window -
+        the picture as shown (effects in) and each layer's own image through
+        the view, the guides over them - or None where it cannot show it."""
+        label = getattr(self, 'image_label', None)
+        pic = getattr(self, 'original_pixmap', None)
+        path = self.current_image
+        if (label is None or pic is None or pic.isNull() or not path
+                or is_video_file(path) or is_animated_image(path) or is_audio_file(path)
+                or getattr(self, '_pdf_doc', None) is not None or self._frame_timer.isActive()
+                or not self.image_visible or self._picture_look() != (100, 'Normal')
+                or self._picture_underlay() is not None or self._sel is not None):
+            return None
+        w, h = label.width(), label.height()
+        params = self._fx_view_params()
+        view = (w, h, *params)
+        original_size, sx, sy, draw_x, draw_y = params
+        items = []
+        pic_tf = QTransform()
+        pic_tf.translate(draw_x, draw_y)
+        pic_tf.scale(original_size.width() * sx / pic.width(), original_size.height() * sy / pic.height())
+        items.append((pic, pic_tf, 1.0, None, None))
+        guides_all = []
+        if self.lines_visible:
+            to_view = self._layer_view_transform(view)
+            for layer in self.layers:
+                if not layer.visible or not layer.has_content():
+                    continue
+                marks = list(self._ordered_marks(layer))
+                paint = [(kind, m) for kind, m in marks if not self._is_guide(kind, m)]
+                guides_all += [(kind, m) for kind, m in marks if self._is_guide(kind, m)]
+                canvas, rect, k = self._layer_canvas(layer, paint)
+                source = self._canvas_lit(layer, canvas, k) if layer.impasto else canvas
+                to_picture = QTransform()
+                to_picture.translate(rect.x(), rect.y())
+                to_picture.scale(1.0 / k, 1.0 / k)
+                mode = BLEND_MODES[layer.blend] if layer.blend != 'Normal' else None
+                items.append((source, to_picture * to_view, layer.opacity / 100.0, mode, None))
+        overlay = None
+        if guides_all:
+            overlay = lambda p, g=guides_all, v=view: self._paint_layer_marks(p, g, *v)
+        return self.canvas_color, items, overlay
+
+    def _gpu_warm_up(self):
+        """Shown once see-through and put away: OpenGL starting up took more
+        than a second, the first zoom of a session froze for it."""
+        if getattr(self, '_view_in_motion', False) or getattr(self, 'is_drawing_free_stroke', False):
+            QTimer.singleShot(2000, self._gpu_warm_up)
+            return
+        if not self.isVisible() or self.isMinimized():
+            return
+        try:
+            # 🌊🧊 Smear / Push kernels built now too (see drag_gpu).
+            processor = getattr(self, 'gpu_processor', None)
+            if processor is not None and processor.is_available():
+                from random_image_viewer.drawing import drag_gpu
+                drag_gpu.use_gpu(processor)
+                drag_gpu.prebuild()
+        except Exception as e:
+            print(f"GPU kernels not built ahead: {e}")
+        gpu = self._gpu_view_get()
+        if gpu is None or gpu.isVisible():
+            return
+        try:
+            gpu.ensure_shown()
+            gpu.set_scene(self.canvas_color, [])
+            gpu.repaint()
+            QTimer.singleShot(300, lambda: None if gpu.active else gpu.put_away())
+        except Exception as e:
+            print(f"GPU warm-up failed: {e}")
+
+    def _gpu_frame(self):
+        """Zooming / panning: the view drawn on the graphics card - a
+        fraction of a ms a step, whole (see GpuView). Only once its images
+        are on the graphics card: the window shows see-through first and
+        takes them, the plain path drawing meanwhile - a window shown
+        waiting for them was black. True when it
+        showed one; the plain canvas takes over once the view rests."""
+        if not getattr(self, '_view_in_motion', False) or getattr(self, 'is_drawing_free_stroke', False):
+            return False
+        gpu = self._gpu_view_get()
+        if gpu is None:
+            return False
+        try:
+            scene = self._gpu_scene()
+            if scene is None:
+                return False
+            if not gpu.active and not gpu.ready_for(scene[1]):
+                # Not on the graphics card yet: send them now (see-through)
+                # and draw this step the plain way.
+                self._gpu_show(gpu)
+                gpu.set_scene(*scene)
+                return False
+            label = self.image_label
+            if not gpu.active:
+                # The tool panels lying on the canvas, drawn over it as they look.
+                gpu.grab_panels([w for w in label.children()
+                                 if isinstance(w, QWidget) and not w.isWindow() and w.isVisible()])
+            self._gpu_show(gpu)
+            gpu.set_scene(*scene)
+            if not gpu.active:
+                gpu.activate()
+            return not gpu.failed
+        except Exception as e:
+            print(f"🎮 GPU frame failed: {e}")
+            return False
+
+    def _gpu_show(self, gpu):
+        """The GPU window there (see-through until used), the floating
+        panels (Brush, Layers ...) raised over it at once - raised only once
+        it was seen, they were covered for a frame (a blink)."""
+        if gpu.isVisible():
+            return
+        gpu.ensure_shown()
+        for w in self._panel_windows():
+            if w is not gpu:
+                w.raise_()
+
+    def _hide_gpu_view(self):
+        """The plain canvas shows again: drawn now, on screen, and the GPU
+        window goes away a moment after - not before it is there (a blink)."""
+        gpu = getattr(self, '_gpu_view', None)
+        if gpu is None:
+            return
+        if not gpu.active:
+            gpu.put_away()
+            return
+        try:
+            self.image_label.repaint()
+        except Exception:
+            pass
+        gpu.put_away_soon()
+
+    def _finish_view_motion(self):
+        """A stroke (or anything that needs the plain canvas) is starting
+        while the GPU view still shows: the canvas made for this view now,
+        then the GPU view put away."""
+        gpu = getattr(self, '_gpu_view', None)
+        if gpu is None or not gpu.active:
+            return
+        if not getattr(self, '_view_in_motion', False):
+            gpu.put_away()      # at rest already, only going away: the canvas is there
+            return
+        timer = getattr(self, '_view_settle_timer', None)
+        if timer is not None:
+            timer.stop()
+        self._view_in_motion = False
+        self._settle_job = None
+        if self.current_image:
+            self._smart_zoom_display(settled=True)
+        self._hide_gpu_view()
+
+    def _motion_frame(self):
+        """Zooming / panning with effects on: the last finished frame moved
+        and scaled to the new view - a few ms - instead of the picture, the
+        layers and the effects done again for every step (~250 ms each with
+        a value filter over a few hundred strokes: the app seemed to hang).
+        The real frame follows once the view rests (see _begin_view_motion),
+        the layers laid again a slice at a time. True when it showed one."""
+        kept = getattr(self, '_shown_frame', None)
+        label = getattr(self, 'image_label', None)
+        if (kept is None or label is None or kept[0] != self.current_image
+                or not getattr(self, '_view_in_motion', False) or not self._heavy_view()
+                or getattr(self, '_pdf_doc', None) is not None or self._video_playing
+                or self.image_label.is_animation_active() or self._frame_timer.isActive()):
+            return False
+        _path, old, old_tf = kept
+        w, h = label.width(), label.height()
+        try:
+            params = self._fx_view_params()
+            new_tf = self._layer_view_transform((w, h, *params))
+        except Exception:
+            return False
+        back, ok = old_tf.inverted()
+        if not ok:
+            return False
+        # At the screen's own resolution: drawn 1:1, where a window-sized
+        # frame was scaled up again by the label on every paint (150 % display).
+        dpr = label.devicePixelRatioF() or 1.0
+        frame = QPixmap(max(1, round(w * dpr)), max(1, round(h * dpr)))
+        frame.setDevicePixelRatio(dpr)
+        frame.fill(self.canvas_color)
+        p = QPainter(frame)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setTransform(back * new_tf)
+        p.drawPixmap(0, 0, old)
+        p.end()
+        label.setPixmap(frame)
+        return True
+
     def _smart_zoom_display(self, settled=False):
         """OPTIMIZED zoom display - avoids GPU reprocessing during interactive zoom"""
         if not self.current_image:
@@ -15842,6 +16747,8 @@ class RandomImageViewer(QMainWindow):
         self._update_zoom_readout()
         if not settled:
             self._begin_view_motion()
+            if self._gpu_frame() or self._motion_frame():
+                return
 
         # A playing film: refit the frame on screen, the next one follows suit.
         if self._frame_timer.isActive():
@@ -16558,6 +17465,59 @@ class RandomImageViewer(QMainWindow):
         if preview is not None:
             preview.hide()
 
+    # -- panels away while another program is in front --------------------
+
+    def _on_app_state(self, state):
+        """Another program came to the front (or Show desktop): the floating
+        panels go too, instead of staying on top of it; back with this app.
+        Checked a moment later, so a brief switch does not blink them."""
+        if state == Qt.ApplicationActive:
+            panels, self._panels_hidden_for_away = getattr(self, '_panels_hidden_for_away', []), []
+            for w in panels:
+                try:
+                    w.show()
+                except RuntimeError:
+                    pass
+            if panels:
+                self._dock_place_soon()
+        else:
+            QTimer.singleShot(300, self._hide_panels_if_away)
+
+    def _hide_panels_if_away(self):
+        if (QApplication.applicationState() == Qt.ApplicationActive
+                or getattr(self, '_panels_hidden_for_away', None)
+                or self.windowState() & Qt.WindowMinimized):
+            return
+        if self._foreground_is_topmost():
+            return      # a small always-on-top helper (a colour palette ...): keep them
+        panels = self._panel_windows()
+        for w in panels:
+            w.blockSignals(True)
+            try:
+                w.hide()
+            finally:
+                w.blockSignals(False)
+        self._panels_hidden_for_away = panels
+        preview = getattr(self, '_color_snap_preview', None)
+        if preview is not None:
+            preview.hide()
+
+    @staticmethod
+    def _foreground_is_topmost():
+        """Windows: the window in front is an always-on-top one (palette
+        apps, overlays) - used beside this one, not instead of it."""
+        if sys.platform != 'win32':
+            return False
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            return bool(user32.GetWindowLongW(hwnd, -20) & 0x00000008)     # WS_EX_TOPMOST
+        except Exception:
+            return False
+
     def _show_panels_after_minimize(self):
         """Restored: the panels hidden by the minimise come back where they were."""
         panels, self._panels_hidden_by_minimize = getattr(self, '_panels_hidden_by_minimize', []), []
@@ -16683,6 +17643,8 @@ class RandomImageViewer(QMainWindow):
         ``time.perf_counter()`` taken at the top of main) is the fallback when
         that is unavailable, and measures from Python entry instead.
         """
+        # The GPU view's OpenGL set up now, while idle, not on the first zoom.
+        QTimer.singleShot(2500, self._gpu_warm_up)
         try:
             seconds = process_uptime_seconds()
             source = "process launch"

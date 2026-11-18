@@ -61,6 +61,12 @@ class BrushWindow(QWidget):
                                              "them - 100 % and they touch"),
         ('rake_wobble', 'Wobble', (0, 100), '%', "Rake: how much the tines differ in size, place and "
                                                  "strength, like a worn rake - 0 % lays ruled lines"),
+        ('smoothing', 'Smoothing', (0, 100), '%',
+         "Steadies the pen's line: shaky slow lines come out smooth, quick strokes "
+         "hardly lag. 0 %: the pen's points exactly as they come"),
+        ('pressure_curve', 'Firmness', (-50, 50), '',
+         "Pen pressure curve: below 0 a light touch already gives a lot (soft pen), "
+         "above 0 it takes a firmer press. 0: as the pen reports it"),
         ('spacing', 'Spacing', (1, 200), '%', "Gap between stamps, as a share of their size"),
         ('angle', 'Angle', (0, 359), '°', "Turns every stamp by this much"),
         ('angle_jitter', 'Angle ±', (0, 180), '°', "Random turn per stamp, either way"),

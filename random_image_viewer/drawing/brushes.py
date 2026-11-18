@@ -20,6 +20,7 @@ import colorsys
 import math
 import os
 import random
+import time
 
 import numpy as np
 from PySide6.QtCore import Qt, QPointF, QRect, QRectF
@@ -74,6 +75,8 @@ DEFAULT_SETTINGS = {
     'smear_edge': 25,           # Smear: % how much it must stand out to be grabbed
     'smear_blur': 20,           # Smear: % how much the hairs also blend what they pass
     'push_ice': 40,             # Push: % how unevenly the pixels move (cracks the paint like ice)
+    'smoothing': 25,            # %: the pen's way steadied (1€ filter; see StampTrail._smoothed)
+    'pressure_curve': 0,        # -50..50: < 0 a light touch counts more, > 0 a firmer press needed
 }
 
 MODES = ('paint', 'blend', 'smudge', 'history', 'pick', 'erase', 'smear', 'push')
@@ -998,6 +1001,10 @@ class StampTrail:
                                for i in range(PARTICLE_SETS)]
         self._last = None       # (x, y, pressure) of the previous point
         self._pending = None    # first point, waiting for a real pressure
+        self._filter = None     # Smoothing's 1€ filter state (see _smoothed)
+        self._curve_pts = []    # the last (up to 4) smoothed points, for the curve
+        self._curve_n = 0       # how many came this stroke
+        self._raw_last = None   # the pen's own last point
         self._travel = 0.0      # distance walked since the last stamp
         self._direction = None  # smoothed unit vector in picture space
         self._tilt = None       # smoothed lean, picture space
@@ -1038,9 +1045,18 @@ class StampTrail:
     def add(self, x, y, pressure=None, tilt=None):
         """Feed the next point (picture coords). *pressure* None: not known
         yet (the first point of a stroke). *tilt*: the pen's (xTilt, yTilt) in
-        degrees, or None. Returns the stamps it made."""
+        degrees, or None. Returns the stamps it made.
+
+        The pen's points are smoothed (Smoothing: a 1€ filter - steady
+        when the pen moves slowly, hardly any lag when it moves fast) and
+        joined by curves through them (centripetal Catmull-Rom) instead of
+        straight pieces - a quick curve showed its corners. The curve to a
+        point is laid when the next one comes (one pen event later);
+        finish() lays the rest, up to where the pen lifted."""
         if not self._pressure_on:
             pressure = 1.0
+        elif pressure is not None:
+            pressure = self._pressure_curve(pressure)
         if tilt is not None and math.hypot(*tilt) >= TILT_MIN:
             lean = self._picture_direction(tilt[0], tilt[1])
             if lean is not None:
@@ -1048,6 +1064,103 @@ class StampTrail:
         if pressure is None:
             self._pending = (x, y)
             return []
+        self._raw_last = (x, y, pressure)
+        new = []
+        for px, py, pp in self._through(x, y, pressure):
+            new += self._walk(px, py, pp)
+        return new
+
+    # -- the pen's way: pressure curve, smoothing, curves ----------------
+
+    def _pressure_curve(self, pressure):
+        """Pressure through the brush's Firmness: below 0 a light touch
+        counts for more (soft), above 0 it takes a firmer press."""
+        firm = self.settings.get('pressure_curve', 0)
+        pressure = max(0.0, min(1.0, pressure))
+        return pressure ** (2.0 ** (firm / 50.0)) if firm else pressure
+
+    def _smoothed(self, x, y):
+        """(x, y) through the 1€ filter (Casiez et al. 2012), in screen px
+        and seconds: the cutoff rises with the pen's speed."""
+        s = max(0.0, min(1.0, self.settings.get('smoothing', 0) / 100.0))
+        if s <= 0.0:
+            return x, y
+        now = time.perf_counter()
+        sx, sy = x / self._unit, y / self._unit
+        f = self._filter
+        if f is None:
+            self._filter = [sx, sy, 0.0, 0.0, now]
+            return x, y
+        fx, fy, dx, dy, t = f
+        dt = max(1.0 / 240.0, now - t)          # bursts of events: not a near-zero step
+        min_cutoff = 10.0 ** (1.0 - 2.0 * s)    # Hz: ~10 (light) .. 0.1 (heavy)
+        beta = 0.04 * (1.0 - s) ** 2 + 0.0015
+
+        def alpha(cutoff):
+            tau = 1.0 / (2.0 * math.pi * cutoff)
+            return 1.0 / (1.0 + tau / dt)
+
+        a_d = alpha(15.0)       # the speed itself followed quickly: a fast stroke opens the filter at once
+        dx += (((sx - fx) / dt) - dx) * a_d
+        dy += (((sy - fy) / dt) - dy) * a_d
+        a = alpha(min_cutoff + beta * math.hypot(dx, dy))
+        fx += (sx - fx) * a
+        fy += (sy - fy) * a
+        self._filter = [fx, fy, dx, dy, now]
+        return fx * self._unit, fy * self._unit
+
+    def _through(self, x, y, pressure):
+        """The points to walk to for this pen point: the curve from two
+        points back to the last one (see add)."""
+        x, y = self._smoothed(x, y)
+        pts = self._curve_pts
+        pts.append((x, y, pressure))
+        del pts[:-4]
+        self._curve_n += 1
+        if self._curve_n == 1:
+            return [(x, y, pressure)]
+        if self._curve_n == 2:
+            return []
+        a = pts[-4] if len(pts) >= 4 else pts[-3]
+        return self._spline(a, pts[-3], pts[-2], pts[-1])
+
+    def _spline(self, a, b, c, d):
+        """Points along the centripetal Catmull-Rom curve from *b* to *c*
+        (*a*, *d* its neighbours), every ~1.5 screen px, *c* last."""
+        length = math.hypot(c[0] - b[0], c[1] - b[1]) / self._unit
+        if length < 1e-6:
+            return [c]
+        n = max(1, min(64, int(math.ceil(length / 1.5))))
+        if n == 1:
+            return [c]
+
+        def knot(t, p, q):
+            return t + max(math.hypot(q[0] - p[0], q[1] - p[1]), 1e-4) ** 0.5
+
+        t0 = 0.0
+        t1 = knot(t0, a, b)
+        t2 = knot(t1, b, c)
+        t3 = knot(t2, c, d)
+
+        def lerp(p, q, ta, tb, t):
+            u = (t - ta) / (tb - ta)
+            return (p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u)
+
+        out = []
+        for k in range(1, n):
+            t = t1 + (t2 - t1) * k / n
+            a1 = lerp(a, b, t0, t1, t)
+            a2 = lerp(b, c, t1, t2, t)
+            a3 = lerp(c, d, t2, t3, t)
+            b1 = lerp(a1, a2, t0, t2, t)
+            b2 = lerp(a2, a3, t1, t3, t)
+            px, py = lerp(b1, b2, t1, t2, t)
+            out.append((px, py, b[2] + (c[2] - b[2]) * k / n))
+        out.append(c)
+        return out
+
+    def _walk(self, x, y, pressure):
+        """Lay stamps along the straight way from the last point to (x, y)."""
         new = []
         first = False
         if self._pending is not None:
@@ -1099,9 +1212,19 @@ class StampTrail:
         return new
 
     def finish(self, pressure=1.0):
-        """A tap that never moved still leaves one stamp, at *pressure*."""
+        """The pen lifted: the curve's last piece, up to where it lifted. A
+        tap that never moved still leaves one stamp, at *pressure*."""
         if self._pending is not None:
             self.add(*self._pending, pressure=pressure)
+        elif self._curve_n >= 2:
+            pts = self._curve_pts
+            a = pts[-3] if len(pts) >= 3 else pts[-2]
+            for px, py, pp in self._spline(a, pts[-2], pts[-1], pts[-1]):
+                self._walk(px, py, pp)
+            raw = self._raw_last
+            if raw is not None and math.hypot(raw[0] - pts[-1][0], raw[1] - pts[-1][1]) > 0.5 * self._unit:
+                self._walk(*raw)        # smoothing lagged: on to the pen's own last place
+        self._curve_n = 0
         return self.stamps
 
     def _stamp_size(self, pressure):
@@ -1893,6 +2016,8 @@ class DragStroke:
         self.pixels = np.frombuffer(self.work.bits(), np.uint8, count=line * h).reshape(
             h, line)[:, :w * 4].reshape(h, w, 4)
         self.reached = np.zeros((h, w), np.uint8)     # where the tip went (compose's alpha)
+        self._cl = None         # the arrays on the graphics card (drag_gpu.DragGpu), or None
+        self._cl_tried = False
         # The stroke's ends feathered: how far along the stroke (device px)
         # each pixel was laid, so compose() fades the smear in over the first
         # stretch and out over the last - it began and ended in a straight cut.
@@ -1913,6 +2038,11 @@ class DragStroke:
         # averaged. Long, it spread a thin line's colour too thin to see -
         # the load is what carries it whole.
         self.blend = 0.5 + 60.0 * clamp(blur) ** 2
+        # ... and the wet drag itself (Mix): how far a hair carries the
+        # colour it passed, the paint pulled along as a mass. Only
+        # what stands out was carried before - a flat colour, all of it
+        # alike, hardly moved even with everything at full.
+        self.pull = 120.0 * clamp(drag) ** 1.5
         self.hairs = None       # (S, 4) float32: each hair's blend of what it passed
         self.load = None        # (S, 4) float32: the paint each hair grabbed and carries ...
         self.amount = None      # (S,) float32: ... and how much of it is left, 0..1
@@ -1921,6 +2051,40 @@ class DragStroke:
         self.way = None         # the stroke's way, smoothed
         self._masks = {}
         self._grids = {}
+
+    # The graphics card pays from about this tip size (screen px): each step
+    # costs ~0.5 ms there whatever its size, so smaller tips are quicker in
+    # numpy (measured: Smear wins from ~500 px, Push from ~250 px).
+    CL_MIN_TIP = 450
+
+    def _cl_on(self, tip=0.0):
+        """The stroke's arrays on the graphics card (made at the first
+        step, when the tip is big enough to gain), or None - numpy then
+        (see drag_gpu)."""
+        if not self._cl_tried:
+            self._cl_tried = True
+            if tip < self.CL_MIN_TIP:
+                return None
+            from . import drag_gpu
+            if drag_gpu.available():
+                try:
+                    self._cl = drag_gpu.DragGpu(self.pixels, self.reached, self.laid_at)
+                except Exception as e:
+                    drag_gpu.failed(e)
+                    self._cl = None
+        return self._cl
+
+    def _cl_off(self, error):
+        """The graphics card failed mid-stroke: its arrays back, numpy on."""
+        from . import drag_gpu
+        drag_gpu.failed(error)
+        gpu, self._cl = self._cl, None
+        if gpu is not None:
+            try:
+                h, w = self.reached.shape
+                gpu.fetch(0, 0, w, h, self.pixels, self.reached, self.laid_at)
+            except Exception:
+                pass
 
     def _mask(self, texture, level, tip, m):
         """The tip's grey as the stamp lays it (turned and sized by *m*'s
@@ -2004,6 +2168,7 @@ class DragStroke:
                 ux, uy = self.way[0] * 0.85 + ux * 0.15, self.way[1] * 0.85 + uy * 0.15
                 n = math.hypot(ux, uy) or 1.0
                 ux, uy = ux / n, uy / n
+            prev_way = self.way
             self.way = (ux, uy)
             vx, vy = -uy, ux
             _tip_a, grey = self._mask(texture, level, tip, m)
@@ -2021,10 +2186,19 @@ class DragStroke:
             inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
             if not inside.any():
                 continue
-            np.clip(ix, 0, w - 1, out=ix)
-            np.clip(iy, 0, h - 1, out=iy)
-            old = self.pixels[iy, ix].astype(np.float32)          # (steps, hairs, 4)
-            met = old.mean(0)
+            gpu = self._cl_on(on_screen)
+            met = None
+            if gpu is not None:
+                try:
+                    met = gpu.met(fx_c, fy_c, ux, uy, vx, vy, len(ss), half, len(js))
+                except Exception as e:
+                    self._cl_off(e)
+                    gpu = None
+            if met is None:
+                np.clip(ix, 0, w - 1, out=ix)
+                np.clip(iy, 0, h - 1, out=iy)
+                old = self.pixels[iy, ix].astype(np.float32)      # (steps, hairs, 4)
+                met = old.mean(0)
             self._fit_hairs(met)
             f32 = np.float32
             # The load runs out as it is laid along ...
@@ -2047,9 +2221,27 @@ class DragStroke:
             safe = np.maximum(total, 1e-6)[:, None]
             self.load = (self.load * self.amount[:, None] + met * room[:, None]) / safe
             self.amount = total.astype(f32)
-            # The plain blend (Blur) - of what is left once the hair took its
-            # share - and what the hair has been passing.
-            self.hairs += (ground - self.hairs) * f32(1.0 - math.exp(-travelled / self.blend))
+            # The plain blend (Blur) and the wet drag (Mix, longer the harder
+            # the pen presses) - of what is left once the hair took its share -
+            # and what the hair has been passing.
+            press = max(0.0, min(1.0, stamp[4]))
+            reach = self.blend + self.pull * (0.25 + 0.75 * press)
+            self.hairs += (ground - self.hairs) * f32(1.0 - math.exp(-travelled / reach))
+            if len(self.hairs) > 2:
+                # Neighbouring hairs share a little of their colour: each
+                # carried its own, and rounded to whole pixels on a slant
+                # they laid it in alternating rows - thin stripes that
+                # turned with the stroke. (The tip's own streaks stay: they
+                # come from how much each hair grabs.)
+                for name, rate in (('hairs', 0.5), ('load', 0.5)):
+                    a = getattr(self, name)
+                    soft = a.copy()
+                    soft[1:-1] = (a[:-2] + 2.0 * a[1:-1] + a[2:]) * f32(0.25)
+                    a += (soft - a) * f32(rate)
+                amt = self.amount
+                soft = amt.copy()
+                soft[1:-1] = (amt[:-2] + 2.0 * amt[1:-1] + amt[2:]) * f32(0.25)
+                self.amount = (amt + (soft - amt) * f32(0.5)).astype(f32)
             self.around += (met - self.around) * f32(1.0 - math.exp(-travelled / 12.0))
             # Each hair lays the load it brought (what it grabs here goes
             # down from the next step on, moved), its blend where it is spent.
@@ -2063,16 +2255,64 @@ class DragStroke:
             # the hair, the picture as it was showed through - a particle
             # moved on still showed at its old place.
             cover = np.where(strength > 0.02, 1.0, 0.0).astype(f32) * min(1.0, stamp[4])
-            touched = inside & (cover[None, :] > 0.02)
+            # Laid pixel by pixel over the area the tip swept since the last
+            # step: each pixel takes the hair it lies under. (Laid as one
+            # line per hair, the lines fanned apart round a bend and the
+            # paint between them showed through - fans of fine rays.) Round
+            # a bend the area reaches back over the wedge the last step's
+            # left open on the outside.
+            reach_back = 1.0
+            if prev_way is not None:
+                turn = abs(prev_way[0] * vx + prev_way[1] * vy)      # sin of the turn
+                reach_back += half * min(1.0, turn) * 1.2
+            corners_x = [fx_c + vx * half, fx_c - vx * half,
+                         fx_c - ux * (travelled + reach_back) + vx * half,
+                         fx_c - ux * (travelled + reach_back) - vx * half]
+            corners_y = [fy_c + vy * half, fy_c - vy * half,
+                         fy_c - uy * (travelled + reach_back) + vy * half,
+                         fy_c - uy * (travelled + reach_back) - vy * half]
+            bx0, bx1 = max(0, int(math.floor(min(corners_x)))), min(w, int(math.ceil(max(corners_x))) + 1)
+            by0, by1 = max(0, int(math.floor(min(corners_y)))), min(h, int(math.ceil(max(corners_y))) + 1)
+            if bx0 >= bx1 or by0 >= by1:
+                continue
+            mixing = (strength * f32(0.45 + 0.5 * press)).astype(f32)
+            if gpu is not None:
+                try:
+                    gpu.lay((bx0, by0, bx1, by1), fx_c, fy_c, ux, uy, vx, vy, travelled, reach_back,
+                            half, lay, mixing, cover, self.travel)
+                    box = QRect(bx0 + ox, by0 + oy, bx1 - bx0, by1 - by0)
+                    self._recent.append((self.travel, box))
+                    dirty = box if dirty is None else dirty.united(box)
+                    continue
+                except Exception as e:
+                    self._cl_off(e)
+            gx = np.arange(bx0, bx1, dtype=f32)[None, :] - f32(fx_c)
+            gy = np.arange(by0, by1, dtype=f32)[:, None] - f32(fy_c)
+            back = -(gx * f32(ux) + gy * f32(uy))           # how far behind the tip (along)
+            across = gx * f32(vx) + gy * f32(vy)
+            hair = np.rint(across * 2.0).astype(np.intp) + 2 * half
+            inside_px = ((back >= -0.5) & (back < travelled + reach_back)
+                         & (hair >= 0) & (hair < len(strength)))
+            hair_c = np.clip(hair, 0, len(strength) - 1)
+            touched = inside_px & (cover[hair_c] > 0.02)
             if not touched.any():
                 continue
-            colour = np.clip(np.broadcast_to(lay[None, :, :], old.shape) + 0.5, 0, 255).astype(np.uint8)
-            self.pixels[iy[touched], ix[touched]] = colour[touched]
-            shown = np.broadcast_to((cover * 255.0).astype(np.uint8)[None, :], touched.shape)[touched]
-            ys_t, xs_t = iy[touched], ix[touched]
+            ys_t, xs_t = np.nonzero(touched)
+            hs = hair_c[ys_t, xs_t]
+            ys_t = ys_t + by0
+            xs_t = xs_t + bx0
+            # Mixed into what is there, not laid over it: each pixel goes
+            # part of the way to its hair's colour (mixing, above) - as far
+            # as the tip is dense there (soft at its rim) and the pen
+            # presses. Laid whole, a smear was a solid blob of the colour it
+            # started on.
+            here = self.pixels[ys_t, xs_t].astype(f32)
+            colour = here + (lay[hs] - here) * mixing[hs][:, None]
+            self.pixels[ys_t, xs_t] = np.clip(colour + 0.5, 0, 255).astype(np.uint8)
+            shown = (cover[hs] * 255.0).astype(np.uint8)
             self.reached[ys_t, xs_t] = np.maximum(self.reached[ys_t, xs_t], shown)
-            laid = np.broadcast_to((self.travel - ss)[:, None], touched.shape)[touched]
-            self.laid_at[ys_t, xs_t] = laid
+            behind = back[touched]
+            self.laid_at[ys_t, xs_t] = (self.travel - np.clip(behind, 0.0, travelled)).astype(f32)
             box = QRect(int(xs_t.min()) + ox, int(ys_t.min()) + oy,
                         int(xs_t.max() - xs_t.min()) + 1, int(ys_t.max() - ys_t.min()) + 1)
             self._recent.append((self.travel, box))
@@ -2128,6 +2368,13 @@ class DragStroke:
     def compose(self, rect):
         """The dragged pixels inside device *rect*, where the brush went."""
         local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        if self._cl is not None:
+            # The pixels live on the graphics card: this part of them back.
+            try:
+                self._cl.fetch(local.x(), local.y(), local.x() + local.width(),
+                               local.y() + local.height(), self.pixels, self.reached, self.laid_at)
+            except Exception as e:
+                self._cl_off(e)
         out = self.work.copy(local)
         part = (slice(local.y(), local.y() + local.height()), slice(local.x(), local.x() + local.width()))
         reached = self.reached[part].astype(np.float32)
@@ -2162,6 +2409,8 @@ class PushStroke(DragStroke):
     pushed (HeavyPaint's Blur Ice); 0 is a clean liquify push.
 
     Same face as DragStroke (add / compose, feathered ends)."""
+
+    CL_MIN_TIP = 200
 
     def __init__(self, rect, work, strength, ice=0.4):
         super().__init__(rect, work, 0.5)
@@ -2199,7 +2448,11 @@ class PushStroke(DragStroke):
                 continue
             dx, dy = fx_c - self.last[0], fy_c - self.last[1]
             travelled = math.hypot(dx, dy)
-            if travelled < 1.0:
+            # A step moves the whole tip's square: a big tip steps further
+            # (2 % of it) - a pixel at a time, a 300 px push warped 90 000
+            # pixels per pixel moved and fell behind the pen. A whole-pixel
+            # move of a big mass looks the same in a few px steps.
+            if travelled < max(1.0, 0.02 * on_screen):
                 continue
             self.last = (fx_c, fy_c)
             self.travel += travelled
@@ -2220,6 +2473,20 @@ class PushStroke(DragStroke):
             if ax0 >= ax1 or ay0 >= ay1:
                 continue
             sx0, sy0, sx1, sy1 = ax0 - x0, ay0 - y0, ax1 - x0, ay1 - y0
+            gpu = self._cl_on(on_screen)
+            if gpu is not None:
+                try:
+                    even = (getattr(self, '_even', 0.0) + 0.6180339887) % 1.0
+                    gpu.push((ax0, ay0, ax1, ay1), x0, y0, grey, tip_a, self._lag, self._step,
+                             self.strength, self.ice, even, ux * travelled, uy * travelled,
+                             int(round(255 * min(1.0, stamp[4]))), self.travel)
+                    self._even = even
+                    box = QRect(ax0 + ox, ay0 + oy, ax1 - ax0, ay1 - ay0)
+                    self._recent.append((self.travel, box))
+                    dirty = box if dirty is None else dirty.united(box)
+                    continue
+                except Exception as e:
+                    self._cl_off(e)
             # How far each pixel goes this step: the brush's move, times the
             # tip's grey there and Strength, less its own lag (Ice) ...
             share = grey[sy0:sy1, sx0:sx1] * np.float32(self.strength)
@@ -2318,9 +2585,31 @@ def paint_stamps(painter, texture, stamps, to_display, clip=None, flat=False, hi
         painter.restore()
         return image, box.topLeft(), box == full
     scale = math.sqrt(abs(to_display.determinant()))
+    view = to_display * base
+    # The stamps build up in a buffer of their own at 16 bits a channel, and
+    # it goes on the device once: laid one by one on 8 bits, every faint
+    # stamp was rounded and a soft or see-through build-up came out in
+    # bands. (The same blend: stamps over stamps, then over the device.)
+    device = painter.device()
+    target = painter
+    buffer = None
+    box = None
+    try:
+        dw, dh = device.width(), device.height()
+    except Exception:
+        dw = dh = 0
+    if dw > 0 and dh > 0:
+        box = _stamps_box(stamps, view, math.sqrt(abs(view.determinant())) or 1.0).intersected(
+            QRect(0, 0, dw, dh))
+        if box.isEmpty():
+            return None
+        if box.width() * box.height() <= 40_000_000:
+            buffer = QImage(box.size(), QImage.Format_RGBA64_Premultiplied)
+            buffer.fill(Qt.transparent)
+            painter = QPainter(buffer)
+            view = view * QTransform.fromTranslate(-box.x(), -box.y())
     painter.save()
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-    view = to_display * base
     for x, y, size, angle, opacity, rgb in stamps:
         on_screen = size * scale
         if on_screen < 0.4 or opacity <= 0:
@@ -2342,6 +2631,12 @@ def paint_stamps(painter, texture, stamps, to_display, clip=None, flat=False, hi
         painter.setOpacity(opacity)
         painter.drawImage(0, 0, image)
     painter.restore()
+    if buffer is not None:
+        painter.end()
+        target.save()
+        target.resetTransform()
+        target.drawImage(box.topLeft(), buffer)
+        target.restore()
 
 
 def _paint_spray(painter, texture, stamps, to_display, clip=None):

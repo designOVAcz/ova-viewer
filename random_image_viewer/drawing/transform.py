@@ -30,7 +30,9 @@ def mark_points(kind, mark):
     if kind == 'free_stroke':
         stamps = getattr(mark, 'stamps', None)
         if stamps:
-            return [(s[0], s[1], s[2] / 2.0) for s in stamps]
+            # A turned tip reaches its diagonal: ~0.71 of its size (as
+            # brushes._stamps_box) - undo's patches must hold all of it.
+            return [(s[0], s[1], s[2] * 0.75) for s in stamps]
         reach = (getattr(mark, 'thickness', None) or 1) / 2.0
         return [(*_xy(p), reach) for p in mark]
     if kind == 'free_line':

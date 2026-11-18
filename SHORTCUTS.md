@@ -23,6 +23,7 @@
 | Input | Action |
 |---|---|
 | `Left` / `Right` | Previous / next image (seek ±5 s while a video plays) |
+| `Up` / `Down` | With a video or song open: previous / next clip |
 | Mouse wheel | Previous / next image (when not zoomed in) |
 | Middle-click | Next image |
 
@@ -197,6 +198,7 @@ Flip vertical has no working shortcut: the context menu lists `Ctrl+V`, but
 | `M` | Toggle mute |
 | `Left Arrow` | Seek back 5 seconds |
 | `Right Arrow` | Seek forward 5 seconds |
+| `Up Arrow` / `Down Arrow` | Previous / next clip |
 
 ## Drag & Drop
 
