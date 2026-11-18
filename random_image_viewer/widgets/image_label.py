@@ -1,9 +1,9 @@
 import time
 
-from PySide6.QtWidgets import QLabel, QApplication, QMenu
+from PySide6.QtWidgets import QLabel, QApplication, QMenu, QWidget
 from PySide6.QtGui import (QPainter, QColor, QPen, QAction, QTabletEvent, QMovie,
                            QPolygon, QRegion, QCursor, QPointingDevice)
-from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPointF, QRectF, QRect
+from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QPointF, QRectF, QRect
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink, QAudioOutput
 
 
@@ -189,6 +189,18 @@ class ImageLabel(QLabel):
 
     def paintEvent(self, event):
         viewer = self.parent_viewer
+        if viewer is not None and viewer.__dict__.get('_gpu_display'):
+            # 🎮 The canvas is on the graphics card (see RandomImageViewer.
+            # _gpu_display_frame): what would be painted here is drawn there.
+            gpu = viewer.__dict__.get('_gpu_canvas')
+            if gpu is not None and gpu.active and gpu.isVisible():
+                if not getattr(viewer, 'is_drawing_free_stroke', False):
+                    # (While a stroke is drawn its changes go there straight,
+                    # see RandomImageViewer._live_update - the label's own
+                    # repaints, the whole of it under the GPU canvas's
+                    # window, would send the whole stroke up every frame.)
+                    gpu.update_area(event.rect())   # only the piece that changed
+                return
         live = viewer.live_stroke_overlay() if viewer is not None else None
         pm = self.pixmap()
         if live is not None and pm is not None and not pm.isNull():
@@ -1439,6 +1451,26 @@ class ImageLabel(QLabel):
 
         super().mouseMoveEvent(event)
 
+    def _ui_at(self, global_point, pos):
+        """A panel or window of this app in front of the canvas at the point
+        (a floating tool window, a popup, a panel lying on the canvas), or
+        None. Windows that let input through (the GPU canvas) do not count."""
+        own = self.window()
+        for w in QApplication.topLevelWidgets():
+            if (w is own or not w.isVisible() or getattr(w, 'passes_input', False)
+                    or w.windowType() not in (Qt.Tool, Qt.Popup, Qt.ToolTip, Qt.Dialog, Qt.Window)):
+                continue
+            if w.windowType() == Qt.Window and not w.isActiveWindow():
+                continue        # another main window of the app behind: not over this one
+            if w.frameGeometry().contains(global_point):
+                return w
+        local = QPoint(int(pos.x()), int(pos.y()))
+        for child in self.children():
+            if isinstance(child, QWidget) and not child.isWindow() and child.isVisible() \
+                    and not getattr(child, 'passes_input', False) and child.geometry().contains(local):
+                return child
+        return None
+
     def _is_position_on_canvas(self, pos):
         """Check if a position is on the canvas: the picture or the background
         around it, with no UI element in front of it"""
@@ -1453,8 +1485,10 @@ class ImageLabel(QLabel):
             # Convert QPointF to QPoint for widgetAt() method
             global_point = global_pos.toPoint()
 
-            # Find which widget is actually at this position
-            widget_at_pos = QApplication.widgetAt(global_point)
+            # Find which widget is actually at this position - by the panels'
+            # own rectangles: asking Windows (QApplication.widgetAt) took
+            # ~2.5 ms, and this runs for every pen move.
+            widget_at_pos = self._ui_at(global_point, pos)
 
             # If there's a widget at this position and it's not the ImageLabel itself,
             # then we're over a UI element - return False immediately. (The
@@ -1544,8 +1578,9 @@ class ImageLabel(QLabel):
         hover = (event.type() in (QTabletEvent.TabletMove, QTabletEvent.TabletEnterProximity)
                  and self.rect().contains(event.position().toPoint()))
         if hover:
-            above = QApplication.widgetAt(event.globalPosition().toPoint())
-            hover = above is None or above is self     # not a panel lying on it
+            # Not a panel lying on it - by the panels' rectangles (see _ui_at):
+            # QApplication.widgetAt cost ~3 ms for every pen event.
+            hover = self._ui_at(event.globalPosition().toPoint(), event.position()) is None
         if hover:
             self._reassert_cursor_for_pen()
         if self.parent_viewer is not None:
@@ -1867,6 +1902,16 @@ class ImageLabel(QLabel):
             swatch_action.setChecked(self.parent_viewer.colour_swatch_shown())
             swatch_action.toggled.connect(self.parent_viewer.toggle_colour_swatch)
             menu.addAction(swatch_action)
+
+        # --- 🎮 The canvas drawn on the graphics card ---
+        if hasattr(self.parent_viewer, 'toggle_gpu_canvas'):
+            gpu_action = QAction("🎮 GPU canvas while painting", self)
+            gpu_action.setCheckable(True)
+            gpu_action.setChecked(self.parent_viewer.gpu_canvas_enabled())
+            gpu_action.setToolTip("While painting, the canvas is drawn by the graphics card: strokes "
+                                  "end at once. Off: the plain canvas, as before")
+            gpu_action.toggled.connect(self.parent_viewer.toggle_gpu_canvas)
+            menu.addAction(gpu_action)
 
         # --- 🐧 Colours from ColorPenguin (its sync set to Rebelle) ---
         if hasattr(self.parent_viewer, 'toggle_colour_sync'):

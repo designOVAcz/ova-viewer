@@ -1461,6 +1461,8 @@ class RandomImageViewer(QMainWindow):
                         layer.raster = kept
         key = key_for(rect, k)
         view = self._canvas_view(rect, k)
+        key_before = kept['image'].cacheKey() if kept is not None else None
+        self.__dict__.pop('_undo_boxes', None)
         if (kept is not None and kept['key'] == key and len(marks) < kept['count']
                 and self._undo_patches(layer, kept, marks)):
             # Undo: the patches the last marks covered, put back - not the
@@ -1485,10 +1487,17 @@ class RandomImageViewer(QMainWindow):
                         paper = QPainter(image)
                         self._paint_layer_fill(paper, layer, view)
                         paper.end()
+        laid_from = done
         if done < len(marks):
             self.__dict__.pop('_refine_wanted', None)
             with self._laying_canvas(k):
                 self._lay_marks(layer, image, marks, done, view, key)
+        if kept is not None and image is kept['image']:
+            # 🎮 Where it changed, for its texture on the graphics card.
+            rects = list(self.__dict__.pop('_undo_boxes', None) or [])
+            if laid_from < len(marks):
+                rects.append(self._marks_canvas_box(marks[laid_from:], rect, k, image))
+            self._canvas_note(image, rects, key_before)
         layer.raster = {'canvas': True, 'key': key, 'image': image, 'count': len(marks),
                         'last': marks[-1][1] if marks else None, 'rect': rect, 'k': k}
         self._queue_refines(layer, key)
@@ -1530,9 +1539,13 @@ class RandomImageViewer(QMainWindow):
         return True
 
     def _queue_refines(self, layer, key):
-        """The strokes just burnt coarser than the layer: to lay again exactly."""
+        """The strokes just burnt coarser than the layer: to lay again exactly.
+        Off: the stroke laid again came out different (a hard grey rim round
+        soft strokes, ~2 s after drawing them) and the work in the background
+        competed with the pen. The burnt stroke - as it was seen while drawn -
+        stays."""
         wanted = self.__dict__.pop('_refine_wanted', None)
-        if not wanted:
+        if not wanted or not self.__dict__.get('_refine_on', False):
             return
         jobs = [j for j in getattr(self, '_refine_jobs', []) if j['layer'] is not layer]
         mark, view = wanted[-1]     # only the newest can be put back (see _refine_valid)
@@ -1614,6 +1627,7 @@ class RandomImageViewer(QMainWindow):
                 return
             # Laid exactly: the image before the stroke back, the stroke on it.
             stroke = work.compose(box) if mark.flat else work
+            before = kept['image'].cacheKey()
             p = QPainter(kept['image'])
             p.setClipRect(patch['box'])
             p.setCompositionMode(QPainter.CompositionMode_Source)
@@ -1621,6 +1635,7 @@ class RandomImageViewer(QMainWindow):
             p.setCompositionMode(QPainter.CompositionMode_SourceOver)
             p.drawImage(box.topLeft(), stroke)
             p.end()
+            self._canvas_note(kept['image'], [QRect(patch['box'])], before)
             jobs.pop(0)
             if self.current_image:
                 self.display_image(self.current_image)
@@ -1636,13 +1651,7 @@ class RandomImageViewer(QMainWindow):
     def _keep_patch(self, layer, key, kept, marks, done, rect, k, image):
         """Before marks[done:] go onto *image*: the part of it they will
         cover, kept, so undo puts that back (as a paint program does)."""
-        from random_image_viewer.drawing import transform as mark_transform
-        area = mark_transform.bounds(marks[done:])
-        if area.isEmpty():
-            return
-        box = QRectF((area.x() - rect.x()) * k, (area.y() - rect.y()) * k,
-                     area.width() * k, area.height() * k).toAlignedRect().adjusted(-4, -4, 4, 4)
-        box = box.intersected(image.rect())
+        box = self._marks_canvas_box(marks[done:], rect, k, image)
         if box.isEmpty():
             return
         patches = getattr(layer, 'canvas_patches', None) or []
@@ -1654,6 +1663,43 @@ class RandomImageViewer(QMainWindow):
                     for p in (getattr(l, 'canvas_patches', None) or []))
         while total > self._PATCHES_BYTES and patches:
             total -= patches.pop(0)['image'].sizeInBytes()      # the oldest go first
+
+    def _marks_canvas_box(self, marks, rect, k, image):
+        """The part of a layer image (*rect*, *k*) that *marks* paint into,
+        with room for every stroke's width there: a round pen's width is
+        kept in picture px (pic_width), wider than its screen thickness
+        when drawn zoomed out - a box from the screen width left its edge
+        out (undo left a rim; the graphics card's copy missed it)."""
+        from random_image_viewer.drawing import transform as mark_transform
+        area = mark_transform.bounds(marks)
+        if area.isEmpty():
+            return QRect()
+        extra = 0.0
+        for kind, mark in marks:
+            if kind == 'free_stroke' and not getattr(mark, 'stamps', None):
+                width = getattr(mark, 'pic_width', None) or getattr(mark, 'thickness', None) or 1
+                extra = max(extra, width * 0.75)
+        area = area.adjusted(-extra, -extra, extra, extra)
+        box = QRectF((area.x() - rect.x()) * k, (area.y() - rect.y()) * k,
+                     area.width() * k, area.height() * k).toAlignedRect().adjusted(-4, -4, 4, 4)
+        return box.intersected(image.rect())
+
+    def _canvas_note(self, image, rects, before):
+        """🎮 *image* (a layer's own) changed in *rects* since cacheKey
+        *before*: its texture on the graphics card gets just those (see
+        GpuView._layer_texture). A change not noted breaks the chain of
+        keys, and the whole image goes up again - never a stale copy."""
+        notes = self.__dict__.get('_canvas_notes')
+        entry = notes.get(image.cacheKey() >> 32) if notes else None
+        if entry is None:
+            return              # not on the graphics card yet: it goes up whole
+        if entry.get('key') != before:
+            entry['all'] = True
+        else:
+            entry['rects'] = list(entry.get('rects') or []) + [QRect(r) for r in rects if not r.isEmpty()]
+            if len(entry['rects']) > 64:
+                entry['all'] = True
+        entry['key'] = image.cacheKey()
 
     def _undo_patches(self, layer, kept, marks):
         """*layer*'s image back to *marks* (fewer than it holds) by putting
@@ -1676,6 +1722,7 @@ class RandomImageViewer(QMainWindow):
         for p in need:                      # newest first, back to *want*
             painter.drawImage(p['box'].topLeft(), p['image'])
         painter.end()
+        self._undo_boxes = [QRect(p['box']) for p in need]
         layer.canvas_patches = patches[:len(patches) - len(need)]
         return True
 
@@ -2226,7 +2273,7 @@ class RandomImageViewer(QMainWindow):
                 self.display_image(self.current_image)
                 return
             # Get currently displayed pixmap (may already have LUT/enhancements applied)
-            current_pixmap = self.image_label.pixmap()
+            current_pixmap = self._view_pixmap()
             if (not current_pixmap) or current_pixmap.isNull():
                 # Fallback: full redraw
                 self.display_image(self.current_image)
@@ -2505,6 +2552,12 @@ class RandomImageViewer(QMainWindow):
             self.brush_settings.update(json.loads(self._settings.value("brush_settings", "{}")))
         except (TypeError, ValueError):
             pass
+        # Each line tool and the brush keep their own size (see _recall_tool_size).
+        try:
+            self._tool_sizes = {k: int(v) for k, v in
+                                json.loads(self._settings.value("tool_sizes", "{}")).items()}
+        except (TypeError, ValueError, AttributeError):
+            self._tool_sizes = {}
         try:
             self.brush_textures = [p for p in json.loads(self._settings.value("brush_textures", "[]"))
                                    if os.path.isfile(p)]
@@ -5434,6 +5487,8 @@ class RandomImageViewer(QMainWindow):
         self.original_pixmap = pixmap
         self._update_layer_chip()       # ✨ there follows the effects being on
         self._update_zoom_readout()
+        if not self._force_cpu_frame and self._gpu_display_ok() and self._gpu_display_frame(img_path):
+            return          # 🎮 drawn on the graphics card (see _gpu_display_frame)
         
         # Scale FIRST, then draw lines on the scaled version
         scaled_pixmap = self._scale_pixmap(pixmap, img_path)
@@ -5532,6 +5587,14 @@ class RandomImageViewer(QMainWindow):
         self.image_label.setPixmap(scaled_pixmap)
         self.image_label.setToolTip("")
         self.current_image = img_path
+        if not self._force_cpu_frame:
+            if self._gpu_display_ok():
+                # First frame of a view the GPU can take (the label now has
+                # its size): on there from now on.
+                if self._gpu_display_frame(img_path):
+                    self._cpu_frame_stale = False
+            else:
+                self._gpu_leave_display()
         # Kept with its view: while the view moves, frames are this one moved
         # (see _motion_frame) instead of the effects run again each time.
         try:
@@ -8778,12 +8841,14 @@ class RandomImageViewer(QMainWindow):
         if keep != 'fill':
             self._disable_fill_tools_silent()
         self._sync_erase_button()
+        QTimer.singleShot(0, self._gpu_recheck)     # 🎮 a tool with a preview: the CPU canvas
 
     def toggle_line_drawing(self, checked):
         self.line_drawing_mode = checked
         if checked:
             self._deactivate_tools(keep='line')
             self._show_guides_for_tool()
+            self._recall_tool_size('line')
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
 
@@ -8799,6 +8864,7 @@ class RandomImageViewer(QMainWindow):
         if checked:
             self._deactivate_tools(keep='hline')
             self._show_guides_for_tool()
+            self._recall_tool_size('hline')
         # Don't clear lines when mode is deactivated - keep them visible
         self._update_cursor_and_status()
 
@@ -8807,6 +8873,7 @@ class RandomImageViewer(QMainWindow):
         if checked:
             self._deactivate_tools(keep='free_line')
             self._show_guides_for_tool()
+            self._recall_tool_size('free_line')
         if not checked:
             # Reset current line start when mode is deactivated
             had_pending = self.current_line_start is not None
@@ -9065,7 +9132,7 @@ class RandomImageViewer(QMainWindow):
         It is kept in picture coordinates like any mark, so it zooms, pans and
         turns with the picture, can be blended, erased and undone, and goes
         when you move to another file, as marks do."""
-        shown = self.image_label.pixmap()
+        shown = self._view_pixmap()
         tx = self._compute_line_transform()
         if not self.current_image or shown is None or shown.isNull() or not tx:
             self.status.showMessage("Nothing on screen to snapshot")
@@ -9309,7 +9376,7 @@ class RandomImageViewer(QMainWindow):
         with its effects - and only this layer and the ones under it
         ('below'), or this layer alone on nothing ('layer'). Made once, when
         the stroke starts."""
-        shown = self.image_label.pixmap()
+        shown = self._view_pixmap()
         source = self.brush_settings.get('sample', 'below')
         if (source == 'all' or shown is None or shown.isNull() or not self.current_image
                 or getattr(self, 'original_pixmap', None) is None):
@@ -9358,7 +9425,7 @@ class RandomImageViewer(QMainWindow):
         own has no colour to give."""
         import numpy as np
         if shown is None:
-            shown = self.image_label.pixmap()
+            shown = self._view_pixmap()
         if shown is None or shown.isNull():
             return None
         image = shown.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
@@ -9705,6 +9772,13 @@ class RandomImageViewer(QMainWindow):
         history = mode == 'history'
         picture = self._history_picture() if history else None
         source = (picture, to_screen, self.brush_settings['mix'] / 100.0) if picture is not None else None
+        old = self.__dict__.pop('_gpu_flat', None)
+        if old is not None:
+            try:
+                old.cancel()
+            except Exception:
+                pass
+        self._gpu_flat = None
         if mode in ('push', 'smear') and self._blend_under is not None and image is not None:
             # 🌊🧊 Their pixels worked on the graphics card when it is up (see drag_gpu).
             gpu = getattr(self, 'gpu_processor', None)
@@ -9741,11 +9815,29 @@ class RandomImageViewer(QMainWindow):
             self._flat_live = (brushes.FlatStroke(image.rect(), source)
                                if (self._stamp_trail.settings['flat'] or history) and image is not None
                                else None)
+            self._gpu_flat = self._gpu_flat_stroke(image, mode, history, texture)
+            if self._gpu_flat is not None:
+                self._flat_live = None      # laid on the graphics card instead (see _gpu_flat_stroke)
         self._flat_live_box, self._flat_live_count = None, 0
+        self._flat_pending = None
         self._live_stamp_count = 0
 
     def _paint_live_stamps(self, stamps):
         if not stamps or getattr(self, '_stroke_image', None) is None:
+            return
+        gflat = self.__dict__.get('_gpu_flat')
+        if gflat is not None:
+            # 🎮 The stamps laid on the graphics card (~0.3 ms, not ~3 ms on the CPU).
+            try:
+                rect = gflat.add(self._stamp_trail.texture, stamps, self._stamp_to_screen)
+            except Exception as e:
+                print(f"🎮 GPU brush failed, back to the CPU one: {e}")
+                self._gpu_flat_off()
+                return
+            self._flat_live_count = getattr(self, '_flat_live_count', 0) + len(stamps)
+            self._gpu_flat_dirty = True
+            if not self.stroke_update_timer.isActive():
+                self._schedule_live_frame()
             return
         painter = QPainter(self._stroke_image)
         if self._flat_live is not None:
@@ -9755,8 +9847,11 @@ class RandomImageViewer(QMainWindow):
             if dirty is not None and not dirty.isEmpty():
                 box = getattr(self, '_flat_live_box', None)
                 self._flat_live_box = dirty if box is None else box.united(dirty)
-                painter.setCompositionMode(QPainter.CompositionMode_Source)
-                painter.drawImage(dirty.topLeft(), self._flat_live.compose(dirty))
+                # Composed (tail and all) once per frame, not per pen event:
+                # only the last one before a frame is ever seen, and composing
+                # every event cost ~1.6 ms of each 5 ms (see _flush_flat_live).
+                pending = self.__dict__.get('_flat_pending')
+                self._flat_pending = dirty if pending is None else pending.united(dirty)
                 self._mark_live_dirty(dirty)
         else:
             brushes.paint_stamps(painter, self._stamp_trail.texture, stamps, self._stamp_to_screen)
@@ -9770,7 +9865,7 @@ class RandomImageViewer(QMainWindow):
                 self._mark_live_dirty(QRectF(p.x() - half, p.y() - half, 2 * half, 2 * half).toAlignedRect())
         painter.end()
         if not self.stroke_update_timer.isActive():
-            self.stroke_update_timer.start()
+            self._schedule_live_frame()
 
     # -- ⬚ select + transform ---------------------------------------------------
     #
@@ -9817,7 +9912,7 @@ class RandomImageViewer(QMainWindow):
 
     def _sel_view(self):
         """The current view as _paint_marks takes it, and picture -> label."""
-        pix = self.image_label.pixmap()
+        pix = self._view_pixmap()
         if pix is None or pix.isNull() or getattr(self, 'original_pixmap', None) is None:
             return None, None
         view = (pix.width(), pix.height(), *self._fx_view_params())
@@ -10375,6 +10470,7 @@ class RandomImageViewer(QMainWindow):
             self._deactivate_tools(keep='fill')
             if mode == 'polyline':
                 self._show_guides_for_tool()
+                self._recall_tool_size('polyline')
             if mode in self._CLICK_SHAPES:
                 self.status.showMessage(self._click_shape_hint(mode))
             else:
@@ -10635,7 +10731,7 @@ class RandomImageViewer(QMainWindow):
         if mapper is None:
             return False
         try:
-            canvas = self.image_label.pixmap().copy()
+            canvas = self._view_pixmap().copy()
             painter = QPainter(canvas)
             self._paint_one_fill(painter, fill, mapper)
             painter.end()
@@ -10840,6 +10936,7 @@ class RandomImageViewer(QMainWindow):
             if hasattr(self, 'image_label'):
                 self.image_label.setAttribute(Qt.WA_TabletTracking, True)
             self._show_color_box_for_painting()
+            self._recall_tool_size('brush')     # the brush's own size, not the last line tool's
             print(f"Free draw mode activated - pen pressure enabled")
         if not checked:
             # Reset drawing state when mode is deactivated
@@ -11272,7 +11369,7 @@ class RandomImageViewer(QMainWindow):
         Falls back to the picture when nothing is shown there.
         """
         label = getattr(self, 'image_label', None)
-        pix = label.pixmap() if label is not None else None
+        pix = self._view_pixmap() if label is not None else None
         if pix is not None and not pix.isNull():
             try:
                 key = pix.cacheKey()
@@ -11557,7 +11654,7 @@ class RandomImageViewer(QMainWindow):
         painted on it - or None. The background around it is left out, so
         a zoomed-out picture does not fill the palette with that."""
         label = getattr(self, 'image_label', None)
-        pix = label.pixmap() if label is not None else None
+        pix = self._view_pixmap() if label is not None else None
         src = getattr(self, 'original_pixmap', None)
         if pix is None or pix.isNull() or src is None or src.isNull():
             return None
@@ -11797,8 +11894,42 @@ class RandomImageViewer(QMainWindow):
         self.set_brush_size(size + sign * step)
         self.status.showMessage(f"Brush size {self.line_thickness}px", 1500)
 
+    def _size_tool(self):
+        """Which tool the size slider sets now: 'line', 'hline' (ruler),
+        'free_line', 'polyline', 'brush' - or None."""
+        if getattr(self, 'free_line_drawing_mode', False):
+            return 'free_line'
+        if getattr(self, 'line_drawing_mode', False):
+            return 'line'
+        if getattr(self, 'horizontal_line_drawing_mode', False):
+            return 'hline'
+        if getattr(self, 'fill_mode', None) == 'polyline':
+            return 'polyline'
+        if getattr(self, 'free_draw_mode', False):
+            return 'brush'
+        return None
+
+    def _recall_tool_size(self, tool):
+        """*tool* picked up: the size it was last used with comes back (one
+        size for all of them had a fine ruler line come out as thick as the
+        last brush stroke). The first time, it takes the size there is."""
+        sizes = getattr(self, '_tool_sizes', None)
+        if sizes is None:
+            return
+        size = sizes.get(tool)
+        if size is None:
+            sizes[tool] = int(self.line_thickness)
+            self._settings.setValue("tool_sizes", json.dumps(sizes))
+        elif size != self.line_thickness:
+            self.set_brush_size(size)
+
     def update_line_thickness(self, value):
         self.line_thickness = max(1, min(self._BRUSH_MAX, int(value)))
+        tool = self._size_tool()
+        sizes = getattr(self, '_tool_sizes', None)
+        if tool is not None and sizes is not None and sizes.get(tool) != self.line_thickness:
+            sizes[tool] = self.line_thickness       # remembered for this tool (see _recall_tool_size)
+            self._settings.setValue("tool_sizes", json.dumps(sizes))
         if getattr(self, 'line_thickness_label', None) is not None:
             self.line_thickness_label.setText(f"{self.line_thickness}px")
         self._show_size_in_panel()
@@ -12323,7 +12454,7 @@ class RandomImageViewer(QMainWindow):
             # (with all committed lines baked in) and precompute display geometry so
             # the rubber-band preview can be composited cheaply on each pen move.
             self._line_preview_geom = self._build_display_geometry_cache()
-            base = self.image_label.pixmap()
+            base = self._view_pixmap()
             self._line_preview_base = base.copy() if base and not base.isNull() else None
             self.status.showMessage(f"Line start set at ({x:.0f}, {y:.0f}) - drag and lift the pen, "
                                     "or click the end point")
@@ -12629,7 +12760,7 @@ class RandomImageViewer(QMainWindow):
         # to fire, so the line only appeared once the pen slowed/lifted. This way
         # the overlay refreshes at a steady cadence *during* the stroke.
         if not self.stroke_update_timer.isActive():
-            self.stroke_update_timer.start()
+            self._schedule_live_frame()
 
     def _paint_smooth_segment(self, start_point, end_point, thickness=None):
         """✨ HIGH-QUALITY: Smooth antialiased line drawing with improved interpolation"""
@@ -12835,7 +12966,7 @@ class RandomImageViewer(QMainWindow):
         dpr = pm.devicePixelRatio() if pm is not None and not pm.isNull() else 1.0
         ox = (label.width() - round(frame.width() / dpr)) // 2
         oy = (label.height() - round(frame.height() / dpr)) // 2
-        label.update(QRect(int(area.x() / dpr) + ox - 1, int(area.y() / dpr) + oy - 1,
+        self._live_update(QRect(int(area.x() / dpr) + ox - 1, int(area.y() / dpr) + oy - 1,
                            int(area.width() / dpr) + 3, int(area.height() / dpr) + 3))
         return True
 
@@ -12934,11 +13065,133 @@ class RandomImageViewer(QMainWindow):
         kept = getattr(self, '_live_dirty', None)
         self._live_dirty = rect if kept is None else kept.united(rect)
 
+    _LIVE_FRAME_S = 0.008       # the stroke on screen at most this often (~120 a second)
+
+    def _schedule_live_frame(self):
+        """The stroke being drawn shown on screen: at once when the last
+        frame was a while ago (the first dab never waits), else when the
+        frame time is up - the pen events in between go into that one frame.
+        Shown after every pen event (~200 a second, against the screen's
+        60), the repaints took most of each event's time and with a big
+        brush the app fell behind the pen."""
+        if self.stroke_update_timer.interval() > 0 and not self._live_direct_ok():
+            self.stroke_update_timer.start()        # the effects' own pace (see _show_live_with_effects)
+            return
+        since = time.perf_counter() - self.__dict__.get('_live_frame_t', 0.0)
+        wait = self._LIVE_FRAME_S - since
+        self.stroke_update_timer.start(0 if wait <= 0 else int(wait * 1000) + 1)
+
+    def _live_update(self, rect):
+        """The stroke being drawn changed in *rect* (canvas coords; None: all
+        of it): repainted there - on the GPU canvas straight (going through
+        the label, under the GPU canvas's native window, came back as the
+        whole canvas each time), else on the label."""
+        if self.__dict__.get('_gpu_display'):
+            gpu = self.__dict__.get('_gpu_canvas')
+            if gpu is not None and gpu.active:
+                if rect is None:
+                    gpu._full = True
+                    gpu.update()
+                else:
+                    gpu.update_area(rect)
+                return
+        if rect is None:
+            self.image_label.update()
+        else:
+            self.image_label.update(rect)
+
+    def _gpu_flat_stroke(self, image, mode, history, texture):
+        """🎮 The flat stroke laid on the graphics card (drawing/gpu_flat:
+        FlatStroke's look, ~0.3 ms a pen event instead of ~3 ms) while the GPU
+        canvas is the display: the stroke as the screen shows it, in a layer
+        of the screen's size on the card; read back once when the pen lifts
+        and burnt in like the CPU's. None where it does not do: other modes,
+        History, Spray, the plain canvas."""
+        if (not self.__dict__.get('_gpu_display') or image is None or history or mode != 'paint'
+                or not self._stamp_trail.settings['flat'] or texture is None
+                or getattr(texture, 'procedural', False) or self.__dict__.get('_gpu_flat_failed')):
+            return None
+        try:
+            from random_image_viewer.drawing.gpu_paint import GpuLayer, GpuFlatStroke
+            w, h = image.width(), image.height()
+            layer = self.__dict__.get('_gpu_flat_layer')
+            if layer is None or (layer.width, layer.height) != (w, h):
+                if layer is not None:
+                    try:
+                        layer.release()
+                    except Exception:
+                        pass
+                layer = self._gpu_flat_layer = GpuLayer(w, h, precision='byte')
+            self._gpu_flat_dirty = False
+            return GpuFlatStroke(layer)
+        except Exception as e:
+            print(f"🎮 GPU brush off, the CPU one paints: {e}")
+            self._gpu_flat_failed = True
+            return None
+
+    def _gpu_flat_off(self):
+        self._gpu_flat_failed = True
+        gflat = self.__dict__.pop('_gpu_flat', None)
+        if gflat is not None:
+            try:
+                gflat.cancel()
+            except Exception:
+                pass
+
+    def _gpu_flat_finished(self, trail, stamps):
+        """Pen up, the stroke laid on the card: (view transform, image,
+        top-left) as _finished_render gives - read back once."""
+        gflat = self.__dict__.pop('_gpu_flat', None)
+        self._flat_live = None
+        try:
+            done = getattr(self, '_flat_live_count', 0)
+            if done < len(stamps):          # a tap: its stamp came with finish()
+                gflat.add(trail.texture, stamps[done:], self._stamp_to_screen)
+            gflat.preview()
+            box = gflat.bounds()
+            self._flat_live_box, self._flat_live_count = None, 0
+            if box.isEmpty():
+                gflat.cancel()
+                return None
+            image = gflat.read_overlay(box)
+            gflat.cancel()
+            return (QTransform(self._stamp_to_screen), image, box.topLeft())
+        except Exception as e:
+            print(f"🎮 GPU brush read back failed: {e}")
+            self._gpu_flat_failed = True
+            return None
+
+    def _flush_flat_live(self):
+        """The flat / smear / push stroke's pieces changed since the last
+        frame, composed into the live buffer now (see _paint_live_stamps)."""
+        gflat = self.__dict__.get('_gpu_flat')
+        if gflat is not None and self.__dict__.get('_gpu_flat_dirty'):
+            self._gpu_flat_dirty = False
+            try:
+                rect = gflat.preview()
+            except Exception as e:
+                print(f"🎮 GPU brush preview failed: {e}")
+                rect = None
+            if rect is not None:
+                self._mark_live_dirty(rect)
+        pending = self.__dict__.get('_flat_pending')
+        self._flat_pending = None
+        live = getattr(self, '_flat_live', None)
+        image = getattr(self, '_stroke_image', None)
+        if pending is None or pending.isEmpty() or live is None or image is None or image.isNull():
+            return
+        painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.drawImage(pending.topLeft(), live.compose(pending))
+        painter.end()
+
     def _update_display_with_overlay(self):
         """⚡ TIMER-BASED: Update display only when timer fires for optimal performance"""
         if not hasattr(self, '_stroke_image') or not self.temp_stroke_overlay:
             return
 
+        self._live_frame_t = time.perf_counter()
+        self._flush_flat_live()
         if self._live_direct_ok():
             # ✏ Straight onto the screen: the view stays as it is and the
             # label paints the stroke over it (see live_stroke_overlay), only
@@ -12948,14 +13201,14 @@ class RandomImageViewer(QMainWindow):
             dirty, self._live_dirty = self._live_dirty, None
             label = self.image_label
             if dirty is None:
-                label.update()
+                self._live_update(None)
             else:
                 pm = label.pixmap()
                 dpr = pm.devicePixelRatio() if pm is not None and not pm.isNull() else 1.0
                 ox = (label.width() - round(self._stroke_image.width() / dpr)) // 2
                 oy = (label.height() - round(self._stroke_image.height() / dpr)) // 2
-                label.update(QRect(int(dirty.x() / dpr) + ox - 1, int(dirty.y() / dpr) + oy - 1,
-                                   int(dirty.width() / dpr) + 3, int(dirty.height() / dpr) + 3))
+                self._live_update(QRect(int(dirty.x() / dpr) + ox - 1, int(dirty.y() / dpr) + oy - 1,
+                                        int(dirty.width() / dpr) + 3, int(dirty.height() / dpr) + 3))
             return
 
         # ⚠️ FIX: Ensure no active painters before converting back to pixmap
@@ -13067,6 +13320,9 @@ class RandomImageViewer(QMainWindow):
         """The flat stroke just drawn, as the live buffers have it: (view
         transform, image, top-left), or None. Laying all its stamps again for
         the redraw after the pen lifts took tens of ms, for the same pixels."""
+        gflat = self.__dict__.get('_gpu_flat')
+        if gflat is not None:
+            return self._gpu_flat_finished(trail, stamps)
         live = self._flat_live
         self._flat_live = None
         if live is None or getattr(self, '_stamp_to_screen', None) is None:
@@ -13079,6 +13335,7 @@ class RandomImageViewer(QMainWindow):
                 self._flat_live_box = dirty if box is None else box.united(dirty)
         box = getattr(self, '_flat_live_box', None)
         self._flat_live_box, self._flat_live_count = None, 0
+        self._flat_pending = None
         if box is None or box.isEmpty():
             return None
         return (QTransform(self._stamp_to_screen), live.compose(box), box.topLeft())
@@ -14061,7 +14318,7 @@ class RandomImageViewer(QMainWindow):
         # Create the final pixmap representing current view
         try:
             # If there is a currently displayed pixmap, use it (includes LUT/enhancements and possibly lines)
-            if self.image_label and self.image_label.pixmap() and not self.image_label.pixmap().isNull():
+            if self.image_label and self._view_pixmap() and not self.image_label.pixmap().isNull():
                 final_pixmap = self.image_label.pixmap().copy()
             else:
                 # Fallback: render current image as display_image would
@@ -16573,6 +16830,7 @@ class RandomImageViewer(QMainWindow):
         pic_tf.scale(original_size.width() * sx / pic.width(), original_size.height() * sy / pic.height())
         items.append((pic, pic_tf, 1.0, None, None))
         guides_all = []
+        seen = set()
         if self.lines_visible:
             to_view = self._layer_view_transform(view)
             for layer in self.layers:
@@ -16587,7 +16845,17 @@ class RandomImageViewer(QMainWindow):
                 to_picture.translate(rect.x(), rect.y())
                 to_picture.scale(1.0 / k, 1.0 / k)
                 mode = BLEND_MODES[layer.blend] if layer.blend != 'Normal' else None
-                items.append((source, to_picture * to_view, layer.opacity / 100.0, mode, None))
+                note = None
+                if source is canvas:
+                    # Kept on the graphics card, updated where it changed (see _canvas_note).
+                    notes = self.__dict__.setdefault('_canvas_notes', {})
+                    note = notes.setdefault(canvas.cacheKey() >> 32, {'key': None, 'rects': [], 'all': True})
+                    seen.add(canvas.cacheKey() >> 32)
+                items.append((source, to_picture * to_view, layer.opacity / 100.0, mode, note))
+        notes = self.__dict__.get('_canvas_notes')
+        if notes:
+            for serial in [s_ for s_ in notes if s_ not in seen]:
+                del notes[serial]       # images no longer shown
         overlay = None
         if guides_all:
             overlay = lambda p, g=guides_all, v=view: self._paint_layer_marks(p, g, *v)
@@ -16630,7 +16898,8 @@ class RandomImageViewer(QMainWindow):
         showed one; the plain canvas takes over once the view rests."""
         if not getattr(self, '_view_in_motion', False) or getattr(self, 'is_drawing_free_stroke', False):
             return False
-        gpu = self._gpu_view_get()
+        gpu = (self.__dict__.get('_gpu_canvas') if self.__dict__.get('_gpu_display')
+               else self._gpu_view_get())
         if gpu is None:
             return False
         try:
@@ -16643,12 +16912,10 @@ class RandomImageViewer(QMainWindow):
                 self._gpu_show(gpu)
                 gpu.set_scene(*scene)
                 return False
-            label = self.image_label
-            if not gpu.active:
-                # The tool panels lying on the canvas, drawn over it as they look.
-                gpu.grab_panels([w for w in label.children()
-                                 if isinstance(w, QWidget) and not w.isWindow() and w.isVisible()])
+            # The tool panels lying on the canvas show through holes in it.
+            gpu.on_top = self._gpu_overlay
             self._gpu_show(gpu)
+            gpu.refresh_holes()
             gpu.set_scene(*scene)
             if not gpu.active:
                 gpu.activate()
@@ -16668,12 +16935,233 @@ class RandomImageViewer(QMainWindow):
             if w is not gpu:
                 w.raise_()
 
+    # -- 🎮 the canvas on the graphics card -------------------------------
+    #
+    # While painting (marks on the canvas, or the brush in hand) and the view
+    # is one the graphics card can draw - the picture, the layers' own
+    # images, the guides; no effects over the paint, no line / shape / crop /
+    # select tool drawing its preview on the label - the GPU window is the
+    # display: every redraw (a stroke ending, a zoom settling) is the layer
+    # images drawn there, no frame put together on the CPU (~70 ms at each
+    # pen-up). The CPU frame is made only when something reads its pixels
+    # (_view_pixmap: colour pick, smudge, saving the view ...). The label
+    # under it keeps its last frame (its size is what the stroke buffers
+    # follow) and paints nothing meanwhile (see ImageLabel.paintEvent).
+
+    _gpu_display = False        # the GPU window is the display now
+    _cpu_frame_stale = False    # ... and the label's frame is behind it
+    _force_cpu_frame = False    # making that frame now (see _view_pixmap)
+
+    def _gpu_canvas_get(self):
+        """The GPU canvas: an OpenGL child of the canvas inside the main
+        window (made when first used), or None."""
+        gpu = self.__dict__.get('_gpu_canvas')
+        if gpu is None and not self.__dict__.get('_gpu_canvas_tried'):
+            self._gpu_canvas_tried = True
+            try:
+                from random_image_viewer.widgets.gpu_view import GpuCanvasWindow
+                gpu = self._gpu_canvas = GpuCanvasWindow(self, self.image_label)
+            except Exception as e:
+                print(f"🎮 GPU canvas off: {e}")
+                gpu = None
+        return gpu if gpu is not None and not gpu.failed else None
+
+    def _gpu_target(self):
+        """What draws on the graphics card now: the GPU canvas when it is the
+        display, else the window laid over the plain canvas while zooming."""
+        if self.__dict__.get('_gpu_display'):
+            return self.__dict__.get('_gpu_canvas')
+        return self.__dict__.get('_gpu_view')
+
+    def _gpu_display_ok(self):
+        """Whether the GPU window can be the display for the view now."""
+        label = getattr(self, 'image_label', None)
+        if (label is None or not label.isVisible() or self.isMinimized() or not self.current_image
+                or os.environ.get('OVA_NO_GPU_CANVAS')
+                or (os.environ.get('OVA_GPU_CANVAS') != '1'       # (tests: on without touching the settings)
+                    and str(self._settings.value("gpu_canvas_experimental", "true")).lower() in ("false", "0"))):
+            return False
+        if not (self.has_marks() or getattr(self, 'free_draw_mode', False)):
+            return False
+        if (self._fx_layers_on() or getattr(self, 'crop_mode', False) or getattr(self, 'select_mode', False)
+                or getattr(self, 'fill_mode', None) or getattr(self, 'line_drawing_mode', False)
+                or getattr(self, 'horizontal_line_drawing_mode', False)
+                or getattr(self, 'free_line_drawing_mode', False) or getattr(self, 'eraser_mode', False)
+                or getattr(self, 'color_snap_mode', False) or self._sel is not None
+                or self.current_erase_stroke):
+            return False
+        if (getattr(self, 'is_drawing_free_stroke', False) and self._brush_erasing()
+                and self.__dict__.get('_erase_live') is False):
+            return False        # 🧽 erasing the whole-redraw way: the label shows it as it goes
+        gpu = self.__dict__.get('_gpu_canvas')
+        return not (gpu is not None and gpu.failed)
+
+    def _gpu_display_frame(self, img_path):
+        """Show the view on the graphics card (see above). True when shown."""
+        label = self.image_label
+        pm = label.pixmap()
+        if pm is None or pm.isNull() or pm.size() != label.size():
+            return False        # the label's frame first (the stroke buffers take its size)
+        gpu = self._gpu_canvas_get()
+        if gpu is None:
+            return False
+        window_view = self.__dict__.get('_gpu_view')
+        if window_view is not None and window_view.isVisible():
+            window_view.put_away()      # the zoom window: the canvas itself draws now
+        self.current_image = img_path
+        try:
+            scene = self._gpu_scene()
+            if scene is None:
+                return False
+            gpu.on_top = self._gpu_overlay
+            self._gpu_show(gpu)
+            gpu.refresh_holes()
+            gpu.set_scene(*scene)
+            if not gpu.active:
+                gpu.activate()          # drawn first, then seen: no black frame
+            if gpu.failed:
+                return False
+        except Exception as e:
+            print(f"🎮 GPU canvas failed, drawing on the CPU: {e}")
+            return False
+        self._gpu_display = True
+        self._cpu_frame_stale = True
+        self._shown_frame = None
+        return True
+
+    def _gpu_leave_display(self):
+        """The CPU frame is the display again (just made): the GPU window
+        goes once the label shows it (see _hide_gpu_view)."""
+        if self.__dict__.get('_gpu_display'):
+            self._gpu_display = False
+            self._cpu_frame_stale = False
+            canvas = self.__dict__.get('_gpu_canvas')
+            if canvas is not None:
+                try:
+                    self.image_label.repaint()      # the plain frame first ...
+                except Exception:
+                    pass
+                canvas.put_away()                   # ... then the GPU canvas goes
+
+    def gpu_canvas_enabled(self):
+        return str(self._settings.value("gpu_canvas_experimental", "true")).lower() not in ("false", "0")
+
+    def toggle_gpu_canvas(self, on):
+        """🎮 The GPU canvas on or off (canvas right-click menu), remembered."""
+        self._settings.setValue("gpu_canvas_experimental", "true" if on else "false")
+        self._gpu_recheck()
+        self.status.showMessage("🎮 GPU canvas " + ("on" if on else "off - the plain canvas"), 3000)
+
+    def _gpu_recheck(self):
+        """A tool or mode changed: the GPU canvas on or off to suit it."""
+        if not self.current_image:
+            return
+        on = bool(self.__dict__.get('_gpu_display'))
+        if on != bool(self._gpu_display_ok()):
+            self.display_image(self.current_image)
+
+    def _gpu_canvas_hidden(self):
+        """The canvas gave way (thumbnail grid ...): the GPU window too, the
+        label's frame brought up to date for when it comes back."""
+        if self.__dict__.get('_gpu_display'):
+            self._view_pixmap()
+            self._gpu_display = False
+        for name in ('_gpu_view', '_gpu_canvas'):
+            gpu = self.__dict__.get(name)
+            if gpu is not None:
+                gpu.put_away()
+
+    def _view_pixmap(self):
+        """The view as a picture (the label's frame), made now when the GPU
+        canvas is ahead of it."""
+        if self.__dict__.get('_cpu_frame_stale') and self.current_image:
+            self._force_cpu_frame = True
+            try:
+                self._display_image_now(self.current_image)
+            finally:
+                self._force_cpu_frame = False
+            self._cpu_frame_stale = False
+        return self.image_label.pixmap()
+
+    def _gpu_overlay(self, p, area=None):
+        """Drawn over the GPU canvas each frame: the stroke being drawn (or
+        the eraser's frame) and the grid / crosshair - what the label paints
+        over its frame. *area* (canvas coords): only that piece is redrawn,
+        so only that piece of the stroke goes to the graphics card."""
+        label = self.image_label
+        live = self.live_stroke_overlay()
+        gflat = self.__dict__.get('_gpu_flat')
+        gpu = self.__dict__.get('_gpu_canvas')
+        if live is not None and gflat is not None and gpu is not None:
+            pm = label.pixmap()
+            if pm is not None and not pm.isNull():
+                image, opacity, mode = live
+                dpr = pm.devicePixelRatio() or 1.0
+                sw, sh = pm.width() / dpr, pm.height() / dpr
+                x0, y0 = (label.width() - sw) // 2, (label.height() - sh) // 2
+                k = image.width() / max(1.0, sw)
+                ow, oh = gflat.overlay_size
+                if gpu.draw_texture_id(p, gflat.overlay_texture_id, ow, oh,
+                                       QTransform(1.0 / k, 0, 0, 1.0 / k, x0, y0), opacity, area):
+                    live = None
+        if live is not None:
+            pm = label.pixmap()
+            if pm is not None and not pm.isNull():
+                image, opacity, mode = live
+                dpr = pm.devicePixelRatio() or 1.0
+                sw, sh = pm.width() / dpr, pm.height() / dpr
+                x0, y0 = (label.width() - sw) // 2, (label.height() - sh) // 2
+                k = image.width() / max(1.0, sw)            # stroke pixels per canvas px
+                target = QRectF(x0, y0, sw, sh)
+                if area is not None:
+                    target = target.intersected(QRectF(area))
+                gpu = self.__dict__.get('_gpu_canvas')
+                if (mode is None and gpu is not None and getattr(gpu, 'embedded', False)
+                        and image.format() == QImage.Format_ARGB32_Premultiplied):
+                    # The stroke as a texture of its own, kept on the graphics
+                    # card: only the piece that changed goes up each frame
+                    # (QPainter took every piece for a new texture: ~4.7 ms).
+                    if area is None:
+                        note = {'key': None, 'rects': [], 'all': True, 'mip': False}
+                    else:
+                        src = QRectF((target.x() - x0) * k, (target.y() - y0) * k,
+                                     target.width() * k, target.height() * k).toAlignedRect().adjusted(
+                                         -2, -2, 2, 2).intersected(image.rect())
+                        note = {'key': image.cacheKey(), 'rects': [src], 'all': False, 'mip': False}
+                    to_canvas = QTransform(1.0 / k, 0, 0, 1.0 / k, x0, y0)
+                    if gpu._draw_layer_texture(p, image, note, to_canvas, opacity, area):
+                        live = None
+            if live is not None and pm is not None and not pm.isNull():
+                p.save()
+                if opacity < 1.0:
+                    p.setOpacity(opacity)
+                if mode is not None:
+                    p.setCompositionMode(mode)
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                if area is None:
+                    p.drawImage(target, image)
+                elif not target.isEmpty():
+                    src = QRectF((target.x() - x0) * k, (target.y() - y0) * k,
+                                 target.width() * k, target.height() * k).toAlignedRect().intersected(image.rect())
+                    if not src.isEmpty():
+                        piece = image.copy(src)     # a small upload, not the whole stroke image
+                        p.drawImage(QRectF(src.x() / k + x0, src.y() / k + y0,
+                                           src.width() / k, src.height() / k), piece)
+                p.restore()
+        if (self.crosshair_overlay or self.grid_overlay) and self.lines_visible:
+            tx = self._compute_line_transform()
+            if tx:
+                p.save()
+                self._draw_fixed_overlays(p, tx['draw_x'], tx['draw_y'],
+                                          tx['zoomed_width'], tx['zoomed_height'])
+                p.restore()
+
     def _hide_gpu_view(self):
         """The plain canvas shows again: drawn now, on screen, and the GPU
         window goes away a moment after - not before it is there (a blink)."""
         gpu = getattr(self, '_gpu_view', None)
-        if gpu is None:
-            return
+        if gpu is None or self.__dict__.get('_gpu_display'):
+            return      # it is the display (see _gpu_display_frame): it stays
         if not gpu.active:
             gpu.put_away()
             return
@@ -16687,11 +17175,12 @@ class RandomImageViewer(QMainWindow):
         """A stroke (or anything that needs the plain canvas) is starting
         while the GPU view still shows: the canvas made for this view now,
         then the GPU view put away."""
-        gpu = getattr(self, '_gpu_view', None)
+        gpu = self._gpu_target()
         if gpu is None or not gpu.active:
             return
         if not getattr(self, '_view_in_motion', False):
-            gpu.put_away()      # at rest already, only going away: the canvas is there
+            if not self.__dict__.get('_gpu_display'):
+                gpu.put_away()  # at rest already, only going away: the canvas is there
             return
         timer = getattr(self, '_view_settle_timer', None)
         if timer is not None:
@@ -17319,7 +17808,7 @@ class RandomImageViewer(QMainWindow):
 
     def copy_to_clipboard(self):
         """Copy the current displayed image (with all enhancements and lines) to clipboard"""
-        if not self.current_image or not self.image_label.pixmap():
+        if not self.current_image or not self._view_pixmap():
             self.status.showMessage("No image to copy")
             return
         
