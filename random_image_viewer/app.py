@@ -16,6 +16,15 @@ def main():
     # Without this Qt silently converts all touch input into synthesised mouse
     # events, so widgets never see TouchBegin/TouchUpdate/TouchEnd.
     QApplication.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents, False)
+    # 🎮 The GPU canvas: OpenGL contexts share their textures (a layer
+    # painted offscreen is drawn by the canvas window as it is), and frames
+    # do not wait for the screen's refresh - waiting held the app ~16 ms a
+    # frame, every pen move (Windows' compositor still shows them in step).
+    try:
+        from PySide6.QtGui import QSurfaceFormat
+        QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
 
     from random_image_viewer.splash import show_splash, close_splash

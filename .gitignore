@@ -57,3 +57,6 @@ test_icon.py
 convert_icon.py
 logo.png
 ARCHITECTURE.md
+
+# Claude Code (agent worktrees, local settings)
+.claude/
