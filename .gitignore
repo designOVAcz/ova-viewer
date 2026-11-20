@@ -58,5 +58,8 @@ convert_icon.py
 logo.png
 ARCHITECTURE.md
 
+# Private notes (feature explanations - not for the public repo)
+INTERNAL.md
+
 # Claude Code (agent worktrees, local settings)
 .claude/

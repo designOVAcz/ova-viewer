@@ -218,6 +218,10 @@ class ColorPickerPopup(QWidget):
     pinned_changed = Signal(bool)
     closed = Signal()
     drag_finished = Signal()        # moved by hand (it leaves / rejoins the dock)
+    # the second colour (the gradient's other end), when shown - see enable_second
+    second_requested = Signal()     # its swatch clicked: pick it
+    swap_requested = Signal()       # ⇄
+    second_picked = Signal(QColor)  # Alt+click on a palette swatch
 
     def __init__(self, parent=None):
         # A frameless tool window rather than Qt.Popup: a popup is closed by Qt
@@ -306,6 +310,28 @@ class ColorPickerPopup(QWidget):
         self._hex.returnPressed.connect(self._on_hex_entered)
         row.addWidget(self._hex)
         row.addStretch(1)
+        # The second colour - as a paint program's background colour: the
+        # \U0001F308 gradient's other end. ⇄ (X) swaps the two.
+        self._swap_btn = QToolButton()
+        self._swap_btn.setText("\u21c4")
+        self._swap_btn.setFixedSize(20, 22)
+        self._swap_btn.setCursor(Qt.PointingHandCursor)
+        self._swap_btn.setToolTip("Swap the pen colour and the second colour (X)")
+        self._swap_btn.setStyleSheet(
+            "QToolButton { color: #c8c8c8; background: transparent; border: none; font-size: 11pt; }"
+            "QToolButton:hover { background: #3c3f44; border-radius: 3px; }")
+        self._swap_btn.clicked.connect(self.swap_requested)
+        row.addWidget(self._swap_btn)
+        self._second_btn = QToolButton()
+        self._second_btn.setFixedSize(26, 22)
+        self._second_btn.setCursor(Qt.PointingHandCursor)
+        self._second_btn.setToolTip("The second colour - the \U0001F308 gradient's other end. Click to "
+                                    "pick it; Alt+click a palette swatch or the eyedropper sets it too")
+        self._second_btn.clicked.connect(self.second_requested)
+        row.addWidget(self._second_btn)
+        self._second_on = False
+        self._swap_btn.hide()
+        self._second_btn.hide()
         inner.addLayout(row)
 
         self._swatch_label = QLabel("Picked from images")
@@ -318,6 +344,18 @@ class ColorPickerPopup(QWidget):
         self._strip.changed.connect(self._on_strip)
 
     # ── public API ──
+    def enable_second(self, on=True):
+        """Show the second colour (and ⇄) beside the current one."""
+        self._second_on = bool(on)
+        self._swap_btn.setVisible(self._second_on)
+        self._second_btn.setVisible(self._second_on)
+
+    def set_second_color(self, color):
+        c = QColor(color)
+        self._second_btn.setStyleSheet(
+            f"QToolButton {{ background: {c.name()}; border: 1px solid #6a6d70; border-radius: 3px; }}"
+            "QToolButton:hover { border: 1px solid #ffcc00; }")
+
     def set_title(self, text):
         self._title.setText(f"\U0001f3a8 {text}")
 
@@ -428,6 +466,9 @@ class ColorPickerPopup(QWidget):
         self._emit()
 
     def _on_swatch(self, color):
+        if self._second_on and QApplication.keyboardModifiers() & Qt.AltModifier:
+            self.second_picked.emit(QColor(color))      # Alt: the second colour
+            return
         self.set_color(color)
         self.color_picked.emit(QColor(color))
 

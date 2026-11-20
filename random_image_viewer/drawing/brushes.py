@@ -51,6 +51,13 @@ DEFAULT_SETTINGS = {
     'sat_jitter': 0,            # %
     'val_jitter': 0,            # %
     'jitter_marks': False,      # lines and shapes get a jittered colour too (one each)
+    'lines_paint': True,        # new straight lines / polylines are paint (brushes smudge,
+                                #   blend and cover them); off: guides drawn over the paint
+    'gradient': 'linear',       # 🌈 the gradient tool: 'linear' or 'radial'
+    'gradient_to': '',          # 🌈 ... from the pen colour to this ('#rrggbb'), '' = transparent
+    'shape_gradient': False,    # 🌈 shapes fill with the gradient instead of one colour
+    'mode_marks': True,         # in a mode other than Paint, lines run the brush along
+                                #   them and shapes run it over their area (clipped to it)
     'jitter_per_stamp': False,  # True: every stamp its own colour; 'streaks':
                                 #   every streak across the tip its own colour;
                                 #   'particles': every speck its own colour
@@ -196,6 +203,17 @@ def _streaked(source, rgb):
     return image
 
 
+def particles_mean(rgb):
+    """A particles colour tuple (axis < 0, c0, c1 ...) as one 0xRRGGBB: the
+    average of its specks."""
+    colours = rgb[1:]
+    n = max(1, len(colours))
+    r = sum((c >> 16) & 255 for c in colours) / n
+    g = sum((c >> 8) & 255 for c in colours) / n
+    b = sum(c & 255 for c in colours) / n
+    return (round(r) << 16) | (round(g) << 8) | round(b)
+
+
 def _mix(a, b, t):
     """0xRRGGBB colours *a* and *b* mixed, *t* of the way to *b*."""
     out = 0
@@ -203,6 +221,91 @@ def _mix(a, b, t):
         ca, cb = (a >> shift) & 255, (b >> shift) & 255
         out |= round(ca + (cb - ca) * t) << shift
     return out
+
+
+# -- colour jitter, as a painter means it --------------------------------
+#
+# Hue / Sat / Value ± work in OKLCH (Björn Ottosson's OKLab, as lightness,
+# chroma and hue), a colour space made so equal steps look equal:
+#   Value ±  lighter / darker - its place on a grey scale - at the same
+#            intensity and hue (the same step looks the same on yellow and blue)
+#   Sat ±    more intense, or greyer: towards the grey of the SAME value,
+#            never lighter or darker (HSV's saturation went towards white)
+#   Hue ±    round the wheel, value and intensity kept
+# A colour pushed past what the screen can show loses intensity, not value.
+
+def _srgb_to_linear(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(c):
+    c = np.clip(c, 0.0, 1.0)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * c ** (1 / 2.4) - 0.055)
+
+
+def _rgb_to_oklab(rgb):
+    """(..., 3) sRGB 0..1 -> (..., 3) OKLab (L 0..1)."""
+    lin = _srgb_to_linear(rgb)
+    lms = lin @ np.array([[0.4122214708, 0.2119034982, 0.0883024619],
+                          [0.5363325363, 0.6806995451, 0.2817188376],
+                          [0.0514459929, 0.1073969566, 0.6299787005]])
+    lms = np.cbrt(lms)
+    return lms @ np.array([[0.2104542553, 1.9779984951, 0.0259040371],
+                           [0.7936177850, -2.4285922050, 0.7827717662],
+                           [-0.0040720468, 0.4505937099, -0.8086757660]])
+
+
+def _oklab_to_linear(lab):
+    lms = lab @ np.array([[1.0, 1.0, 1.0],
+                          [0.3963377774, -0.1055613458, -0.0894841775],
+                          [0.2158037573, -0.0638541728, -1.2914855480]])
+    lms = lms ** 3
+    return lms @ np.array([[4.0767416621, -1.2684380046, -0.0041960863],
+                           [-3.3077115913, 2.6097574011, -0.7034186147],
+                           [0.2309699292, -0.3413193965, 1.7076147010]])
+
+
+def jitter_rgb(rgb, hj, sj, vj, uh, us, uv):
+    """sRGB colours *rgb* ((..., 3), 0..1) jittered by Hue / Sat / Value ±
+    (*hj*, *sj*, *vj*: 0..1) with random numbers *uh*, *us*, *uv* in [-1, 1]
+    (each the shape of rgb[..., 0]), in OKLCH - see above. sRGB back."""
+    lab = _rgb_to_oklab(np.asarray(rgb, np.float64))
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    C, h = np.hypot(a, b), np.arctan2(b, a)
+    h = h + np.asarray(uh) * hj * math.pi            # 100 %: anywhere on the wheel
+    C = C * np.clip(1.0 + np.asarray(us) * sj, 0.0, None)   # 100 %: grey .. twice as intense
+    L = np.clip(L + np.asarray(uv) * vj, 0.0, 1.0)          # 100 %: anywhere black .. white
+    ca, sa = np.cos(h), np.sin(h)
+    # Past what sRGB holds: the most intensity that fits, value and hue kept
+    # (a few halvings - the colours are made in batches).
+    k_lo = np.zeros_like(C)
+    k_hi = np.ones_like(C)
+
+    def fits(k):
+        lin = _oklab_to_linear(np.stack([L, C * k * ca, C * k * sa], -1))
+        return np.all((lin >= -1e-4) & (lin <= 1 + 1e-4), -1)
+    ok = fits(k_hi)
+    if not ok.all():
+        for _ in range(12):
+            mid = (k_lo + k_hi) / 2
+            good = fits(mid)
+            k_lo = np.where(good, mid, k_lo)
+            k_hi = np.where(good, k_hi, mid)
+        k = np.where(ok, 1.0, k_lo)
+    else:
+        k = k_hi
+    lin = _oklab_to_linear(np.stack([L, C * k * ca, C * k * sa], -1))
+    return _linear_to_srgb(lin)
+
+
+def gradient_lut(rgb0, rgb1, n=1024):
+    """🌈 (n, 3) sRGB 0..1: from *rgb0* to *rgb1* (sRGB 0..1 triples) in
+    OKLab steps - the middle looks halfway to the eye, with no grey dip (as
+    red to green has mixed in sRGB) or dark band."""
+    a = _rgb_to_oklab(np.array([rgb0], np.float64))[0]
+    b = _rgb_to_oklab(np.array([rgb1], np.float64))[0]
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    return _linear_to_srgb(_oklab_to_linear(a + (b - a) * t))
 
 
 def jitter_color(color, settings, rng=random):
@@ -213,13 +316,67 @@ def jitter_color(color, settings, rng=random):
     out = QColor(color)
     if not (hj or sj or vj):
         return out
-    h, s, v = colorsys.rgb_to_hsv(color.redF(), color.greenF(), color.blueF())
-    h = (h + rng.uniform(-0.5, 0.5) * hj) % 1.0
-    s = min(1.0, max(0.0, s + rng.uniform(-1, 1) * sj))
-    v = min(1.0, max(0.0, v + rng.uniform(-1, 1) * vj))
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    out.setRgbF(r, g, b, color.alphaF())
+    uh, us, uv = rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-1, 1)
+    r, g, b = jitter_rgb([color.redF(), color.greenF(), color.blueF()], hj, sj, vj, uh, us, uv)
+    out.setRgbF(float(r), float(g), float(b), color.alphaF())
     return out
+
+
+def _cell_noise(ix, iy, seed, channel):
+    """Per-cell random numbers in [-1, 1): a hash of the cell's (ix, iy), the
+    mark's *seed* and *channel*, so a cell has the same colour however much
+    of the mark is drawn, at any zoom."""
+    with np.errstate(over='ignore'):
+        x = (np.asarray(ix, np.int64).view(np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+             ^ np.asarray(iy, np.int64).view(np.uint64) * np.uint64(0xC2B2AE3D27D4EB4F)
+             ^ np.uint64((int(seed) * 0x165667B19E3779F9 + channel * 0x27D4EB2F165667C5) & (2 ** 64 - 1)))
+        x ^= x >> np.uint64(30)
+        x *= np.uint64(0xBF58476D1CE4E5B9)
+        x ^= x >> np.uint64(27)
+        x *= np.uint64(0x94D049BB133111EB)
+        x ^= x >> np.uint64(31)
+    return (x >> np.uint64(11)).astype(np.float64) / float(2 ** 52) - 1.0
+
+
+def jitter_cells(color, jitter, ix, iy):
+    """Colours (uint32 0xFFRRGGBB array, the shape of *ix*) for the cells
+    (ix, iy) of a line or shape jittered per cell: *color* shifted by the
+    Hue / Sat / Value ± kept in *jitter* ({'h', 's', 'v', 'seed'})."""
+    seed = jitter.get('seed', 0)
+    ix, iy = np.asarray(ix), np.asarray(iy)
+    table = _jitter_table(color.rgb() & 0xFFFFFF, jitter.get('h', 0), jitter.get('s', 0), jitter.get('v', 0))
+    n = _JITTER_LEVELS
+
+    def level(channel):
+        q = ((_cell_noise(ix, iy, seed, channel) + 1.0) * (n / 2.0)).astype(np.int64)
+        return np.minimum(q, n - 1)
+    return table[(level(1) * n + level(2)) * n + level(3)]
+
+
+_JITTER_LEVELS = 20         # steps per Hue / Sat / Value: 8000 colours a mark's cells pick from
+_jitter_tables = {}
+
+
+def _jitter_table(rgb, h, s, v):
+    """Every colour a jittered line or shape can take: *rgb* (0xRRGGBB)
+    jittered at _JITTER_LEVELS steps of each random number (uint32 ARGB, in
+    the order jitter_cells indexes). Made once per colour and amounts - the
+    OKLCH sums, gamut included, would cost per cell otherwise."""
+    key = (rgb, h, s, v)
+    table = _jitter_tables.get(key)
+    if table is None:
+        n = _JITTER_LEVELS
+        steps = (np.arange(n) + 0.5) / n * 2.0 - 1.0
+        uh, us, uv = (g.ravel() for g in np.meshgrid(steps, steps, steps, indexing='ij'))
+        base = np.broadcast_to(np.array([((rgb >> 16) & 255) / 255.0, ((rgb >> 8) & 255) / 255.0,
+                                         (rgb & 255) / 255.0]), (n ** 3, 3))
+        out = np.round(jitter_rgb(base, h / 100.0, s / 100.0, v / 100.0, uh, us, uv) * 255).astype(np.uint32)
+        table = (np.uint32(0xFF000000) | (out[:, 0] << np.uint32(16)) | (out[:, 1] << np.uint32(8))
+                 | out[:, 2])
+        if len(_jitter_tables) > 16:
+            _jitter_tables.pop(next(iter(_jitter_tables)))
+        _jitter_tables[key] = table
+    return table
 
 
 def pressure_size(pressure):
@@ -431,7 +588,9 @@ class BrushTexture:
                                       QColor((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255))
                 self._tints[key] = image
             return image
-        rgb = (keep,) + tuple(rgb[1:])      # banded along the dragged side, as the body
+        if rgb[0] >= 0:
+            rgb = (keep,) + tuple(rgb[1:])  # banded along the dragged side, as the body
+        # (particles: speckled, as the tip - see frame_variant)
         key = (id(self), 'front', level, keep, sign, rgb, back)
         image = _streak_cache.get(key)
         if image is None:
@@ -538,7 +697,17 @@ class BrushTexture:
                                       QColor((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255))
                 self._tints[key] = image
             return image
-        rgb = (1,) + tuple(rgb[1:])         # bands run along the motion
+        if rgb[0] < 0 and part == 'profile':
+            # particles in the body: their average - a one-pixel profile
+            # cannot hold specks, and banded each short piece where the
+            # stroke narrows (the pen lifting) became a striped block
+            return self.frame_variant(level, turn, part, rgb=particles_mean(rgb))
+        if not (rgb[0] < 0 and part != 'profile'):
+            rgb = (1,) + tuple(rgb[1:])     # bands run along the motion
+        # (particles keep their speckle in the front and the tail - the tip's
+        # own shape, as every stamp has it: banded, each stroke ended in a
+        # striped block. Only the one-pixel profile, stretched along the
+        # stroke, needs bands.)
         key = (id(self), 'mf', level, turn, part, rgb)
         image = _streak_cache.get(key)
         if image is None:
@@ -551,6 +720,9 @@ class BrushTexture:
         StampTrail) - or, with *keep* (an axis), its swept profile."""
         if isinstance(rgb, int):
             return self.swept(level, rgb=rgb, keep=keep) if keep is not None else self.tinted(level, rgb)
+        if keep is not None and rgb[0] < 0:
+            # particles over a swept profile: their average (see frame_variant)
+            return self.swept(level, rgb=particles_mean(rgb), keep=keep)
         if keep is not None:
             # The bands run along the side being dragged. Laid along the other
             # one, they were squeezed into the one-pixel profile with it - a
@@ -1016,16 +1188,12 @@ class StampTrail:
         base = color.rgb() & 0xFFFFFF
         if not (hj or sj or vj):
             return [base]
-        h, sat, val = colorsys.rgb_to_hsv(color.redF(), color.greenF(), color.blueF())
         rng = self._rng
-        palette = []
-        for _ in range(PALETTE_SIZE):
-            nh = (h + rng.uniform(-0.5, 0.5) * hj) % 1.0
-            ns = min(1.0, max(0.0, sat + rng.uniform(-1, 1) * sj))
-            nv = min(1.0, max(0.0, val + rng.uniform(-1, 1) * vj))
-            r, g, b = colorsys.hsv_to_rgb(nh, ns, nv)
-            palette.append((round(r * 255) << 16) | (round(g * 255) << 8) | round(b * 255))
-        return palette
+        u = np.array([[rng.uniform(-1, 1) for _ in range(3)] for _ in range(PALETTE_SIZE)])
+        base_rgb = np.broadcast_to(np.array([color.redF(), color.greenF(), color.blueF()]),
+                                   (PALETTE_SIZE, 3))
+        out = np.round(jitter_rgb(base_rgb, hj, sj, vj, u[:, 0], u[:, 1], u[:, 2]) * 255).astype(int)
+        return [int((r << 16) | (g << 8) | b) for r, g, b in out]     # (OKLCH, see jitter_rgb)
 
     def _picture_direction(self, sx, sy):
         """A screen direction as a picture one (unit vector), or None."""
@@ -2397,12 +2565,20 @@ class DragStroke:
 
 
 class PushStroke(DragStroke):
-    """🧊 Push: liquify. The pixels under the tip move along with it - the
-    tip's middle carries them as far as it goes (Strength), its rim less, so
-    the paint bends, shears and is shoved along as a mass; nothing is picked
-    up or blended. They move by whole pixels only (each one when the push
-    it has had adds up to a pixel, as a fixed random threshold decides), so
-    it never blurs: lines stay crisp, broken into pieces.
+    """🧊 Push: liquify, as a forward-warp tool does it. The paint under the
+    tip goes along with it - the tip's middle carries it as far as the
+    brush moves (times Strength), its rim less - so it bends, shears and is
+    shoved along as a mass. Whatever is behind the tip comes along too:
+    pushed from the grey (or the empty canvas) into a colour, the grey
+    drives the colour away - the push goes both ways, not only outwards.
+
+    How: a displacement field - for each pixel, how far the paint now there
+    has come in all. Each step bends the field under the tip (the field is
+    itself carried along, then the step's move added), and the pixels are
+    taken once from the paint as it was before the stroke, at the place
+    the field says (bilinear, cv2.remap in C++). Nothing is resampled step
+    after step, so a long push never blurs or breaks into steps, and moving
+    back over the same place undoes it as paint would.
 
     *ice*: neighbouring pixels move unevenly - each lags by its own (fixed,
     slightly clumped) share, so the paint cracks into icy fragments as it is
@@ -2410,18 +2586,27 @@ class PushStroke(DragStroke):
 
     Same face as DragStroke (add / compose, feathered ends)."""
 
-    CL_MIN_TIP = 200
+    CL_MIN_TIP = 10 ** 9        # cv2.remap does it - the old OpenCL kernel moved whole pixels
 
-    def __init__(self, rect, work, strength, ice=0.4):
+    def __init__(self, rect, work, strength, ice=0.4, backdrop=None):
         super().__init__(rect, work, 0.5)
         clamp = lambda v: max(0.0, min(1.0, v))
         self.strength = clamp(strength)
         self.ice = clamp(ice)
         h, w = self.reached.shape
+        self.source = self.pixels.copy()                # the paint as it was: sampled, never changed
+        # *backdrop* (the view without this layer, device-sized): *work* is
+        # this layer alone, and the push REPLACES its paint where it went -
+        # the empty canvas pushed into a shape cuts it away. Shown live as
+        # the layer over the backdrop (see compose); kept as the layer's
+        # pushed paint plus where it replaces (compose_layer, cut).
+        self.backdrop = None
+        if backdrop is not None:
+            b = backdrop.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            if (b.width(), b.height()) == (w, h):
+                self.backdrop = _image_array(b)
+        self.disp = np.zeros((h, w, 2), np.float32)     # how far the paint at each pixel has come
         rng = np.random.default_rng(20261112)
-        # When a pixel's push adds up to a whole pixel (stochastic rounding,
-        # fixed per place so a slow stroke and a fast one move alike).
-        self._step = rng.random((h, w), dtype=np.float32)
         lag = rng.random((h, w), dtype=np.float32)
         if _cv2 is not None:
             lag = _cv2.GaussianBlur(lag, (0, 0), 1.2)       # small clumps, not single pixels
@@ -2448,21 +2633,15 @@ class PushStroke(DragStroke):
                 continue
             dx, dy = fx_c - self.last[0], fy_c - self.last[1]
             travelled = math.hypot(dx, dy)
-            # A step moves the whole tip's square: a big tip steps further
-            # (2 % of it) - a pixel at a time, a 300 px push warped 90 000
-            # pixels per pixel moved and fell behind the pen. A whole-pixel
-            # move of a big mass looks the same in a few px steps.
-            if travelled < max(1.0, 0.02 * on_screen):
+            # Steps of a pixel or two (more for a big tip): each moves the
+            # whole tip's square, and the field carries sub-pixel moves on.
+            if travelled < max(1.0, 0.01 * on_screen):
                 continue
             self.last = (fx_c, fy_c)
             self.travel += travelled
-            self.fade = max(self.fade, 0.5 * on_screen)
-            ux, uy = dx / travelled, dy / travelled
-            if self.way is not None:
-                ux, uy = self.way[0] * 0.85 + ux * 0.15, self.way[1] * 0.85 + uy * 0.15
-                n = math.hypot(ux, uy) or 1.0
-                ux, uy = ux / n, uy / n
-            self.way = (ux, uy)
+            # (no feathered ends, unlike Smear: the field already falls off
+            # with the tip, and a fade mixed in the paint from before the
+            # push - a ghost ring of the old edge where each push ended)
             tip_a, grey = self._mask(texture, level, tip, m)
             size = grey.shape[0]
             half = size // 2
@@ -2473,42 +2652,44 @@ class PushStroke(DragStroke):
             if ax0 >= ax1 or ay0 >= ay1:
                 continue
             sx0, sy0, sx1, sy1 = ax0 - x0, ay0 - y0, ax1 - x0, ay1 - y0
-            gpu = self._cl_on(on_screen)
-            if gpu is not None:
-                try:
-                    even = (getattr(self, '_even', 0.0) + 0.6180339887) % 1.0
-                    gpu.push((ax0, ay0, ax1, ay1), x0, y0, grey, tip_a, self._lag, self._step,
-                             self.strength, self.ice, even, ux * travelled, uy * travelled,
-                             int(round(255 * min(1.0, stamp[4]))), self.travel)
-                    self._even = even
-                    box = QRect(ax0 + ox, ay0 + oy, ax1 - ax0, ay1 - ay0)
-                    self._recent.append((self.travel, box))
-                    dirty = box if dirty is None else dirty.united(box)
-                    continue
-                except Exception as e:
-                    self._cl_off(e)
-            # How far each pixel goes this step: the brush's move, times the
-            # tip's grey there and Strength, less its own lag (Ice) ...
-            share = grey[sy0:sy1, sx0:sx1] * np.float32(self.strength)
+            # How much of the move each pixel takes: the tip's grey there,
+            # Strength and the stamp's opacity, less its own lag (Ice).
+            # A full body that falls off only near the rim (1 - (1 - grey)^3):
+            # the paint is carried as a mass with a rounded front. The tip's
+            # plain grey moved its middle alone - pushed out, the paint
+            # ended in a bite.
+            g = grey[sy0:sy1, sx0:sx1]
+            g = (1.0 - (1.0 - g) ** 3) * np.float32(self.strength * min(1.0, stamp[4]))
             if self.ice:
-                share = share * (1.0 - np.float32(self.ice) * self._lag[ay0:ay1, ax0:ax1])
-            # One threshold for every pixel this step (an evenly spread
-            # sequence, so the moves add up right over the steps), with Ice
-            # each pixel's own mixed in: with its own alone, pixels pushed
-            # alike still moved on different steps - noise even at Ice 0.
-            self._even = (getattr(self, '_even', 0.0) + 0.6180339887) % 1.0
-            step = np.float32((1.0 - self.ice) * self._even) + \
-                np.float32(self.ice) * self._step[ay0:ay1, ax0:ax1]
-            # ... in whole pixels (rounded up where the threshold says so).
-            mx = np.floor(np.float32(ux * travelled) * share + step).astype(np.intp)
-            my = np.floor(np.float32(uy * travelled) * share + step).astype(np.intp)
-            ys = np.arange(ay0, ay1, dtype=np.intp)[:, None]
-            xs = np.arange(ax0, ax1, dtype=np.intp)[None, :]
-            # Each pixel takes what was that far behind it (a backward warp:
-            # no holes), all from the paint as it was before this step.
-            src_y = np.clip(ys - my, 0, h - 1)
-            src_x = np.clip(xs - mx, 0, w - 1)
-            self.pixels[ay0:ay1, ax0:ax1] = self.pixels[src_y, src_x]
+                g = g * (1.0 - np.float32(self.ice) * self._lag[ay0:ay1, ax0:ax1])
+            g = g.astype(np.float32)
+            xs = np.arange(ax0, ax1, dtype=np.float32)[None, :]
+            ys = np.arange(ay0, ay1, dtype=np.float32)[:, None]
+            gx, gy = g * np.float32(dx), g * np.float32(dy)
+            if _cv2 is not None:
+                # the field carried along with the push, then the move added
+                bx = np.ascontiguousarray(np.broadcast_to(xs, g.shape) - gx)
+                by = np.ascontiguousarray(np.broadcast_to(ys, g.shape) - gy)
+                d = _cv2.remap(self.disp, bx, by, _cv2.INTER_LINEAR, borderMode=_cv2.BORDER_REPLICATE)
+                d[..., 0] += gx
+                d[..., 1] += gy
+                self.disp[ay0:ay1, ax0:ax1] = d
+                # every pixel there: the paint from where the field says it came
+                mx = np.ascontiguousarray(np.broadcast_to(xs, g.shape) - d[..., 0])
+                my = np.ascontiguousarray(np.broadcast_to(ys, g.shape) - d[..., 1])
+                self.pixels[ay0:ay1, ax0:ax1] = _cv2.remap(
+                    self.source, mx, my, _cv2.INTER_LINEAR, borderMode=_cv2.BORDER_REPLICATE)
+            else:
+                # (no OpenCV: the same, to the nearest pixel)
+                bxi = np.clip(np.rint(xs - gx), 0, w - 1).astype(np.intp)
+                byi = np.clip(np.rint(ys - gy), 0, h - 1).astype(np.intp)
+                d = self.disp[byi, bxi].copy()
+                d[..., 0] += gx
+                d[..., 1] += gy
+                self.disp[ay0:ay1, ax0:ax1] = d
+                mxi = np.clip(np.rint(xs - d[..., 0]), 0, w - 1).astype(np.intp)
+                myi = np.clip(np.rint(ys - d[..., 1]), 0, h - 1).astype(np.intp)
+                self.pixels[ay0:ay1, ax0:ax1] = self.source[myi, mxi]
             touched = tip_a[sy0:sy1, sx0:sx1] > 5
             if not touched.any():
                 continue
@@ -2525,6 +2706,40 @@ class PushStroke(DragStroke):
             for _t, b in self._recent:
                 dirty = dirty.united(b)
         return dirty
+
+    def compose(self, rect):
+        """As seen while pushing: with a backdrop, the pushed layer over it
+        where the push went (opaque there: it shows what the layer's pushed
+        paint left uncovered); without, the pushed pixels (DragStroke)."""
+        if self.backdrop is None:
+            return super().compose(rect)
+        local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        if self._cl is not None:
+            try:
+                self._cl.fetch(local.x(), local.y(), local.x() + local.width(),
+                               local.y() + local.height(), self.pixels, self.reached, self.laid_at)
+            except Exception as e:
+                self._cl_off(e)
+        part = (slice(local.y(), local.y() + local.height()), slice(local.x(), local.x() + local.width()))
+        top = self.pixels[part].astype(np.float32)
+        under = self.backdrop[part].astype(np.float32)
+        over = top + under * (1.0 - top[..., 3:4] / 255.0)
+        over *= self.reached[part].astype(np.float32)[..., None] / 255.0
+        return _array_image(np.clip(over + 0.5, 0, 255).astype(np.uint8))
+
+    def compose_layer(self, rect):
+        """The layer's own pushed paint in device *rect*, where the push went."""
+        return super().compose(rect)
+
+    def cut(self, rect):
+        """Where the push replaces the layer's paint, in device *rect*: an
+        alpha mask (premultiplied ARGB, black)."""
+        local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        part = (slice(local.y(), local.y() + local.height()), slice(local.x(), local.x() + local.width()))
+        a = self.reached[part]
+        out = np.zeros(a.shape + (4,), np.uint8)
+        out[..., 3] = a
+        return _array_image(out)
 
 
 def _image_array(image):

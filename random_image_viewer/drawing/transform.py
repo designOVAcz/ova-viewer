@@ -85,11 +85,12 @@ def snapshot(marks):
     for kind, mark in marks:
         if kind == 'free_stroke':
             kept.append((kind, mark, (list(mark), list(mark.stamps) if mark.stamps else mark.stamps,
-                                      mark.thickness)))
-        elif kind == 'free_line':
-            kept.append((kind, mark, (mark['start'], mark['end'], mark.get('thickness'))))
-        elif kind == 'fill':
-            kept.append((kind, mark, (list(mark.get('points') or []), mark.get('thickness'))))
+                                      mark.thickness, getattr(mark, 'clip', None),
+                                      getattr(mark, 'pic_width', None))))
+        elif kind in ('free_line', 'fill'):
+            # all of it (points, widths, jitter ...): a transform puts in new values
+            kept.append((kind, mark, dict(mark, points=list(mark.get('points') or []))
+                         if kind == 'fill' else dict(mark)))
         elif kind == 'image':
             kept.append((kind, mark, list(mark['corners'])))
         elif kind == 'erase':
@@ -104,15 +105,12 @@ def restore(kept):
             mark[:] = state[0]
             mark.stamps = state[1]
             mark.thickness = state[2]
+            if len(state) > 3:
+                mark.clip, mark.pic_width = state[3], state[4]
             mark.render = None
-        elif kind == 'free_line':
-            mark['start'], mark['end'] = state[0], state[1]
-            if state[2] is not None:
-                mark['thickness'] = state[2]
-        elif kind == 'fill':
-            mark['points'] = state[0]
-            if state[1] is not None:
-                mark['thickness'] = state[1]
+        elif kind in ('free_line', 'fill'):
+            mark.clear()
+            mark.update(state)
         elif kind == 'image':
             mark['corners'] = state
         elif kind == 'erase':
@@ -146,6 +144,10 @@ def apply(marks, t):
                                for s in mark.stamps]
             if mark.thickness:
                 mark.thickness = max(1, mark.thickness * scale)
+            if getattr(mark, 'clip', None):
+                mark.clip = [moved(p) for p in mark.clip]
+            if getattr(mark, 'pic_width', None):
+                mark.pic_width = mark.pic_width * scale
             mark.render = None
         elif kind == 'free_line':
             mark['start'], mark['end'] = moved(mark['start']), moved(mark['end'])
@@ -155,6 +157,19 @@ def apply(marks, t):
             mark['points'] = [moved(p) for p in mark.get('points') or []]
             if mark.get('thickness'):
                 mark['thickness'] = max(1, mark['thickness'] * scale)
+        if kind == 'fill' and mark.get('gradient'):
+            grad = dict(mark['gradient'])       # (a new one: the undo snapshot keeps the old)
+            grad['start'], grad['end'] = moved(grad['start'])[:2], moved(grad['end'])[:2]
+            mark['gradient'] = grad
+        if kind in ('free_line', 'fill') and mark.get('pic_width'):
+            mark['pic_width'] = mark['pic_width'] * scale     # a painted line's width
+        if kind in ('free_line', 'fill') and mark.get('jitter'):
+            # 🎲 its blocks / streaks scale and turn with it (a new dict:
+            # the undo snapshot keeps the old one)
+            jit = dict(mark['jitter'])
+            jit['cell'] = jit.get('cell', 1.0) * (scale if jit.get('mode') != 'particles' else 1.0)
+            jit['angle'] = jit.get('angle', 0.0) + math.degrees(turn)
+            mark['jitter'] = jit
         elif kind == 'image':
             mark['corners'] = [moved(p)[:2] if not isinstance(p, QPointF) else moved(p)
                                for p in mark['corners']]

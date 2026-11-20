@@ -22,6 +22,7 @@ class ImageLabel(QLabel):
         self._video_sink = None
         self._audio_output = None
         self._fill_overlay = None  # (points, colour) of a shape being dragged
+        self._fill_guide = None    # a gradient's guide line while dragged, see set_fill_guide
         self._fill_pending = None  # QRegion waiting for the next paced repaint
         self._fill_last_paint = 0.0
         self._fill_timer = None
@@ -87,7 +88,9 @@ class ImageLabel(QLabel):
         """
         previous = self._fill_overlay
         pts = points if appended else list(points)
-        self._fill_overlay = (pts, QColor(color), open_path, stroke_width) if pts else None
+        from PySide6.QtGui import QBrush
+        brush = color if isinstance(color, QBrush) else QColor(color)     # (🌈 a gradient)
+        self._fill_overlay = (pts, brush, open_path, stroke_width) if pts else None
         if open_path or (previous and previous[2]):
             changed = self._outline_region(
                 previous[0] if previous else None, previous[3] if previous else 0).united(
@@ -114,11 +117,79 @@ class ImageLabel(QLabel):
         pad = cls._CORNER_RING + 3 + int(stroke_width) // 2 + 1
         return QRegion(QPolygon(pts).boundingRect().adjusted(-pad, -pad, pad, pad))
 
+    # -- the gradient's guide: where it starts and ends, while it is dragged --
+
+    _GUIDE_HANDLE = 8
+
+    def set_fill_guide(self, guide):
+        """*guide*: (start, end, radial, start colour, end colour or None for
+        transparent) in widget coordinates - drawn over the preview - or None."""
+        old = self._fill_guide
+        self._fill_guide = guide
+        changed = self._guide_region(old).united(self._guide_region(guide))
+        self._queue_fill_repaint(changed)
+
+    def _guide_region(self, guide):
+        if not guide:
+            return QRegion()
+        from PySide6.QtCore import QRectF
+        import math as _m
+        s, e, radial = guide[0], guide[1], guide[2]
+        pad = self._GUIDE_HANDLE + 4
+        box = QRectF(s, e).normalized().adjusted(-pad, -pad, pad, pad)
+        if radial:
+            r = _m.hypot(e.x() - s.x(), e.y() - s.y()) + 3
+            box = box.united(QRectF(s.x() - r, s.y() - r, 2 * r, 2 * r))
+        return QRegion(box.toAlignedRect())
+
+    def _paint_fill_guide(self, painter):
+        guide = self._fill_guide
+        if not guide:
+            return
+        from PySide6.QtCore import QPointF
+        import math as _m
+        s, e, radial, c0, c1 = guide
+        painter.setBrush(Qt.NoBrush)
+        if radial:
+            r = _m.hypot(e.x() - s.x(), e.y() - s.y())
+            painter.setPen(QPen(QColor(0, 0, 0, 160), 3))
+            painter.drawEllipse(s, r, r)
+            dash = QPen(QColor(255, 255, 255, 230), 1, Qt.DashLine)
+            painter.setPen(dash)
+            painter.drawEllipse(s, r, r)
+        # the line: dark under light, seen on any picture
+        painter.setPen(QPen(QColor(0, 0, 0, 170), 4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(s, e)
+        painter.setPen(QPen(QColor(255, 255, 255, 240), 2, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(s, e)
+        h = self._GUIDE_HANDLE
+        for at, colour in ((s, c0), (e, c1)):
+            if colour is None:
+                # transparent: a little checkerboard
+                painter.setPen(Qt.NoPen)
+                for i, shade in enumerate((QColor(255, 255, 255), QColor(150, 150, 150))):
+                    painter.setBrush(shade)
+                    painter.drawPie(int(at.x() - h), int(at.y() - h), 2 * h, 2 * h, i * 90 * 16, 90 * 16)
+                    painter.drawPie(int(at.x() - h), int(at.y() - h), 2 * h, 2 * h, (i * 90 + 180) * 16, 90 * 16)
+            else:
+                solid = QColor(colour)
+                solid.setAlpha(255)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(solid)
+                painter.drawEllipse(at, h, h)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 3.5))
+            painter.drawEllipse(at, h, h)
+            painter.setPen(QPen(QColor(255, 255, 255), 1.8))
+            painter.drawEllipse(at, h, h)
+
     def clear_fill_overlay(self):
         """Remove the in-progress shape, repainting straight away (release)."""
         overlay = self._fill_overlay
         self._fill_overlay = None
         region = self._fill_pending if self._fill_pending is not None else QRegion()
+        region = region.united(self._guide_region(self._fill_guide))
+        self._fill_guide = None
         self._fill_pending = None
         if self._fill_timer is not None:
             self._fill_timer.stop()
@@ -278,6 +349,7 @@ class ImageLabel(QLabel):
             painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
             painter.setPen(QPen(QColor(255, 255, 255), 1))
             painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
+        self._paint_fill_guide(painter)     # 🌈 where the gradient runs
         painter.end()
 
     def start_animation(self, file_path, scaled_size=None):
@@ -1902,6 +1974,18 @@ class ImageLabel(QLabel):
             swatch_action.setChecked(self.parent_viewer.colour_swatch_shown())
             swatch_action.toggled.connect(self.parent_viewer.toggle_colour_swatch)
             menu.addAction(swatch_action)
+
+        # --- 💼 Ova projects: the painting saved to carry on with later ---
+        if hasattr(self.parent_viewer, 'save_project'):
+            save_action = QAction("💼 Save project (.ova)…\tCtrl+S", self)
+            save_action.setToolTip("The picture, Studio / sketch, every layer and mark and the view in "
+                                   "one file - open it later to carry on painting")
+            save_action.triggered.connect(lambda: self.parent_viewer.save_project())
+            menu.addAction(save_action)
+            open_action = QAction("📂 Open project (.ova)…", self)
+            open_action.triggered.connect(lambda: self.parent_viewer.open_project())
+            menu.addAction(open_action)
+            menu.addSeparator()
 
         # --- 🎮 The canvas drawn on the graphics card ---
         if hasattr(self.parent_viewer, 'toggle_gpu_canvas'):

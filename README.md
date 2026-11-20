@@ -22,6 +22,8 @@ A fast media viewer and painting companion for Windows, built with PySide6. Imag
 - 🖌 Textured brush tips (load PNG packs), plus built-in Round, Soft (adjustable softness), Bristles, Rake, Dust and Spray
 - Brush modes: Paint, Blend, Smudge, History, Pick blend, Erase, 🌊 **Smear** (hair-style transport of paint) and 🧊 **Push** (liquify, with an "ice" crack option)
 - Lines, polylines, lasso / polygon / shape fills, ⬚ select and transform, ✂ crop
+- Lines are paint (brushes smudge and blend them) or guides drawn over it. In a brush mode other than Paint, the line tools run the brush along the line, and the shape tools run it over the whole shape, kept inside it (a lasso in Blend softens just that area; in Erase it cuts it out)
+- 🌈 **Gradient**: linear or radial, the pen colour fading out or into a second colour, mixed in OKLab and dithered (no banding). A guide line shows where it runs while you drag (**Shift**: 15° steps). Shapes can fill with it too. On a Multiply / Overlay layer it shades or lights the painting
 - 📝 New sketch and ◧ **Studio**: a grey canvas beside the picture for copying from reference
 
 **Layers**
@@ -31,6 +33,7 @@ A fast media viewer and painting companion for Windows, built with PySide6. Imag
 
 **Colour**
 - 💉 Eyedropper (**I**) with a live preview, a palette panel (3 rows) and auto-extract
+- A **second colour** beside the pen colour (as a paint program's background colour): the 🌈 gradient's other end. **Alt+click** a swatch or with the eyedropper to set it, **X** swaps the two
 - 🟥 A floating, resizable swatch of the current colour. **F8** picks a colour from anywhere on screen
 
 **Effects** (non-destructive)
@@ -39,6 +42,7 @@ A fast media viewer and painting companion for Windows, built with PySide6. Imag
 
 **Saving**
 - 💾 The view, the painting only (transparent) or both, at 1×, 2× or 4×, painted again at full resolution
+- 💼 Projects (`.ova`, **Ctrl+S**): the picture, Studio / sketch mode, every layer and mark, the palette and the view in one file. Open it later and carry on painting, with undo
 
 See [SHORTCUTS.md](SHORTCUTS.md) for keyboard shortcuts.
 

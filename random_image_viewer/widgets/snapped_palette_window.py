@@ -7,21 +7,49 @@ the ✕ close button hides it (tool toggles do not affect visibility).
 Swatches are grouped into rows. Each ✨ auto-extract creates a new row;
 💉 clicks append to the most-recent row.
 
+Above them, ◐ Values: a value scale (black to white, 2-10 steps) to pick
+greys from for value studies - built in, never removed with the colours.
+
 Signals:
     swatch_clicked(str)  — left-click on a swatch (hex color)
     swatch_removed(str)  — right-click on a swatch (hex color)
     closed()             — user clicked the ✕ close button
+    values_changed(int)  — the value scale's number of steps
+    dragging()           — moved by hand (each step of the drag)
+    drag_finished()      — dropped after a drag (it may dock: see the main window)
 """
 
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
-                                QToolButton, QSizePolicy, QSizeGrip)
+                                QToolButton, QSizePolicy, QSizeGrip, QSpinBox)
 from PySide6.QtCore import Qt, Signal
+
+
+def value_scale(steps):
+    """*steps* greys from black (value 1) to white, evenly spaced in
+    perceived lightness (CIE L*, as a Munsell-style value scale) - even
+    steps of RGB bunch up in the darks. [(hex, L*)]"""
+    steps = max(2, min(10, int(steps)))
+    out = []
+    for i in range(steps):
+        lightness = 100.0 * i / (steps - 1)
+        # L* -> relative luminance Y -> sRGB
+        if lightness > 8.0:
+            y = ((lightness + 16.0) / 116.0) ** 3
+        else:
+            y = lightness / 903.3
+        c = 12.92 * y if y <= 0.0031308 else 1.055 * y ** (1 / 2.4) - 0.055
+        v = max(0, min(255, round(c * 255)))
+        out.append((f"#{v:02x}{v:02x}{v:02x}", lightness))
+    return out
 
 
 class SnappedPaletteWindow(QWidget):
     swatch_clicked = Signal(str)
     swatch_removed = Signal(str)
     closed = Signal()
+    values_changed = Signal(int)
+    dragging = Signal()
+    drag_finished = Signal()
 
     SWATCH_W = 18      # minimum width for a swatch
     SWATCH_H = 24      # minimum height for a swatch
@@ -92,6 +120,34 @@ class SnappedPaletteWindow(QWidget):
         header.addWidget(self._close_btn, 0)
 
         inner.addLayout(header)
+
+        # ── ◐ Values: the value scale, always there ──
+        self._value_steps = 10
+        values_head = QHBoxLayout()
+        values_head.setContentsMargins(2, 0, 0, 0)
+        values_head.setSpacing(4)
+        values_label = QLabel("◐ Values")
+        values_label.setStyleSheet("QLabel { color: #a8a8a8; font-size: 8pt; background: transparent; }")
+        values_label.setToolTip("A value scale for studies: black (1) to white, in steps of equal "
+                                "perceived lightness. Click one to paint with it")
+        values_head.addWidget(values_label, 1)
+        self._value_spin = QSpinBox()
+        self._value_spin.setRange(2, 10)
+        self._value_spin.setValue(self._value_steps)
+        self._value_spin.setFixedWidth(44)
+        self._value_spin.setToolTip("How many values from black to white (2-10)")
+        self._value_spin.setStyleSheet("QSpinBox { color: #c8c8c8; background: #1e1f22; border: 1px solid #444;"
+                                       " border-radius: 3px; font-size: 8pt; }")
+        self._value_spin.valueChanged.connect(self._on_value_steps)
+        values_head.addWidget(self._value_spin, 0)
+        inner.addLayout(values_head)
+        self._values_row = QWidget()
+        self._values_row.setStyleSheet("background: transparent;")
+        self._values_layout = QHBoxLayout(self._values_row)
+        self._values_layout.setContentsMargins(0, 0, 0, 0)
+        self._values_layout.setSpacing(2)
+        inner.addWidget(self._values_row, 0)
+        self._build_values()
 
         # ── Rows container ──
         self._rows_container = QWidget()
@@ -182,6 +238,43 @@ class SnappedPaletteWindow(QWidget):
         self._rows_container.setVisible(non_empty)
         # NOTE: do not call adjustSize() — preserve the user's resized window
 
+    def set_value_steps(self, steps):
+        """The value scale's number of steps (2-10), without a signal."""
+        steps = max(2, min(10, int(steps)))
+        if steps != self._value_steps:
+            self._value_steps = steps
+            self._value_spin.blockSignals(True)
+            self._value_spin.setValue(steps)
+            self._value_spin.blockSignals(False)
+            self._build_values()
+
+    def _on_value_steps(self, steps):
+        self._value_steps = int(steps)
+        self._build_values()
+        self.values_changed.emit(self._value_steps)
+
+    def _build_values(self):
+        while self._values_layout.count():
+            item = self._values_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        for i, (hex_color, lightness) in enumerate(value_scale(self._value_steps), 1):
+            sw = QToolButton(self._values_row)
+            sw.setMinimumSize(14, self.SWATCH_H)
+            sw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            sw.setText(str(i))
+            ink = "#000" if lightness > 55 else "#ddd"
+            sw.setToolTip(f"Value {i} of {self._value_steps}  ·  L* {lightness:.0f}  ·  {hex_color.upper()}"
+                          "  —  click: paint with it")
+            sw.setStyleSheet(
+                f"QToolButton {{ background-color: {hex_color}; color: {ink}; font-size: 7pt;"
+                f" border: 1px solid #444; margin: 0px; border-radius: 3px; }}"
+                f"QToolButton:hover {{ border: 1px solid #ffcc00; }}")
+            sw.clicked.connect(lambda checked=False, c=hex_color: self.swatch_clicked.emit(c))
+            self._values_layout.addWidget(sw, 1)
+
     def set_colors(self, colors):
         """Backward-compatible wrapper: treat the flat list as a single row."""
         self.set_rows([list(colors or [])])
@@ -202,6 +295,8 @@ class SnappedPaletteWindow(QWidget):
     def mouseMoveEvent(self, event):
         if self._drag_offset is not None and (event.buttons() & Qt.LeftButton):
             self.move(event.globalPosition().toPoint() - self._drag_offset)
+            self._dragged = True
+            self.dragging.emit()
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -209,6 +304,9 @@ class SnappedPaletteWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_offset = None
+            if getattr(self, '_dragged', False):
+                self._dragged = False
+                self.drag_finished.emit()
             event.accept()
         else:
             super().mouseReleaseEvent(event)

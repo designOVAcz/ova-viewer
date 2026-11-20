@@ -859,7 +859,7 @@ class GpuFlatStroke:
                     m = _place(first[0], first[1], first[2], math.atan2(d[1], d[0]),
                                frame['w'], frame['h'], tip_long)
                     sink.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'front'),
-                                 step, 255, ('frame', first[5]), None))
+                                 step, 255, ('frame-end', first[5]), None))
             for piece in pieces:
                 piece['lay'] = (level, int(round(piece['turn'] / fs) * fs) % 360, step, stamp[5], texture)
                 piece['view'] = (v, scale)
@@ -894,7 +894,7 @@ class GpuFlatStroke:
             m = _place(stamp[0], stamp[1], stamp[2], math.atan2(d[1], d[0]), frame['w'], frame['h'],
                        tip_long)
             out.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'back'),
-                        step, 255, ('frame', stamp[5]), clip))
+                        step, 255, ('frame-end', stamp[5]), clip))
         return out
 
     # -- records -> instances on the card -------------------------------------
@@ -929,9 +929,15 @@ class GpuFlatStroke:
         if isinstance(rgb, int):
             return k.row((int(rgb),)), None
         axis, colours = rgb[0], tuple(rgb[1:])
+        if kind == 'frame' and axis < 0:
+            # particles in the body: their average (as frame_variant)
+            from random_image_viewer.drawing.brushes import particles_mean
+            return k.row((particles_mean(rgb),)), None
         n = len(colours)
-        if kind == 'frame':
+        if kind == 'frame' or (kind == 'frame-end' and axis >= 0):
             axis = 1                    # frame_variant: bands run along the motion
+        # ('frame-end': the front and the tail - particles keep their speckle
+        # there, as frame_variant does)
         if axis < 0:
             num = -1 - axis
             e = k.entry(('scatter', num, n, w, h), lambda: _scatter_map(num, n, w, h))

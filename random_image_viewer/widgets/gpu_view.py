@@ -322,6 +322,11 @@ class GpuView(QOpenGLWidget):
                     if fill is not None:
                         rect, colour = fill
                         p.fillRect(QRectF(rect), colour)
+                elif (mode is not None and mode != QPainter.CompositionMode_SourceOver
+                        and not hasattr(image, 'toImage')
+                        and self._blend_layer(p, image, fill if isinstance(fill, dict) else None,
+                                              transform, opacity, mode, area)):
+                    pass        # a layer in Multiply, Screen ... (see _blend_layer)
                 elif (isinstance(fill, dict) and mode is None and not self._textures_failed
                         and self._draw_layer_texture(p, image, fill, transform, opacity, area)):
                     pass        # a layer's own image, kept on the graphics card (see _layer_texture)
@@ -489,6 +494,210 @@ class GpuView(QOpenGLWidget):
                 if area is not None:
                     f.glDisable(GL_SCISSOR_TEST)
 
+    # -- layer blend modes, on the graphics card --------------------------
+    #
+    # QPainter on OpenGL knows SourceOver and little else: a layer in
+    # Multiply, Screen, Overlay ... was not drawn at all. Here a shader does
+    # what the CPU's QPainter does: what is drawn so far is copied to a
+    # texture, and the layer goes on with the W3C compositing formula
+    #   out = (1 - Sa) D + (1 - Da) S + Sa Da B(Sc, Dc)     (premultiplied)
+    # B being the mode's blend of the unpremultiplied colours.
+
+    _BLEND_IDS = None
+    _blend_failed = False
+
+    @classmethod
+    def _blend_id(cls, mode):
+        if cls._BLEND_IDS is None:
+            M = QPainter
+            cls._BLEND_IDS = {
+                M.CompositionMode_Multiply: 1, M.CompositionMode_Screen: 2,
+                M.CompositionMode_Overlay: 3, M.CompositionMode_SoftLight: 4,
+                M.CompositionMode_HardLight: 5, M.CompositionMode_Darken: 6,
+                M.CompositionMode_Lighten: 7, M.CompositionMode_ColorDodge: 8,
+                M.CompositionMode_ColorBurn: 9, M.CompositionMode_Difference: 10,
+                M.CompositionMode_Exclusion: 11, M.CompositionMode_Plus: 12}
+        return cls._BLEND_IDS.get(mode)
+
+    _BLEND_FRAG = """
+        uniform sampler2D src;
+        uniform sampler2D dst;
+        uniform vec2 dstSize;
+        uniform float opacity;
+        uniform int mode;
+        float soft(float s, float d) {
+            if (s <= 0.5) return d - (1.0 - 2.0 * s) * d * (1.0 - d);
+            float e = d <= 0.25 ? ((16.0 * d - 12.0) * d + 4.0) * d : sqrt(d);
+            return d + (2.0 * s - 1.0) * (e - d);
+        }
+        float hard(float s, float d) {
+            return s <= 0.5 ? 2.0 * s * d : 1.0 - 2.0 * (1.0 - s) * (1.0 - d);
+        }
+        float dodge(float s, float d) {
+            if (d <= 0.0) return 0.0;
+            if (s >= 1.0) return 1.0;
+            return min(1.0, d / (1.0 - s));
+        }
+        float burn(float s, float d) {
+            if (d >= 1.0) return 1.0;
+            if (s <= 0.0) return 0.0;
+            return 1.0 - min(1.0, (1.0 - d) / s);
+        }
+        float one(float s, float d) {
+            if (mode == 1) return s * d;
+            if (mode == 2) return s + d - s * d;
+            if (mode == 3) return hard(d, s);
+            if (mode == 4) return soft(s, d);
+            if (mode == 5) return hard(s, d);
+            if (mode == 6) return min(s, d);
+            if (mode == 7) return max(s, d);
+            if (mode == 8) return dodge(s, d);
+            if (mode == 9) return burn(s, d);
+            if (mode == 10) return abs(s - d);
+            if (mode == 11) return s + d - 2.0 * s * d;
+            return min(1.0, s + d);
+        }
+        vec4 blended(vec2 tc, vec2 frag) {
+            vec4 s = TEX(src, tc) * opacity;
+            vec4 d = TEX(dst, frag / dstSize);
+            vec3 sc = s.a > 0.0 ? s.rgb / s.a : vec3(0.0);
+            vec3 dc = d.a > 0.0 ? d.rgb / d.a : vec3(0.0);
+            vec3 b = vec3(one(sc.r, dc.r), one(sc.g, dc.g), one(sc.b, dc.b));
+            return vec4((1.0 - s.a) * d.rgb + (1.0 - d.a) * s.rgb + s.a * d.a * b,
+                        s.a + d.a - s.a * d.a);
+        }
+    """
+
+    def _blend_program(self):
+        """The blend shader for this context (made once), or None."""
+        prog = getattr(self, '_blend_prog', None)
+        if prog is not None:
+            return prog
+        from PySide6.QtGui import QSurfaceFormat
+        from PySide6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader
+        ctx = self.context()
+        fmt = ctx.format()
+        if ctx.isOpenGLES():
+            head_v = head_f = "#version 100\nprecision highp float;\n"
+            vin, vout, fin, tex, outv = "attribute", "varying", "varying", "texture2D", "gl_FragColor"
+            decl = ""
+        elif fmt.profile() == QSurfaceFormat.CoreProfile:
+            head_v = head_f = "#version 330 core\n"
+            vin, vout, fin, tex, outv = "in", "out", "in", "texture", "fragColour"
+            decl = "out vec4 fragColour;\n"
+        else:
+            head_v = head_f = "#version 120\n"
+            vin, vout, fin, tex, outv = "attribute", "varying", "varying", "texture2D", "gl_FragColor"
+            decl = ""
+        vert = (head_v + f"{vin} vec2 pos;\nuniform mat4 matrix;\n{vout} vec2 tc;\n"
+                "void main() { tc = pos; gl_Position = matrix * vec4(pos, 0.0, 1.0); }\n")
+        frag = (head_f + f"#define TEX {tex}\n{fin} vec2 tc;\n{decl}" + self._BLEND_FRAG
+                + f"void main() {{ {outv} = blended(tc, gl_FragCoord.xy); }}\n")
+        prog = QOpenGLShaderProgram()
+        if not (prog.addShaderFromSourceCode(QOpenGLShader.Vertex, vert)
+                and prog.addShaderFromSourceCode(QOpenGLShader.Fragment, frag)
+                and prog.link()):
+            raise RuntimeError("blend shader: " + prog.log())
+        from PySide6.QtOpenGL import QOpenGLBuffer, QOpenGLVertexArrayObject
+        import struct
+        vao = QOpenGLVertexArrayObject()
+        vao.create()
+        vao.bind()
+        buf = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        buf.create()
+        buf.bind()
+        data = struct.pack('8f', 0, 0, 1, 0, 0, 1, 1, 1)
+        buf.allocate(data, len(data))
+        prog.bind()
+        loc = prog.attributeLocation("pos")
+        prog.enableAttributeArray(loc)
+        prog.setAttributeBuffer(loc, 0x1406, 0, 2)          # GL_FLOAT
+        prog.release()
+        buf.release()
+        vao.release()
+        self._blend_prog, self._blend_vao, self._blend_buf = prog, vao, buf
+        return prog
+
+    def _blend_layer(self, p, image, note, transform, opacity, mode, area):
+        """Draw a layer's image in blend mode *mode* (a QPainter
+        CompositionMode) over what is drawn so far. False when it cannot."""
+        code = self._blend_id(mode)
+        if code is None or self._blend_failed:
+            return False
+        from PySide6.QtGui import QMatrix4x4, QTransform
+        from PySide6.QtOpenGL import QOpenGLTexture
+        GL_TEXTURE_2D, GL_TEXTURE0, GL_BLEND, GL_SCISSOR_TEST = 0x0DE1, 0x84C0, 0x0BE2, 0x0C11
+        GL_TRIANGLE_STRIP = 0x0005
+        try:
+            p.beginNativePainting()
+            try:
+                if note is None:
+                    # (an image of its own each time - an impasto-lit layer):
+                    # sent whole when it is a new one, else kept
+                    notes = self.__dict__.setdefault('_blend_notes', {})
+                    note = notes.setdefault(image.cacheKey() >> 32, {'key': None, 'rects': [], 'all': True})
+                if image.format() != image.Format.Format_ARGB32_Premultiplied:
+                    image = image.convertToFormat(image.Format.Format_ARGB32_Premultiplied)
+                tex = self._layer_texture(image, note)
+                if tex is None:
+                    return False
+                prog = self._blend_program()
+                f = self.context().functions()
+                dpr = self.devicePixelRatioF()
+                W, H = self.width(), self.height()
+                dw, dh = int(round(W * dpr)), int(round(H * dpr))
+                # What is drawn so far, as a texture (the part being drawn).
+                dst = getattr(self, '_blend_dst', None)
+                if dst is None or (dst.width(), dst.height()) != (dw, dh):
+                    if dst is not None:
+                        dst.destroy()
+                    dst = self._blend_dst = QOpenGLTexture(QOpenGLTexture.Target2D)
+                    dst.setFormat(QOpenGLTexture.RGBA8_UNorm)
+                    dst.setSize(dw, dh)
+                    dst.setMipLevels(1)
+                    dst.allocateStorage(QOpenGLTexture.RGBA, QOpenGLTexture.UInt8)
+                    dst.setMinMagFilters(QOpenGLTexture.Nearest, QOpenGLTexture.Nearest)
+                    dst.setWrapMode(QOpenGLTexture.ClampToEdge)
+                dev = getattr(self, '_area_dev', None) if area is not None else None
+                box = dev if dev is not None else QRect(0, 0, dw, dh)
+                gx, gy = box.x(), dh - box.y() - box.height()       # GL: from the bottom
+                f.glViewport(0, 0, dw, dh)
+                f.glActiveTexture(GL_TEXTURE0 + 1)
+                f.glBindTexture(GL_TEXTURE_2D, dst.textureId())
+                f.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, gx, gy, gx, gy, box.width(), box.height())
+                f.glActiveTexture(GL_TEXTURE0)
+                f.glBindTexture(GL_TEXTURE_2D, tex.textureId())
+                if dev is not None:
+                    f.glEnable(GL_SCISSOR_TEST)
+                    f.glScissor(gx, gy, box.width(), box.height())
+                f.glDisable(GL_BLEND)           # the shader writes the result itself
+                # unit quad -> image px -> canvas -> clip space
+                quad = QTransform(image.width(), 0, 0, image.height(), 0, 0)
+                clip = QTransform(2.0 / W, 0, 0, -2.0 / H, -1.0, 1.0)
+                prog.bind()
+                prog.setUniformValue("matrix", QMatrix4x4(quad * transform * clip))
+                prog.setUniformValue1i("src", 0)
+                prog.setUniformValue1i("dst", 1)
+                prog.setUniformValue("dstSize", float(dw), float(dh))
+                prog.setUniformValue1f("opacity", float(opacity))
+                prog.setUniformValue1i("mode", int(code))
+                self._blend_vao.bind()
+                f.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+                self._blend_vao.release()
+                prog.release()
+                if dev is not None:
+                    f.glDisable(GL_SCISSOR_TEST)
+                f.glActiveTexture(GL_TEXTURE0 + 1)
+                f.glBindTexture(GL_TEXTURE_2D, 0)
+                f.glActiveTexture(GL_TEXTURE0)
+                return True
+            finally:
+                p.endNativePainting()
+        except Exception as e:
+            print(f"\U0001F3AE Layer blend modes off on the GPU: {e}")
+            self._blend_failed = True
+            return False
+
     def _drop_unused_textures(self):
         """Textures of images no longer drawn: freed (their memory)."""
         used = getattr(self, '_used_textures', None)
@@ -541,6 +750,11 @@ class GpuCanvasWindow(QOpenGLWindow):
     _drop_unused_textures = GpuView._drop_unused_textures
     draw_texture_id = GpuView.draw_texture_id
     _blit = GpuView._blit
+    _blend_id = GpuView._blend_id
+    _BLEND_FRAG = GpuView._BLEND_FRAG
+    _blend_program = GpuView._blend_program
+    _blend_layer = GpuView._blend_layer
+    _blend_failed = False
     _keep = GpuView._keep
     ready_for = GpuView.ready_for
     _textures_failed = False

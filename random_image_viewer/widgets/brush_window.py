@@ -30,6 +30,7 @@ class BrushWindow(QWidget):
     reset_requested = Signal()
     closed = Signal()
     drag_finished = Signal()                # moved by hand (it leaves / rejoins the dock)
+    gradient_colour_requested = Signal()    # 🌈 the swatch clicked: the app's colour picker for it
 
     WIDTH = 250
 
@@ -73,9 +74,15 @@ class BrushWindow(QWidget):
         ('scatter', 'Scatter', (0, 300), '%',
          "Throws each stamp off the stroke at random, up to this share of its size (airbrush, dust)"),
         ('size_jitter', 'Size ±', (0, 100), '%', "Each stamp up to this much smaller, at random"),
-        ('hue_jitter', 'Hue ±', (0, 100), '%', "Colour jitter: hue (100 % = anywhere on the wheel)"),
-        ('sat_jitter', 'Sat ±', (0, 100), '%', "Colour jitter: saturation"),
-        ('val_jitter', 'Value ±', (0, 100), '%', "Colour jitter: brightness"),
+        ('hue_jitter', 'Hue ±', (0, 100), '%',
+         "Colour jitter: hue - round the colour wheel, value and intensity kept "
+         "(100 % = anywhere on the wheel)"),
+        ('sat_jitter', 'Sat ±', (0, 100), '%',
+         "Colour jitter: saturation (chroma) - more intense, or greyer towards the grey of "
+         "the same value; never lighter or darker (100 % = grey .. twice as intense)"),
+        ('val_jitter', 'Value ±', (0, 100), '%',
+         "Colour jitter: value - lighter or darker, its place on a grey scale, at the same "
+         "intensity; the same step looks the same on every hue (100 % = black .. white)"),
     )
 
     def __init__(self, parent=None):
@@ -314,10 +321,64 @@ class BrushWindow(QWidget):
 
         self._jitter_marks = QCheckBox("Jitter lines && shapes too")
         self._jitter_marks.setToolTip(
-            "Ruler lines, straight lines, polylines and filled shapes get a colour jittered by "
-            "Hue / Sat / Value ± as well - a new one for each line or shape")
+            "Straight lines, polylines and filled shapes get colours jittered by Hue / Sat / "
+            "Value ± as well, following the Colour jitter above: one per line or shape, a block "
+            "per line-width (every stamp), bands along it (streaks) or every pixel (particles). "
+            "Ruler lines get one colour each")
         self._jitter_marks.toggled.connect(lambda on: self._emit('jitter_marks', on))
         inner.addWidget(self._jitter_marks)
+
+        self._lines_paint = QCheckBox("Lines are paint (else guides)")
+        self._lines_paint.setToolTip(
+            "On: new straight lines and polylines are part of the painting - the brushes "
+            "smudge, blend, smear and cover them.\nOff: they are guides, drawn over the paint, "
+            "hidden with \U0001F441 and copied across in ◧ Studio for measuring.\n"
+            "Lines already drawn keep what they are; ruler lines are always guides")
+        self._lines_paint.toggled.connect(lambda on: self._emit('lines_paint', on))
+        inner.addWidget(self._lines_paint)
+
+        self._mode_marks = QCheckBox("Lines && shapes use this mode")
+        self._mode_marks.setToolTip(
+            "In a mode other than Paint (Blend, Smudge, Smear, Push, Erase ...): a straight line "
+            "or polyline runs this brush along it, and a lasso / polygon / rectangle / ellipse "
+            "runs it over the whole shape, kept inside it - e.g. a lasso in Blend softens just "
+            "that area, in Erase cuts it out")
+        self._mode_marks.toggled.connect(lambda on: self._emit('mode_marks', on))
+        inner.addWidget(self._mode_marks)
+
+        # 🌈 the gradient tool (and shapes filled with a gradient)
+        grad_row = QHBoxLayout()
+        grad_row.setContentsMargins(0, 0, 0, 0)
+        self._gradient_kind = QComboBox()
+        self._gradient_kind.addItem("\U0001F308 Linear", 'linear')
+        self._gradient_kind.addItem("\U0001F308 Radial", 'radial')
+        self._gradient_kind.setToolTip("The \U0001F308 gradient tool: straight across (linear), "
+                                       "or out from where the drag starts (radial)")
+        self._gradient_kind.currentIndexChanged.connect(
+            lambda i: self._emit('gradient', self._gradient_kind.itemData(i)))
+        grad_row.addWidget(self._gradient_kind, 1)
+        self._gradient_to = QComboBox()
+        self._gradient_to.addItem("to transparent", False)
+        self._gradient_to.addItem("to colour →", True)
+        self._gradient_to.setToolTip("From the pen colour fading out, or into the second colour "
+                                     "(the swatch beside: click to pick it)")
+        self._gradient_to.currentIndexChanged.connect(lambda _i: self._emit_gradient_to())
+        grad_row.addWidget(self._gradient_to, 1)
+        self._gradient_swatch = QToolButton()
+        self._gradient_swatch.setFixedSize(22, 22)
+        self._gradient_swatch.setToolTip("The gradient's second colour - click to pick it")
+        self._gradient_colour = QColor('#f0a030')
+        self._paint_gradient_swatch()
+        self._gradient_swatch.clicked.connect(self._pick_gradient_colour)
+        grad_row.addWidget(self._gradient_swatch)
+        inner.addLayout(grad_row)
+        self._shape_gradient = QCheckBox("Shapes fill with the gradient")
+        self._shape_gradient.setToolTip(
+            "Lasso, polygon, rectangle, ellipse and triangle fill with the gradient above "
+            "instead of one colour: linear along the way you drag them (or their longer way), "
+            "radial from their middle out")
+        self._shape_gradient.toggled.connect(lambda on: self._emit('shape_gradient', on))
+        inner.addWidget(self._shape_gradient)
 
         checks = QHBoxLayout()
         checks.setContentsMargins(0, 0, 0, 0)
@@ -441,6 +502,16 @@ class BrushWindow(QWidget):
         self._angle_mode.setCurrentIndex(self._angle_mode.findData(settings['angle_mode']))
         self._jitter_mode.setCurrentIndex(self._jitter_mode.findData(settings['jitter_per_stamp']))
         self._jitter_marks.setChecked(bool(settings.get('jitter_marks', False)))
+        self._lines_paint.setChecked(bool(settings.get('lines_paint', True)))
+        self._mode_marks.setChecked(bool(settings.get('mode_marks', True)))
+        self._gradient_kind.setCurrentIndex(max(0, self._gradient_kind.findData(settings.get('gradient', 'linear'))))
+        to = settings.get('gradient_to') or ''
+        if to:
+            self._gradient_colour = QColor(to)
+            self._paint_gradient_swatch()
+        self._gradient_to.setCurrentIndex(1 if to else 0)
+        self._gradient_swatch.setEnabled(bool(to))
+        self._shape_gradient.setChecked(bool(settings.get('shape_gradient', False)))
         self._size_pressure.setChecked(settings['size_pressure'])
         self._opacity_pressure.setChecked(settings['opacity_pressure'])
         self._quiet = False
@@ -454,7 +525,8 @@ class BrushWindow(QWidget):
         # or smudges (painting Round is the plain pen).
         stamped = bool(path) or self._mode_value != 'paint'
         for widget in self._texture_widgets:
-            widget.setEnabled(stamped)
+            # (the jitter mode also serves lines and shapes, as its sliders)
+            widget.setEnabled(stamped or widget is self._jitter_mode)
         for key, (slider, _value, _unit) in self._sliders.items():
             # The colour jitter also serves lines and shapes (Jitter lines &
             # shapes too), so it stays usable with the plain round pen.
@@ -494,6 +566,49 @@ class BrushWindow(QWidget):
     def _emit(self, key, value):
         if not self._quiet:
             self.setting_changed.emit(key, value)
+
+    # 🌈 the gradient's second colour
+    def _paint_gradient_swatch(self):
+        pix = QPixmap(16, 16)
+        pix.fill(self._gradient_colour)
+        self._gradient_swatch.setIcon(QIcon(pix))
+
+    def _emit_gradient_to(self):
+        on = bool(self._gradient_to.currentData())
+        self._gradient_swatch.setEnabled(on)
+        self._emit('gradient_to', self._gradient_colour.name() if on else '')
+
+    def _pick_gradient_colour(self):
+        # Ova's own picker (with the palette), opened by the app at the swatch
+        self.gradient_colour_requested.emit()
+
+    def gradient_colour(self):
+        return QColor(self._gradient_colour)
+
+    def gradient_swatch(self):
+        return self._gradient_swatch
+
+    def show_second_colour(self, colour):
+        """The app's second colour changed (picked anywhere): the swatch,
+        and - when the gradient goes to a colour - it goes to this one."""
+        if not colour.isValid():
+            return
+        self._gradient_colour = QColor(colour)
+        self._paint_gradient_swatch()
+        if self._gradient_to.currentIndex() == 1:
+            self._emit_gradient_to()
+
+    def set_gradient_colour(self, colour):
+        """The second colour picked (live, as the picker moves): the swatch,
+        and the gradient goes to it."""
+        if not colour.isValid():
+            return
+        self._gradient_colour = QColor(colour)
+        self._paint_gradient_swatch()
+        if self._gradient_to.currentIndex() != 1:
+            self._gradient_to.setCurrentIndex(1)     # (emits)
+        else:
+            self._emit_gradient_to()
 
     # ── drag by the header ────────────────────────────────────────
 

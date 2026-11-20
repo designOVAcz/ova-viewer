@@ -89,7 +89,10 @@ class Layer:
         """
         return (self.opacity == 100 and self.blend == 'Normal' and not self.impasto
                 and not self.marks['erase_strokes'] and self.fill is None
-                and not any(getattr(s, 'erase', False) for s in self.marks['drawn_free_strokes']))
+                and not any(getattr(s, 'erase', False) for s in self.marks['drawn_free_strokes'])
+                # (a 🧊 push that replaces paint cuts the layer's own pixels)
+                and not any(isinstance(m, dict) and m.get('cut') is not None
+                            for m in self.marks['drawn_images']))
 
     def has_content(self):
         """Marks, or paper: anything this layer puts on screen."""

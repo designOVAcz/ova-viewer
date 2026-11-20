@@ -9,6 +9,8 @@
 | `Ctrl+Esc` | Force exit fullscreen |
 | `Alt+F4` | Close application |
 | `Ctrl+O` | Open folder |
+| `Ctrl+S` | 💼 Save the painting as an Ova project (`.ova`): picture, Studio / sketch, layers and marks, palette, view. Asks where the first time |
+| `Ctrl+Shift+S` | 💼 Save the project under a new name |
 | `Ctrl+V` | Paste an image or a file path from the clipboard |
 | `Ctrl+G` | Go to image number / PDF page |
 | `Ctrl+U` | Hide / show all panels (minimal mode) |
@@ -57,6 +59,9 @@ the drawing).
 | Shortcut | Action |
 |---|---|
 | `I` | Colour snap (eyedropper) on / off. Picked up while a tool is on (brush, eraser, a fill …), one pick takes the colour and hands back to that tool; with no tool on it stays on for more picks |
+| `Alt+click` | With the eyedropper, or on a 💉 palette / value swatch: sets the **second colour** (the 🌈 gradient's other end) instead of the pen colour |
+| `X` | Swap the pen colour and the second colour (also ⇄ in the 🎨 colour picker) |
+| `Shift` (dragging a 🌈 gradient) | Its direction in 15° steps |
 | `Ctrl+Z` | Undo the last mark (while placing a polygon: remove its last corner) |
 | T slider (opacity, with %) | Opacity of the next marks: click anywhere on it to jump there, then drag; wheel / arrow keys step 5 %. Marks already drawn keep theirs |
 | `Ctrl+Shift+A` | Toggle antialiasing |

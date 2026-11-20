@@ -451,7 +451,13 @@ class FloatingPanel(QWidget):
             return
         if self._drag_offset is not None:
             parent = self.parentWidget()
-            new_pos = self.mapToParent(pos - self._drag_offset)
+            # From the global cursor, not the panel-local one: the panel is a
+            # native window (above the GPU canvas), and a local position can
+            # still refer to where it was before the last move - the panel
+            # then flips between two places while it is dragged.
+            glob = event.globalPosition().toPoint()
+            new_pos = ((parent.mapFromGlobal(glob) if parent is not None else glob)
+                       - self._drag_offset)
             if parent is not None:
                 max_x = max(0, parent.width() - self.width())
                 max_y = max(0, parent.height() - self.height())
