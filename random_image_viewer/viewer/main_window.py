@@ -257,6 +257,36 @@ class _PenProximityWatch(QObject):
         return False
 
 
+class _StrokeEndWatch(QObject):
+    """A stroke (or erase) left open: the pen or mouse let go somewhere the
+    canvas never heard of it - over a panel lying on the canvas (a window of
+    its own above the GPU canvas), outside the window, the app losing focus.
+    Left open, the app took it for a stroke still under way: two fingers
+    would not pan or zoom, the tool kept acting as if drawing - until another
+    tool was picked. Any release anywhere, or focus going, ends it."""
+
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self._viewer = viewer
+        self._queued = False
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t in (QEvent.TabletRelease, QEvent.MouseButtonRelease, QEvent.ApplicationDeactivate,
+                 QEvent.WindowDeactivate, QEvent.TabletLeaveProximity):
+            v = self._viewer
+            if (getattr(v, 'is_drawing_free_stroke', False) or getattr(v, 'is_erasing', False)) \
+                    and not self._queued:
+                # after the canvas has had the event (its own release ends it)
+                self._queued = True
+                QTimer.singleShot(0, self._check)
+        return False
+
+    def _check(self):
+        self._queued = False
+        self._viewer._end_stale_stroke()
+
+
 class RulerLine(float):
     """A vertical / horizontal ruler line position, plus the size and colour
     it was placed with.
@@ -1287,7 +1317,14 @@ class RandomImageViewer(QMainWindow):
                 if not (getattr(mark, 'color', None) and getattr(mark, 'thickness', None)):
                     return True
             elif kind in ('free_line', 'fill'):
-                if not isinstance(mark, dict) or 'color' not in mark or not mark.get('thickness'):
+                if not isinstance(mark, dict) or 'color' not in mark:
+                    return True
+                # A width only where there is a line: a filled shape (or a
+                # 🌈 gradient) has none - counted as following the pen, a
+                # single fill put the pen's colour and size into the layer's
+                # key, and every colour change laid the whole layer again
+                # (the "loading" every few strokes in a big painting).
+                if (kind == 'free_line' or mark.get('shape') == 'polyline') and not mark.get('thickness'):
                     return True
         return False
 
@@ -1781,17 +1818,22 @@ class RandomImageViewer(QMainWindow):
         *before*: its texture on the graphics card gets just those (see
         GpuView._layer_texture). A change not noted breaks the chain of
         keys, and the whole image goes up again - never a stale copy."""
-        notes = self.__dict__.get('_canvas_notes')
-        entry = notes.get(image.cacheKey() >> 32) if notes else None
-        if entry is None:
-            return              # not on the graphics card yet: it goes up whole
-        if entry.get('key') != before:
-            entry['all'] = True
-        else:
-            entry['rects'] = list(entry.get('rects') or []) + [QRect(r) for r in rects if not r.isEmpty()]
-            if len(entry['rects']) > 64:
+        # One record per GPU window (the canvas, the zoom window): each keeps
+        # its own copy of the image. Shared, the zoom window (zooming with a
+        # shape or gradient tool on) took the changes up into its copy and
+        # marked them done - the canvas's copy stayed without them: gradients
+        # gone on going back to the brush, back a stroke's box at a time.
+        for notes in (self.__dict__.get('_canvas_notes') or {}).values():
+            entry = notes.get(image.cacheKey() >> 32)
+            if entry is None:
+                continue            # not on that card yet: it goes up whole
+            if entry.get('key') != before:
                 entry['all'] = True
-        entry['key'] = image.cacheKey()
+            else:
+                entry['rects'] = list(entry.get('rects') or []) + [QRect(r) for r in rects if not r.isEmpty()]
+                if len(entry['rects']) > 64:
+                    entry['all'] = True
+            entry['key'] = image.cacheKey()
 
     def _undo_patches(self, layer, kept, marks):
         """*layer*'s image back to *marks* (fewer than it holds) by putting
@@ -2806,6 +2848,9 @@ class RandomImageViewer(QMainWindow):
         self._view_in_motion = False    # zoom / pan under way: marks follow cheaply
         self._touch_pan = None          # Wacom two-finger pan, see _start_touch_pan
         QTimer.singleShot(0, self._start_touch_pan)
+        # a stroke left open by a release the canvas never got (see _StrokeEndWatch)
+        self._stroke_end_watch = _StrokeEndWatch(self)
+        QApplication.instance().installEventFilter(self._stroke_end_watch)
         self._settle_wanted = {}        # layer id -> (w, h, view) to lay once it rests
         self._settle_job = None
         self._blend_under = None    # Blend: what is under the stroke, as Sample reads it
@@ -10071,6 +10116,8 @@ class RandomImageViewer(QMainWindow):
         self._save_brush_settings()
         if size and int(size) != self.line_thickness:
             self.set_brush_size(size)
+        if key == 'gradient_mid':
+            self._regrade_last_gradient()
         if key == 'mode':
             self._refresh_brush_window()
             self._update_brush_mode_button()
@@ -11106,7 +11153,8 @@ class RandomImageViewer(QMainWindow):
     #
     # A gradient is a fill (a shape, or the whole sheet for the gradient
     # tool) with 'gradient': {'type': 'linear' | 'radial', 'start', 'end'
-    # (picture coords), 'to': '#rrggbb' or None (transparent)}. Laid pixel by
+    # (picture coords), 'to': '#rrggbb' or None (transparent), 'mid': 0..1
+    # where the colours are half mixed (gradient_bias; missing = 0.5)}. Laid pixel by
     # pixel where it is drawn: the colours mixed in OKLab (gradient_lut), a
     # fine dither so a wide one shows no steps, cut to its shape.
 
@@ -11140,6 +11188,7 @@ class RandomImageViewer(QMainWindow):
             length2 = max(1e-9, dx * dx + dy * dy)
             t = ((px - sx) * dx + (py - sy) * dy) / length2
         t = np.clip(t, 0.0, 1.0).astype(np.float32)
+        t = brushes.gradient_bias(t, g.get('mid', 0.5)).astype(np.float32)   # the Middle slider
         alpha0 = color.alphaF()
         rgb0 = (color.redF(), color.greenF(), color.blueF())
         to = g.get('to')
@@ -11221,8 +11270,31 @@ class RandomImageViewer(QMainWindow):
             mid_v = sum(-p[0] * sa + p[1] * ca for p in pts) / len(pts)
             start = (u0 * ca - mid_v * sa, u0 * sa + mid_v * ca)
             end = (u1 * ca - mid_v * sa, u1 * sa + mid_v * ca)
+        mid = min(95, max(5, int(s.get('gradient_mid', 50)))) / 100.0
         return {'type': kind, 'start': (float(start[0]), float(start[1])),
-                'end': (float(end[0]), float(end[1])), 'to': to}
+                'end': (float(end[0]), float(end[1])), 'to': to, 'mid': mid}
+
+    def _regrade_last_gradient(self):
+        """🌈 The Middle slider moved: the gradient just laid (still the last
+        thing done on this layer) takes the new middle, so it can be tuned
+        while looking at it. Anything drawn after it leaves it as it is."""
+        fills = getattr(self, 'drawn_fills', None)
+        stack = getattr(self, '_undo_stack', None)
+        if not fills or not stack or stack[-1] != 'fill' or not fills[-1].get('gradient'):
+            return
+        mid = min(95, max(5, int(self.brush_settings.get('gradient_mid', 50)))) / 100.0
+        record = fills[-1]
+        if abs(record['gradient'].get('mid', 0.5) - mid) < 1e-6:
+            return
+        grad = dict(record['gradient'])      # (a new one: an undo snapshot keeps the old)
+        grad['mid'] = mid
+        record['gradient'] = grad
+        # the layer's baked image counts its marks, not what is in them: built
+        # anew, as after a transform
+        self.active_layer.raster = None
+        if hasattr(self, '_lut_process_cache'):
+            self._lut_process_cache.clear()
+        self._refresh_marks()
 
     def _fill_gets_gradient(self, shape):
         """True when a fill of *shape* is a gradient: the gradient tool, or
@@ -11239,7 +11311,8 @@ class RandomImageViewer(QMainWindow):
             q = to_screen(*p)
             return QPointF(q.x(), q.y()) if hasattr(q, 'x') else QPointF(q[0], q[1])
         return (at(gradient['start']), at(gradient['end']), gradient.get('type') == 'radial',
-                QColor(colour), QColor(gradient['to']) if gradient.get('to') else None)
+                QColor(colour), QColor(gradient['to']) if gradient.get('to') else None,
+                gradient.get('mid', 0.5))
 
     def _gradient_preview_brush(self, gradient, to_screen, colour):
         """A QBrush showing *gradient* on screen while it is dragged (Qt's
@@ -11260,14 +11333,22 @@ class RandomImageViewer(QMainWindow):
         else:
             end.setAlpha(0)
         grad.setColorAt(0.0, QColor(colour))
+        # stops between, bent by the Middle slider (and mixed in OKLab), so
+        # the preview matches the result
+        mid = gradient.get('mid', 0.5)
+        steps = 16
         if gradient.get('to'):
-            # a few OKLab stops between, so the preview matches the result
             lut = brushes.gradient_lut((colour.redF(), colour.greenF(), colour.blueF()),
-                                       (end.redF(), end.greenF(), end.blueF()), 9)
-            for i in range(1, 8):
-                c = QColor.fromRgbF(*[float(v) for v in lut[i]])
+                                       (end.redF(), end.greenF(), end.blueF()), 257)
+        for i in range(1, steps):
+            u = float(brushes.gradient_bias(i / steps, mid))
+            if gradient.get('to'):
+                c = QColor.fromRgbF(*[float(v) for v in lut[int(round(u * 256))]])
                 c.setAlpha(colour.alpha())
-                grad.setColorAt(i / 8, c)
+            else:
+                c = QColor(colour)
+                c.setAlphaF(colour.alphaF() * (1.0 - u))
+            grad.setColorAt(i / steps, c)
         grad.setColorAt(1.0, end)
         return QBrush(grad)
 
@@ -13486,6 +13567,7 @@ class RandomImageViewer(QMainWindow):
             # Get current display state once and cache it
             label = self.image_label
             if not label or not label.pixmap() or label.pixmap().isNull():
+                self.is_drawing_free_stroke = False     # (not left marked as under way)
                 return
                 
             # Cache display parameters for ultra-fast coordinate conversion
@@ -17972,10 +18054,12 @@ class RandomImageViewer(QMainWindow):
                 gpu = None
         return gpu if gpu is not None and not gpu.failed else None
 
-    def _gpu_scene(self):
+    def _gpu_scene(self, target='canvas'):
         """(background, items, overlay) of the view now for the GPU window -
         the picture as shown (effects in) and each layer's own image through
-        the view, the guides over them - or None where it cannot show it."""
+        the view, the guides over them - or None where it cannot show it.
+        *target*: which GPU window it is for ('canvas' / 'view'), each with
+        its own record of where the layer images changed (_canvas_note)."""
         label = getattr(self, 'image_label', None)
         pic = getattr(self, 'original_pixmap', None)
         path = self.current_image
@@ -18013,11 +18097,11 @@ class RandomImageViewer(QMainWindow):
                 note = None
                 if source is canvas:
                     # Kept on the graphics card, updated where it changed (see _canvas_note).
-                    notes = self.__dict__.setdefault('_canvas_notes', {})
+                    notes = self.__dict__.setdefault('_canvas_notes', {}).setdefault(target, {})
                     note = notes.setdefault(canvas.cacheKey() >> 32, {'key': None, 'rects': [], 'all': True})
                     seen.add(canvas.cacheKey() >> 32)
                 items.append((source, to_picture * to_view, layer.opacity / 100.0, mode, note))
-        notes = self.__dict__.get('_canvas_notes')
+        notes = (self.__dict__.get('_canvas_notes') or {}).get(target)
         if notes:
             for serial in [s_ for s_ in notes if s_ not in seen]:
                 del notes[serial]       # images no longer shown
@@ -18063,12 +18147,12 @@ class RandomImageViewer(QMainWindow):
         showed one; the plain canvas takes over once the view rests."""
         if not getattr(self, '_view_in_motion', False) or getattr(self, 'is_drawing_free_stroke', False):
             return False
-        gpu = (self.__dict__.get('_gpu_canvas') if self.__dict__.get('_gpu_display')
-               else self._gpu_view_get())
+        on_canvas = bool(self.__dict__.get('_gpu_display'))
+        gpu = self.__dict__.get('_gpu_canvas') if on_canvas else self._gpu_view_get()
         if gpu is None:
             return False
         try:
-            scene = self._gpu_scene()
+            scene = self._gpu_scene('canvas' if on_canvas else 'view')
             if scene is None:
                 return False
             if not gpu.active and not gpu.ready_for(scene[1]):
@@ -19215,6 +19299,54 @@ class RandomImageViewer(QMainWindow):
         elif label.is_animation_paused():
             label.gif_toggle_play_pause()
 
+    def _stroke_really_down(self):
+        """True while a pen or mouse is actually pressed - a stroke under
+        way, not one only left marked as such."""
+        if self._buttons_down():
+            return True
+        return time.monotonic() - getattr(self, '_pen_touch_time', 0.0) < 0.15
+
+    def _buttons_down(self):
+        """A mouse button (or the pen's tip, which Windows reports as the
+        left button) really pressed now. Asked of Windows itself: Qt's own
+        record (QApplication.mouseButtons) is kept from mouse events, and
+        with the brush taking the pen's tablet events a release could leave
+        it 'pressed' - two fingers then never panned until the brush was
+        switched off (the pen a plain mouse again, the record put right)."""
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                state = ctypes.windll.user32.GetAsyncKeyState
+                return any(state(vk) & 0x8000 for vk in (0x01, 0x02, 0x04))
+            except Exception:
+                pass
+        return QApplication.mouseButtons() != Qt.NoButton
+
+    def _end_stale_stroke(self):
+        """A stroke / erase still marked under way with nothing pressed:
+        finished now, as its release would have (see _StrokeEndWatch).
+        True when one was ended."""
+        if self._stroke_really_down():
+            return False
+        ended = False
+        if getattr(self, 'is_drawing_free_stroke', False):
+            try:
+                self.end_free_draw_stroke()
+            except Exception as e:
+                print(f"Stale stroke end: {e}")
+            self.is_drawing_free_stroke = False
+            ended = True
+        if getattr(self, 'is_erasing', False):
+            try:
+                self.end_erase_stroke()
+            except Exception as e:
+                print(f"Stale erase end: {e}")
+            self.is_erasing = False
+            ended = True
+        if ended:
+            print("Stroke left open (its release went elsewhere) - ended")
+        return ended
+
     _TOUCH_PAN_PX_PER_MM = 8.0     # screen px the picture moves per mm the fingers move
     _TOUCH_PEN_QUIET_S = 0.4       # touch pans only once the pen has been off the tablet this long
 
@@ -19245,11 +19377,31 @@ class RandomImageViewer(QMainWindow):
         self._touch_pan_timer.timeout.connect(self._smart_zoom_display)
         print("Wacom two-finger pan: on")
 
+    def _app_active(self):
+        """This window, or one of its own (a floating panel - Brush, Colour,
+        Layers ... - a dialog), has the focus: Ova is the program in use.
+        Only this window counted, and once a panel was clicked (a brush
+        tip picked) two fingers did nothing until the canvas was clicked."""
+        if self.isActiveWindow():
+            return True
+        w = QApplication.activeWindow()
+        while w is not None:
+            if w is self:
+                return True
+            w = w.parentWidget()
+        return False
+
     def _on_touch_pan(self, dx_mm, dy_mm):
         """Two fingers moved on the tablet: the picture follows them - at any
         zoom, 100 % and below too, in the plain view as in ◧ Studio."""
         label = getattr(self, 'image_label', None)
-        if label is None or not self.isActiveWindow() or not self.current_image:
+        if label is None or not self.current_image:
+            return
+        if not self._app_active():
+            now = time.monotonic()
+            if now - getattr(self, '_touch_pan_refused_t', 0.0) > 2.0:
+                self._touch_pan_refused_t = now
+                print("Two-finger pan held back: Ova is not the program in use")
             return
         # Painting: a wrist or palm on the tablet must not move the picture.
         # A stroke or erase under way, a button held, or the pen on the
@@ -19258,10 +19410,20 @@ class RandomImageViewer(QMainWindow):
         # hovering pen all the time (its cursor, its lean), and that alone
         # kept two fingers from ever panning while painting (the driver
         # already ignores a touch it takes for a resting hand).
-        if (getattr(self, 'is_drawing_free_stroke', False)
-                or getattr(self, 'is_erasing', False)
-                or QApplication.mouseButtons() != Qt.NoButton
-                or time.monotonic() - getattr(self, '_pen_touch_time', 0.0) < self._TOUCH_PEN_QUIET_S):
+        if ((getattr(self, 'is_drawing_free_stroke', False) or getattr(self, 'is_erasing', False))
+                and time.monotonic() - getattr(self, '_pen_touch_time', 0.0) > self._TOUCH_PEN_QUIET_S):
+            self._end_stale_stroke()        # marked under way, but the pen is long off: left open
+        why = ('a stroke under way' if getattr(self, 'is_drawing_free_stroke', False)
+               else 'an erase under way' if getattr(self, 'is_erasing', False)
+               else 'a button pressed' if self._buttons_down()
+               else 'the pen just on the tablet'
+               if time.monotonic() - getattr(self, '_pen_touch_time', 0.0) < self._TOUCH_PEN_QUIET_S
+               else None)
+        if why is not None:
+            now = time.monotonic()
+            if now - getattr(self, '_touch_pan_refused_t', 0.0) > 2.0:
+                self._touch_pan_refused_t = now
+                print(f"Two-finger pan held back: {why}")
             return
         label.pan_offset_x += dx_mm * self._TOUCH_PAN_PX_PER_MM
         label.pan_offset_y += dy_mm * self._TOUCH_PAN_PX_PER_MM

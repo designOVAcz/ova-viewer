@@ -713,15 +713,26 @@ class GpuFlatStroke:
         if self._reach is None:
             first = self._first
             f_frame = texture.motion_frame(level, self._turn(first, d))
-            reach = f_frame['w'] * first[2] / tip_long / 2
-            self._reach = (first[0] + d[0] * reach, first[1] + d[1] * reach)
+            # The body grows from the first stamp's middle, inside the tip
+            # laid there whole (holes closed, see motion_frame 'whole'). From
+            # its front edge, with the tip's front filled out to it, the
+            # start was a square slab that stood out as the stroke curved.
+            self._reach = (first[0], first[1])
             self._width = f_frame['h'] * first[2] / tip_long
             self.head = (first, self._turn(first, d), d)
+            # The reach starts at the first stamp's front edge, half a tip
+            # ahead: the next few stamps lie behind it. That is the pen
+            # still crossing the first stamp, not turning back - taken for
+            # a turn, every stroke restarted at its second stamp, its head
+            # the raw tip (a speckled tip's holes as a dark blob at the
+            # start) and never the filled 'front'.
+            self._in_head = True
         tx, ty = stamp[0], stamp[1]
         rx, ry = self._reach
         vx, vy = tx - rx, ty - ry
         far = math.hypot(vx, vy)
-        if far >= 0.25 and vx * d[0] + vy * d[1] < self.REVERSE_COS * far:
+        if (not getattr(self, '_in_head', False) and far >= 0.25
+                and vx * d[0] + vy * d[1] < self.REVERSE_COS * far):
             self._dir = step
             frame = texture.motion_frame(level, self._turn(stamp, step))
             self._reach = (tx, ty)
@@ -732,6 +743,7 @@ class GpuFlatStroke:
         if (tx - rx) * d[0] + (ty - ry) * d[1] < 0.25:
             return []
         self._reach = (tx, ty)
+        self._in_head = False
         span = math.hypot(tx - rx, ty - ry)
         was = self._width
         width = min(max(width, was - self.FLARE * span), was + self.FLARE * span)
@@ -851,14 +863,18 @@ class GpuFlatStroke:
                 first, turn, d = self.head
                 if self._restart:
                     self._flush_piece(sink)
-                    sink.append((_mul(_place(first[0], first[1], first[2], first[3], lw, lh, tip_long), v),
-                                 lw, lh, texture, ('tip', level), step, 255, ('tip', first[5]), None))
+                    frame = texture.motion_frame(level, turn)
+                    tq = int(round(turn / fs) * fs) % 360
+                    m = _place(first[0], first[1], first[2], math.atan2(d[1], d[0]),
+                               frame['w'], frame['h'], tip_long)
+                    sink.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'whole'),
+                                 step, 255, ('frame-end', first[5]), None))
                 else:
                     frame = texture.motion_frame(level, turn)
                     tq = int(round(turn / fs) * fs) % 360
                     m = _place(first[0], first[1], first[2], math.atan2(d[1], d[0]),
                                frame['w'], frame['h'], tip_long)
-                    sink.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'front'),
+                    sink.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'whole'),
                                  step, 255, ('frame-end', first[5]), None))
             for piece in pieces:
                 piece['lay'] = (level, int(round(piece['turn'] / fs) * fs) % 360, step, stamp[5], texture)
@@ -881,8 +897,11 @@ class GpuFlatStroke:
             frame = texture.motion_frame(level, turn)
             fs = texture.FRAME_STEP
             tq = int(round(turn / fs) * fs) % 360
-            out.append((_mul(_place(stamp[0], stamp[1], stamp[2], stamp[3], lw, lh, tip_long), v),
-                        lw, lh, texture, ('tip', level), step, 255, ('tip', stamp[5]), None))
+            m = _place(stamp[0], stamp[1], stamp[2], math.atan2(d[1], d[0]), frame['w'], frame['h'],
+                       tip_long)
+            # the tip itself, its holes closed, streaks along the stroke (BrushTexture.motion_frame)
+            out.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'whole'),
+                        step, 255, ('frame-end', stamp[5]), None))
             rx, ry = self._reach
             big = 4 * (frame['w'] + frame['h']) * stamp[2] / tip_long + 4
             ax, ay = d

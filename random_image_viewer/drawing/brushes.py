@@ -56,6 +56,7 @@ DEFAULT_SETTINGS = {
     'gradient': 'linear',       # 🌈 the gradient tool: 'linear' or 'radial'
     'gradient_to': '',          # 🌈 ... from the pen colour to this ('#rrggbb'), '' = transparent
     'shape_gradient': False,    # 🌈 shapes fill with the gradient instead of one colour
+    'gradient_mid': 50,         # 🌈 % along it where the colours are half mixed (gradient_bias)
     'mode_marks': True,         # in a mode other than Paint, lines run the brush along
                                 #   them and shapes run it over their area (clipped to it)
     'jitter_per_stamp': False,  # True: every stamp its own colour; 'streaks':
@@ -306,6 +307,16 @@ def gradient_lut(rgb0, rgb1, n=1024):
     b = _rgb_to_oklab(np.array([rgb1], np.float64))[0]
     t = np.linspace(0.0, 1.0, n)[:, None]
     return _linear_to_srgb(_oklab_to_linear(a + (b - a) * t))
+
+
+def gradient_bias(t, mid):
+    """🌈 *t* (0..1, a float or numpy array) bent so the half-way mix falls
+    at *mid* (0..1) instead of 0.5: t ** (ln ½ / ln mid). The ends stay put;
+    mid 0.5 leaves it as it is."""
+    mid = min(0.98, max(0.02, float(mid)))
+    if abs(mid - 0.5) < 1e-6:
+        return t
+    return t ** (math.log(0.5) / math.log(mid))
 
 
 def jitter_color(color, settings, rng=random):
@@ -623,7 +634,13 @@ class BrushTexture:
         'front': the turned tip with each row filled on from its leading ink
             to the frame's leading edge - the stroke's start as it drags;
         'back': each row filled from the trailing edge up to its leading
-            ink - the stroke's end, the tip's own ragged front.
+            ink - the stroke's end, the tip's own ragged front;
+        'whole': the turned tip with each row filled between its trailing
+            and leading ink - the tip's ragged outline, its holes closed
+            (the tail under the pen). The raw tip there let a speckled tip's
+            holes show the canvas: a dark speckled blob where the stroke
+            started and ended, and, its streaks laid along the tip's own
+            axis, bands across the stroke when pen tilt turns the tip.
         Working in the motion's frame, the stroke's width is the tip's real
         footprint across the motion whatever its turn, so it changes
         smoothly round a curve instead of flipping between the tip's sides."""
@@ -661,6 +678,7 @@ class BrushTexture:
         has = lit.any(axis=1)
         cols = np.arange(fw)[None, :]
         lead = np.where(has, fw - 1 - np.argmax(lit[:, ::-1], axis=1), -1)[:, None]
+        trail = np.where(has, np.argmax(lit, axis=1), fw)[:, None]
 
         def image(values2d):
             out = np.ascontiguousarray(values2d.clip(0, 255).astype(np.uint8))
@@ -669,10 +687,13 @@ class BrushTexture:
             return QImage(np.ascontiguousarray(px).tobytes(), ww, hh, ww * 4,
                           QImage.Format_ARGB32_Premultiplied).copy()
         rows = np.where(has, v, 0)[:, None]
-        front = np.maximum(alpha, np.where((cols >= lead) & has[:, None], rows, 0))
+        # (front: from the trailing ink on, so the first stamp's holes close
+        # once the drag starts - see 'whole')
+        front = np.maximum(alpha, np.where((cols >= trail) & has[:, None], rows, 0))
         back = np.maximum(alpha, np.where((cols <= lead) & has[:, None], rows, 0))
+        whole = np.maximum(alpha, np.where((cols >= trail) & (cols <= lead) & has[:, None], rows, 0))
         frame = {'w': fw, 'h': fh, 'profile': image(v[:, None]),
-                 'front': image(front), 'back': image(back)}
+                 'front': image(front), 'back': image(back), 'whole': image(whole)}
         self._tints[key] = frame
         return frame
 
@@ -1703,16 +1724,27 @@ class FlatStroke:
         if self._reach is None:
             first = self._first
             f_frame = texture.motion_frame(level, self._turn(first, d))
-            reach = f_frame['w'] * first[2] / tip_long / 2
-            self._reach = (first[0] + d[0] * reach, first[1] + d[1] * reach)
+            # The body grows from the first stamp's middle, inside the tip
+            # laid there whole (holes closed, see motion_frame 'whole'). From
+            # its front edge, with the tip's front filled out to it, the
+            # start was a square slab that stood out as the stroke curved.
+            self._reach = (first[0], first[1])
             self._width = f_frame['h'] * first[2] / tip_long
             self.head = (first, self._turn(first, d), d)
+            # The reach starts at the first stamp's front edge, half a tip
+            # ahead: the next few stamps lie behind it. That is the pen
+            # still crossing the first stamp, not turning back - taken for
+            # a turn, every stroke restarted at its second stamp, its head
+            # the raw tip (a speckled tip's holes as a dark blob at the
+            # start) and never the filled 'front'.
+            self._in_head = True
             old_dir = d
         tx, ty = stamp[0], stamp[1]
         rx, ry = self._reach
         vx, vy = tx - rx, ty - ry
         far = math.hypot(vx, vy)
-        if far >= 0.25 and vx * d[0] + vy * d[1] < self.REVERSE_COS * far:
+        if (not getattr(self, '_in_head', False) and far >= 0.25
+                and vx * d[0] + vy * d[1] < self.REVERSE_COS * far):
             # Turned back (or very sharply): the eased direction still points
             # the old way, and a piece from where the body got to would be
             # sheared across it into a long thin spike. Start afresh here
@@ -1728,6 +1760,7 @@ class FlatStroke:
         if (tx - rx) * d[0] + (ty - ry) * d[1] < 0.25:
             return []
         self._reach = (tx, ty)
+        self._in_head = False
         span = math.hypot(tx - rx, ty - ry)
         was = self._width
         width = min(max(width, was - self.FLARE * span), was + self.FLARE * span)
@@ -1896,12 +1929,16 @@ class FlatStroke:
                     # turned back: the ribbon so far ends here, a new one
                     # starts from the tip as it is
                     self._flush_piece(lay, view, scale)
-                    lay(_stamp_matrix(first, plain, view), plain, texture.coloured(level, first[5]))
+                    # (the tip with its holes closed, streaks along the stroke - see motion_frame)
+                    frame = texture.motion_frame(level, turn)
+                    lay(self._frame_matrix(first, frame, d, tip_long, view),
+                        texture.frame_variant(level, turn, 'whole', step=step),
+                        texture.frame_variant(level, turn, 'whole', rgb=first[5]))
                 else:
                     frame = texture.motion_frame(level, turn)
                     lay(self._frame_matrix(first, frame, d, tip_long, view),
-                        texture.frame_variant(level, turn, 'front', step=step),
-                        texture.frame_variant(level, turn, 'front', rgb=first[5]))
+                        texture.frame_variant(level, turn, 'whole', step=step),
+                        texture.frame_variant(level, turn, 'whole', rgb=first[5]))
             for piece in pieces:
                 turn = piece['turn']
                 images = (texture.frame_variant(level, turn, 'profile', step=step),
@@ -1938,7 +1975,6 @@ class FlatStroke:
         frame = texture.motion_frame(level, turn)
         to_local = view * QTransform.fromTranslate(-self.rect.x() - local.x(),
                                                    -self.rect.y() - local.y())
-        tip_m = _stamp_matrix(stamp, plain, QTransform()) * to_local
         frame_m = self._frame_matrix(stamp, frame, d, tip_long, QTransform()) * to_local
         # The fill only ahead of what the body has laid: from there on to the
         # tip's leading ink, so a short stroke does not paint over its head.
@@ -1956,9 +1992,10 @@ class FlatStroke:
         mp.setCompositionMode(QPainter.CompositionMode_Lighten)
         for p in (mp, cp):
             p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            p.setTransform(tip_m)
-        mp.drawImage(0, 0, plain)                    # the tip itself ...
-        cp.drawImage(0, 0, texture.coloured(level, stamp[5]))
+            p.setTransform(frame_m)
+        # the tip itself, its holes closed and its streaks along the stroke ...
+        mp.drawImage(0, 0, texture.frame_variant(level, turn, 'whole', step=step))
+        cp.drawImage(0, 0, texture.frame_variant(level, turn, 'whole', rgb=stamp[5]))
         for p in (mp, cp):
             p.resetTransform()
             p.setClipPath(path)                      # ... and its fill, ahead only

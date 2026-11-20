@@ -148,7 +148,8 @@ class ImageLabel(QLabel):
             return
         from PySide6.QtCore import QPointF
         import math as _m
-        s, e, radial, c0, c1 = guide
+        s, e, radial, c0, c1 = guide[:5]
+        mid = guide[5] if len(guide) > 5 else 0.5
         painter.setBrush(Qt.NoBrush)
         if radial:
             r = _m.hypot(e.x() - s.x(), e.y() - s.y())
@@ -163,6 +164,18 @@ class ImageLabel(QLabel):
         painter.setPen(QPen(QColor(255, 255, 255, 240), 2, Qt.SolidLine, Qt.RoundCap))
         painter.drawLine(s, e)
         h = self._GUIDE_HANDLE
+        # the middle (the brush panel's Middle slider): a small diamond where
+        # the two colours are half mixed
+        from PySide6.QtGui import QPolygonF
+        m = QPointF(s.x() + (e.x() - s.x()) * mid, s.y() + (e.y() - s.y()) * mid)
+        d = h * 0.7
+        diamond = QPolygonF([QPointF(m.x(), m.y() - d), QPointF(m.x() + d, m.y()),
+                             QPointF(m.x(), m.y() + d), QPointF(m.x() - d, m.y())])
+        painter.setPen(QPen(QColor(0, 0, 0, 200), 3.0))
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawPolygon(diamond)
+        painter.setPen(QPen(QColor(255, 255, 255), 1.2))
+        painter.drawPolygon(diamond)
         for at, colour in ((s, c0), (e, c1)):
             if colour is None:
                 # transparent: a little checkerboard

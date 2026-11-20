@@ -372,6 +372,26 @@ class BrushWindow(QWidget):
         self._gradient_swatch.clicked.connect(self._pick_gradient_colour)
         grad_row.addWidget(self._gradient_swatch)
         inner.addLayout(grad_row)
+        mid_row = QHBoxLayout()
+        mid_row.setContentsMargins(0, 0, 0, 0)
+        mid_name = QLabel("Middle")
+        mid_name.setFixedWidth(52)
+        mid_row.addWidget(mid_name)
+        self._gradient_mid = ClickableSlider(Qt.Horizontal)
+        self._gradient_mid.setRange(5, 95)
+        self._gradient_mid.setToolTip(
+            "\U0001F308 Where along the gradient its two colours are half mixed (the diamond on "
+            "its guide line). 50 %: in the middle; lower: the second colour takes over sooner, "
+            "higher: the first colour reaches further. Moving it also re-lays the gradient you "
+            "just made, until you draw something else")
+        self._gradient_mid_value = QLabel("")
+        self._gradient_mid_value.setFixedWidth(36)
+        self._gradient_mid_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._gradient_mid.valueChanged.connect(
+            lambda v: self._on_slider('gradient_mid', v, '%', self._gradient_mid_value))
+        mid_row.addWidget(self._gradient_mid, 1)
+        mid_row.addWidget(self._gradient_mid_value)
+        inner.addLayout(mid_row)
         self._shape_gradient = QCheckBox("Shapes fill with the gradient")
         self._shape_gradient.setToolTip(
             "Lasso, polygon, rectangle, ellipse and triangle fill with the gradient above "
@@ -512,6 +532,9 @@ class BrushWindow(QWidget):
         self._gradient_to.setCurrentIndex(1 if to else 0)
         self._gradient_swatch.setEnabled(bool(to))
         self._shape_gradient.setChecked(bool(settings.get('shape_gradient', False)))
+        mid = int(settings.get('gradient_mid', 50))
+        self._gradient_mid.setValue(mid)
+        self._gradient_mid_value.setText(f"{mid}%")
         self._size_pressure.setChecked(settings['size_pressure'])
         self._opacity_pressure.setChecked(settings['opacity_pressure'])
         self._quiet = False
