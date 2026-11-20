@@ -2541,6 +2541,8 @@ class RandomImageViewer(QMainWindow):
     def _paint_one_fill(self, painter, fill, to_display, antialias=True):
         """Paint a single filled shape (lasso / rectangle / ellipse), or a
         polyline (the polygon tool's outline-only sibling)."""
+        if fill is self.__dict__.get('_grad_held'):
+            return      # 🌈 a handle being dragged: shown by the drag preview instead
         points = fill.get('points') or []
         color = QColor(fill.get('color', self.line_color))
         alpha = fill.get('alpha')
@@ -3650,7 +3652,7 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.studio_btn = QToolButton(); self.studio_btn.setText("◧"); self.studio_btn.setToolTip("Studio: a blank grey canvas the size of the picture beside it, on the left, with the brush ready — paint what you see on the right. Stays on from picture to picture; 💾 saves both side by side"); self.studio_btn.setCheckable(True); self.studio_btn.setFixedSize(24,24); self.studio_btn.toggled.connect(self.toggle_studio_mode); toolbar.addWidget(self.studio_btn)
         add_spacer(2)
-        self.save_btn = save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save current view to Downloads (includes LUT, enhancements and lines). In ◧ Studio: choose the painting, the picture or both, at 1× / 2× / 4×. Right-click: those choices any time"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self._save_clicked); save_btn.setContextMenuPolicy(Qt.CustomContextMenu); save_btn.customContextMenuRequested.connect(lambda pos: self.show_save_menu(self.save_btn.mapToGlobal(pos))); toolbar.addWidget(save_btn)
+        self.save_btn = save_btn = QToolButton(); save_btn.setText("💾"); save_btn.setToolTip("Save to Downloads: the view as shown (effects included), the picture / sketch with its painting or the painting alone at 1× / 2× / 4×, or 📚 each layer as its own PNG. In ◧ Studio also the painting, the picture or both side by side"); save_btn.setFixedSize(24,24); save_btn.clicked.connect(self._save_clicked); save_btn.setContextMenuPolicy(Qt.CustomContextMenu); save_btn.customContextMenuRequested.connect(lambda pos: self.show_save_menu(self.save_btn.mapToGlobal(pos))); toolbar.addWidget(save_btn)
         self.crop_btn = QToolButton(); self.crop_btn.setText("✂"); self.crop_btn.setFont(QFont("Segoe UI Symbol", 11)); self.crop_btn.setToolTip("Crop (C): drag a frame, then Enter or double-click — what is inside stays. Saved as a new picture in Downloads, the original is kept"); self.crop_btn.setCheckable(True); self.crop_btn.setFixedSize(24,24); self.crop_btn.toggled.connect(self.toggle_crop_tool); toolbar.addWidget(self.crop_btn)
         add_section_divider()
 
@@ -10941,6 +10943,7 @@ class RandomImageViewer(QMainWindow):
 
     def toggle_fill_tool(self, mode, checked):
         """Arm one of the fill tools, or disarm it."""
+        self._drop_grad_edit()
         buttons = {
             'lasso': getattr(self, 'lasso_fill_btn', None),
             'polygon': getattr(self, 'polygon_fill_btn', None),
@@ -10984,6 +10987,7 @@ class RandomImageViewer(QMainWindow):
         """Turn off any armed fill tool without emitting signals."""
         self.cancel_fill()
         self.fill_mode = None
+        self._drop_grad_edit()
         for name in self._FILL_BUTTONS:
             btn = getattr(self, name, None)
             if btn is not None and btn.isChecked():
@@ -10995,6 +10999,9 @@ class RandomImageViewer(QMainWindow):
         """Begin dragging out a filled shape at image coords (x, y)."""
         if not self.fill_mode:
             return
+        if self._grad_edit_press(x, y):
+            return          # 🌈 a handle of the last gradient taken: it is moved, not a new one
+        self._grad_edit = None
         self.current_fill = {'shape': self.fill_mode, 'anchor': (x, y),
                              'points': [(x, y)]}
         self.image_label.clear_fill_overlay()
@@ -11177,23 +11184,33 @@ class RandomImageViewer(QMainWindow):
         X = (np.arange(w, dtype=np.float32) + area.x() + 0.5)[None, :]
         Y = (np.arange(h, dtype=np.float32) + area.y() + 0.5)[:, None]
         # device -> picture is affine: x = m11 X + m21 Y + dx, y = m12 X + m22 Y + dy
-        px = inverse.m11() * X + inverse.m21() * Y + inverse.dx()
-        py = inverse.m12() * X + inverse.m22() * Y + inverse.dy()
+        m11, m21, m12, m22 = inverse.m11(), inverse.m21(), inverse.m12(), inverse.m22()
         (sx, sy), (ex, ey) = g['start'][:2], g['end'][:2]
+        n = 1024
         if g.get('type') == 'radial':
             radius = max(1e-6, math.hypot(ex - sx, ey - sy))
-            t = np.hypot(px - sx, py - sy) / radius
+            px = m11 * X + (m21 * Y + (inverse.dx() - sx))
+            py = m12 * X + (m22 * Y + (inverse.dy() - sy))
+            t = np.hypot(px, py)
+            t *= (n - 1) / radius
         else:
+            # t along it is affine in X, Y too: one pass, no picture coords
             dx, dy = ex - sx, ey - sy
-            length2 = max(1e-9, dx * dx + dy * dy)
-            t = ((px - sx) * dx + (py - sy) * dy) / length2
-        t = np.clip(t, 0.0, 1.0).astype(np.float32)
-        t = brushes.gradient_bias(t, g.get('mid', 0.5)).astype(np.float32)   # the Middle slider
+            k = (n - 1) / max(1e-9, dx * dx + dy * dy)
+            cx = (m11 * dx + m12 * dy) * k
+            cy = (m21 * dx + m22 * dy) * k
+            c0 = ((inverse.dx() - sx) * dx + (inverse.dy() - sy) * dy) * k
+            t = (cx * X + c0) + cy * Y
+        t += 0.5
+        np.clip(t, 0, n - 1, out=t)
+        idx = t.astype(np.int32)                        # (h, w): the step along it
+        # Everything else is a table of n steps: the Middle slider's bend,
+        # the colours mixed in OKLab, the fade - premultiplied, B G R A as
+        # the image keeps them, 0..255.
+        u = brushes.gradient_bias(np.linspace(0.0, 1.0, n), g.get('mid', 0.5))
         alpha0 = color.alphaF()
         rgb0 = (color.redF(), color.greenF(), color.blueF())
         to = g.get('to')
-        n = 1024
-        idx = np.minimum((t * (n - 1) + 0.5).astype(np.int32), n - 1)
         if to:
             end = QColor(to)
             key = (rgb0, end.rgb())
@@ -11201,24 +11218,33 @@ class RandomImageViewer(QMainWindow):
             if lut is None or lut[0] != key:
                 lut = self._gradient_lut = (key, brushes.gradient_lut(
                     rgb0, (end.redF(), end.greenF(), end.blueF()), n).astype(np.float32))
-            rgb = lut[1][idx]                          # (h, w, 3)
-            a = np.full(t.shape, alpha0, np.float32)
+            rgb = lut[1][np.minimum((u * (n - 1) + 0.5).astype(np.int32), n - 1)]
+            a = np.full(n, alpha0)
         else:
-            rgb = np.broadcast_to(np.array(rgb0, np.float32), t.shape + (3,))
-            a = (1.0 - t) * alpha0                   # pen colour -> transparent
-        # premultiplied, 8 bit, dithered (±½ step of noise, the same for a
-        # redraw of the same place: no banding, no crawling)
-        rng = np.random.default_rng((area.x() * 73856093) ^ (area.y() * 19349663) ^ 0x5EED)
-        noise = rng.random((h, w, 4), dtype=np.float32) - 0.5
-        a8 = np.clip(a * 255.0 + noise[:, :, 3], 0, 255)
-        c8 = np.clip(rgb * a[:, :, None] * 255.0 + noise[:, :, :3], 0, None)
-        c8 = np.minimum(c8, a8[:, :, None])
-        words = ((np.round(a8).astype(np.uint32) << 24)
-                 | (np.round(c8[:, :, 0]).astype(np.uint32) << 16)
-                 | (np.round(c8[:, :, 1]).astype(np.uint32) << 8)
-                 | np.round(c8[:, :, 2]).astype(np.uint32))
-        words = np.ascontiguousarray(words)
-        image = QImage(words.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+            rgb = np.broadcast_to(np.array(rgb0), (n, 3))
+            a = (1.0 - u) * alpha0                   # pen colour -> transparent
+        table = np.empty((n, 4), np.float64)
+        table[:, 0] = rgb[:, 2] * a
+        table[:, 1] = rgb[:, 1] * a
+        table[:, 2] = rgb[:, 0] * a
+        table[:, 3] = a
+        # in 1/256ths of an 8-bit step (integers: half the work of floats)
+        table = np.clip(np.round(table * (255.0 * 256.0)), 0, 255 * 256).astype(np.uint16)
+        vals = np.take(table, idx, axis=0)              # (h, w, 4)
+        # dithered: a fraction of a step of noise (0..255/256) from a fixed
+        # tile, tied to the device pixel - the same for a redraw of the same
+        # place (no banding, no crawling) - then cut to whole steps
+        tile = self.__dict__.get('_gradient_noise')
+        if tile is None:
+            tile = self._gradient_noise = np.random.default_rng(0x5EED).integers(
+                0, 256, (128, 128, 4), dtype=np.uint16)
+        T = tile.shape[0]
+        ox, oy = area.x() % T, area.y() % T
+        vals += np.tile(tile, ((h + oy) // T + 1, (w + ox) // T + 1, 1))[oy:oy + h, ox:ox + w]
+        vals >>= 8
+        q = vals.astype(np.uint8)
+        np.minimum(q[:, :, :3], q[:, :, 3:4], out=q[:, :, :3])     # premultiplied: colour <= alpha
+        image = QImage(q.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
         # cut to its shape (edges smoothed)
         mask = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
         mask.fill(Qt.transparent)
@@ -11289,12 +11315,171 @@ class RandomImageViewer(QMainWindow):
         grad = dict(record['gradient'])      # (a new one: an undo snapshot keeps the old)
         grad['mid'] = mid
         record['gradient'] = grad
-        # the layer's baked image counts its marks, not what is in them: built
-        # anew, as after a transform
-        self.active_layer.raster = None
-        if hasattr(self, '_lut_process_cache'):
-            self._lut_process_cache.clear()
-        self._refresh_marks()
+        self._grad_relay(now=True)
+
+    def _grad_relay(self, now=False):
+        """🌈 The last gradient changed (its middle, an end): laid again. The
+        layer's baked image counts its marks, not what is in them, so it is
+        built anew, as after a transform. While a handle is dragged the moves
+        are gathered into one re-lay per turn of the event loop."""
+        self.image_label.update()           # the handles
+        if now:
+            self.__dict__['_grad_relay_due'] = False
+            self.active_layer.raster = None
+            if hasattr(self, '_lut_process_cache'):
+                self._lut_process_cache.clear()
+            self._refresh_marks()
+            return
+        if self.__dict__.get('_grad_relay_due'):
+            return
+        self._grad_relay_due = True
+        QTimer.singleShot(0, lambda: self._grad_relay(now=True)
+                          if self.__dict__.get('_grad_relay_due') else None)
+
+    # -- 🌈 the last gradient stays editable -------------------------------
+    #
+    # After a gradient is laid its guide stays on the canvas (while the tool
+    # is on and nothing else was done since): its two ends and the middle
+    # diamond can be dragged, and it is laid again as they move. A press
+    # anywhere else starts a new one.
+
+    _GRAD_GRAB = 16         # px around a handle that take it
+
+    def _drop_grad_edit(self):
+        """The handles go (another tool): the gradient stays as it is."""
+        self._grad_unhold()
+        if self.__dict__.get('_grad_edit') is not None:
+            self._grad_edit = None
+            self._grad_drag = None
+            label = getattr(self, 'image_label', None)
+            if label is not None:
+                label.update()
+
+    def _grad_edit_record(self):
+        """The gradient fill whose handles show, or None."""
+        record = self.__dict__.get('_grad_edit')
+        if record is None or not self.fill_mode or self.__dict__.get('current_fill'):
+            return None
+        fills = getattr(self, 'drawn_fills', None)
+        stack = getattr(self, '_undo_stack', None)
+        if not fills or fills[-1] is not record or not stack or stack[-1] != 'fill':
+            return None
+        return record if record.get('gradient') else None
+
+    def _grad_edit_guide(self):
+        """Its guide (ImageLabel.set_fill_guide's form) on screen now, or None."""
+        record = self._grad_edit_record()
+        if record is None:
+            return None
+        to_screen = self._fill_screen_mapper()
+        if to_screen is None:
+            return None
+        return self._gradient_guide(record['gradient'], to_screen, QColor(record['color']))
+
+    def _grad_edit_press(self, x, y):
+        """A press at picture (x, y): True if it took a handle (then dragged
+        by grad_edit_move)."""
+        self._grad_drag = None
+        guide = self._grad_edit_guide()
+        if guide is None:
+            return False
+        q = self._fill_screen_mapper()(x, y)
+        s, e, mid = guide[0], guide[1], guide[5]
+        m = QPointF(s.x() + (e.x() - s.x()) * mid, s.y() + (e.y() - s.y()) * mid)
+        best = None
+        for name, at in (('mid', m), ('start', s), ('end', e)):
+            d = math.hypot(at.x() - q.x(), at.y() - q.y())
+            if d <= self._GRAD_GRAB and (best is None or d < best[0]):
+                best = (d, name)
+        if best is None:
+            return False
+        self._grad_drag = best[1]
+        self._fill_input_cache = None           # map_fill_input builds it anew
+        # While dragged it is left out of the layer and shown by the quick
+        # preview (as when it was first dragged): laying it for real takes
+        # ~0.1 s on a full sheet, too slow for every move. Laid on letting go.
+        record = self._grad_edit
+        self._grad_held = record
+        self._grad_relay(now=True)
+        self._grad_preview(record)
+        return True
+
+    def _grad_preview(self, record):
+        """The held gradient drawn by the label's fill preview, with its guide."""
+        to_screen = self._fill_screen_mapper()
+        if to_screen is None:
+            return
+        colour = QColor(record['color'])
+        pts = [to_screen(px, py) for px, py in (
+            (p.x(), p.y()) if isinstance(p, QPointF) else tuple(p[:2]) for p in record['points'])]
+        label = self.image_label
+        label.set_fill_guide(self._gradient_guide(record['gradient'], to_screen, colour))
+        label.set_fill_overlay(pts, self._gradient_preview_brush(record['gradient'], to_screen, colour))
+
+    def _grad_unhold(self):
+        """The held gradient back in its layer, laid as it now is."""
+        if self.__dict__.get('_grad_held') is None:
+            return
+        self._grad_held = None
+        self.image_label.clear_fill_overlay()
+        self._grad_relay(now=True)
+
+    def grad_edit_move(self, x, y):
+        """A handle dragged to picture (x, y)."""
+        record = self._grad_edit_record()
+        which = self.__dict__.get('_grad_drag')
+        if record is None or not which:
+            self._grad_drag = None
+            return
+        g = dict(record['gradient'])        # (a new one: an undo snapshot keeps the old)
+        (sx, sy), (ex, ey) = g['start'][:2], g['end'][:2]
+        if which == 'mid':
+            dx, dy = ex - sx, ey - sy
+            length2 = dx * dx + dy * dy
+            if length2 < 1e-9:
+                return
+            t = ((x - sx) * dx + (y - sy) * dy) / length2
+            g['mid'] = min(0.95, max(0.05, t))
+        else:
+            ox, oy = (ex, ey) if which == 'start' else (sx, sy)
+            if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+                # Shift: straight in 15° steps from the other end
+                length = math.hypot(x - ox, y - oy)
+                step = math.radians(15)
+                angle = round(math.atan2(y - oy, x - ox) / step) * step
+                x, y = ox + length * math.cos(angle), oy + length * math.sin(angle)
+            if math.hypot(x - ox, y - oy) < 2.0:
+                return
+            g[which] = (float(x), float(y))
+        record['gradient'] = g
+        if self.__dict__.get('_grad_held') is record:
+            self._grad_preview(record)
+        else:
+            self._grad_relay()
+
+    def grad_edit_end(self):
+        """The handle let go: laid for good; a moved middle becomes the Middle
+        slider's value (the next gradient starts from it)."""
+        which = self.__dict__.get('_grad_drag')
+        self._grad_drag = None
+        record = self._grad_edit_record()
+        held = self.__dict__.get('_grad_held') is not None
+        self._grad_unhold()
+        if record is None or not which:
+            return
+        if not held:
+            self._grad_relay(now=True)
+        if which == 'mid':
+            self.brush_settings['gradient_mid'] = int(round(record['gradient'].get('mid', 0.5) * 100))
+            self._save_brush_settings()
+            bw = self.__dict__.get('_brush_window')
+            if bw is not None:
+                try:
+                    bw.set_settings(self.brush_settings)
+                except Exception:
+                    pass
+        self.status.showMessage("🌈 Gradient changed — drag its handles again, or start a new one "
+                                "anywhere else", 4000)
 
     def _fill_gets_gradient(self, shape):
         """True when a fill of *shape* is a gradient: the gradient tool, or
@@ -11580,6 +11765,10 @@ class RandomImageViewer(QMainWindow):
         if not self._commit_fill_to_view(record):
             self._refresh_marks()
         self.image_label.clear_fill_overlay()
+        if record.get('gradient'):
+            # 🌈 its handles stay: drag them to move its ends or its middle
+            self._grad_edit = record
+            self.image_label.update()
         if fill['shape'] == 'polyline':
             self.status.showMessage(
                 f"{'Closed' if record['closed'] else 'Open'} polyline added "
@@ -11688,7 +11877,11 @@ class RandomImageViewer(QMainWindow):
         (x, y) is the click in image coordinates, *pos* in label coordinates.
         """
         if not self._placing_polygon():
+            if self._grad_edit_press(x, y):
+                return      # 🌈 a handle of the gradient just laid: dragged, no new polygon
             self.start_fill(x, y)
+            if not self.current_fill:
+                return
             self._set_polygon_keys(True)
             self._update_polygon_preview(pos)
             self.status.showMessage(self._click_shape_hint(self.fill_mode))
@@ -12991,12 +13184,29 @@ class RandomImageViewer(QMainWindow):
                 right = min(right, area.x() + child.x() - self._DOCK_GAP)
         return right
 
-    def _dock_targets(self):
-        """{name: global QPoint} where each docked panel goes."""
+    def _dock_obstacles(self, area):
+        """Global rects of the tool panels lying on the right half of the
+        canvas (DRAW, FILE / NAV, TRANSFORM, EFFECTS ...): the right dock
+        goes around them."""
+        canvas = self.image_label
+        rects = []
+        for child in canvas.children():
+            if (isinstance(child, QWidget) and not child.isWindow() and child.isVisible()
+                    and not getattr(child, 'passes_input', False)
+                    and child.geometry().center().x() > canvas.width() / 2):
+                g = child.geometry()
+                rects.append(QRect(area.x() + g.x(), area.y() + g.y(), g.width(), g.height()))
+        return rects
+
+    def _dock_targets(self, override=None):
+        """{name: global QPoint} where each docked panel goes. *override*:
+        {name: side} to ask where one would go (the hint while dragging)."""
         area = self._dock_canvas_rect()
         if area is None:
             return {}
-        state = self._dock_state()
+        state = dict(self._dock_state())
+        if override:
+            state.update(override)
         # Only the open ones: shutting one closes the gap it leaves.
         windows = {k: w for k, w in self._dock_windows().items() if state.get(k) and w.isVisible()}
         if not windows:
@@ -13017,19 +13227,65 @@ class RandomImageViewer(QMainWindow):
             targets[k] = QPoint(x, y)
             y += h + gap
             col_edge = max(col_edge, x + w)
-        # Right: the same, against the right edge, columns going left.
-        right = self._dock_right_edge(area)
-        y, col_right, col_edge = top, right, right
+        # Right: against the canvas's right edge, top first, going round the
+        # tool panels lying there - below them where there is room (the
+        # space under TRANSFORM / VIEW), else the next column to the left.
+        # (Before, the whole column stood left of the widest tool panel, and
+        # the free space under them was never used.)
+        # Each panel takes the first column with room for it (so a tall one
+        # that goes a column in leaves the space under the tool panels to a
+        # shorter one after it).
+        obstacles = self._dock_obstacles(area)
+        columns = []            # [right edge, next free y, left edge of what is in it]
+        # Columns as wide as the widest panel on this side: one placed later
+        # in an earlier column can never reach into the next.
+        widest = max([w.width() for k, w in windows.items() if state.get(k) == 'right'] or [0])
+
+        def fit(column, w, h):
+            """Top y for a w x h panel down *column*, or None."""
+            right, y = column[0], column[1]
+            for _guard in range(64):
+                spot = QRect(right - w + 1, y, w, h)
+                hit = [o for o in obstacles if o.adjusted(-gap, -gap, gap, gap).intersects(spot)]
+                if not hit:
+                    return y if (y + h <= bottom or y <= top) else None
+                y = max(o.bottom() for o in hit) + gap + 1      # below what is in the way
+                if y + h > bottom:
+                    return None
+            return None
+
         for k in self._DOCK_ORDER:
             window = windows.get(k)
             if window is None or state.get(k) != 'right':
                 continue
             w, h = window.width(), window.height()
-            if y > top and y + h > bottom:
-                col_right, y = col_edge - gap, top
-            targets[k] = QPoint(col_right - w + 1, y)
-            y += h + gap
-            col_edge = min(col_edge, col_right - w + 1)
+            spot = None
+            for column in columns:
+                y = fit(column, w, h)
+                if y is not None:
+                    spot = (column, y)
+                    break
+            while spot is None:
+                # a new column, left of everything in the last one (panels
+                # and the tool panels lying across it)
+                if columns:
+                    last = columns[-1]
+                    band = last[0] - widest + 1
+                    lefts = [band, last[2]] + [o.left() for o in obstacles
+                                               if o.right() >= band and o.left() <= last[0]]
+                    right = min(lefts) - gap - 1    # (a full gap clear: fit() keeps one round all)
+                else:
+                    right = area.right() - m
+                column = [right, top, right]
+                columns.append(column)
+                y = fit(column, w, h)
+                if y is not None or right - w <= area.x() or len(columns) > 8:
+                    spot = (column, y if y is not None else top)
+            column, y = spot
+            targets[k] = QPoint(column[0] - w + 1, y)
+            column[1] = y + h + gap
+            column[2] = min(column[2], column[0] - w + 1)
+            obstacles.append(QRect(targets[k], QSize(w, h)))     # later ones go round it too
         return targets
 
     def _dock_place(self):
@@ -13037,10 +13293,16 @@ class RandomImageViewer(QMainWindow):
         self._dock_pending = False
         self._dock_watch()
         targets = self._dock_targets()
-        for name, window in self._dock_windows().items():
-            pos = targets.get(name)
-            if pos is not None and window.isVisible() and window.pos() != pos:
-                window.move(pos)
+        # (our own moves: not a panel dragged by hand - no dock hint for them,
+        # even with the pen down painting)
+        self._dock_moving = True
+        try:
+            for name, window in self._dock_windows().items():
+                pos = targets.get(name)
+                if pos is not None and window.isVisible() and window.pos() != pos:
+                    window.move(pos)
+        finally:
+            self._dock_moving = False
 
     def _dock_place_soon(self):
         if not getattr(self, '_dock_pending', False):
@@ -13066,11 +13328,13 @@ class RandomImageViewer(QMainWindow):
         geo = window.frameGeometry()
         if not area.adjusted(-self._DOCK_ZONE, 0, self._DOCK_ZONE, 0).intersects(geo):
             return None
-        if geo.left() - area.left() <= self._DOCK_ZONE:
-            return 'left'
-        if area.right() - geo.right() <= self._DOCK_ZONE:
-            return 'right'
-        return None
+        # The right dock lies against the panels on the canvas (DRAW, FILE /
+        # NAV ...), not the window's edge: measured from there, or a panel
+        # dropped right beside them - where it would go - was too far off.
+        gaps = [(geo.left() - area.left(), 'left'),
+                (self._dock_right_edge(area) - geo.right(), 'right')]
+        near = [g for g in gaps if g[0] <= self._DOCK_ZONE]
+        return min(near)[1] if near else None      # (both: the nearer side)
 
     def _dock_hint(self, window):
         """While a panel is dragged: the zone it would dock in, lit up."""
@@ -13092,18 +13356,44 @@ class RandomImageViewer(QMainWindow):
                                " border: 2px solid rgba(255, 204, 0, 150); border-radius: 6px; }")
             hint._fill = fill
         area = self._dock_canvas_rect()
-        zone = (QRect(area.x(), area.y(), self._DOCK_ZONE, area.height()) if side == 'left'
-                else QRect(area.right() - self._DOCK_ZONE + 1, area.y(), self._DOCK_ZONE, area.height()))
+        # Where it would go, exactly: its own place in that side's dock
+        # (below the tool panels, or a column further in).
+        name = next((k for k, w in self._dock_windows().items() if w is window), None)
+        at = self._dock_targets({name: side}).get(name) if name else None
+        if at is not None:
+            zone = QRect(at, QSize(window.width(), window.height())).adjusted(-3, -3, 3, 3)
+        else:
+            edge = self._dock_right_edge(area)
+            zone = (QRect(area.x(), area.y(), self._DOCK_ZONE, area.height()) if side == 'left'
+                    else QRect(edge - self._DOCK_ZONE + 1, area.y(), self._DOCK_ZONE, area.height()))
         hint.setGeometry(zone)
         hint._fill.setGeometry(0, 0, zone.width(), zone.height())
         if not hint.isVisible():
             hint.show()
             window.raise_()
+        # A watch while it shows: the drag's release can be lost (let go
+        # over another window, a pen whose release Qt never sees) and then
+        # nothing would ever take it away - it went as soon as no button is
+        # really down (asked of the system, not Qt's record).
+        timer = self.__dict__.get('_dock_hint_timer')
+        if timer is None:
+            timer = self._dock_hint_timer = QTimer(self)
+            timer.setInterval(150)
+            timer.timeout.connect(self._dock_hint_check)
+        if not timer.isActive():
+            timer.start()
+
+    def _dock_hint_check(self):
+        if not self._buttons_down():
+            self._dock_hint_off()
 
     def _dock_hint_off(self):
         hint = self.__dict__.get('_dock_hint_win')
         if hint is not None:
             hint.hide()
+        timer = self.__dict__.get('_dock_hint_timer')
+        if timer is not None:
+            timer.stop()
 
     def _dock_dragged(self, name):
         """A panel was dragged by hand and dropped: in a dock zone it docks
@@ -13157,7 +13447,11 @@ class RandomImageViewer(QMainWindow):
         if watched and id(obj) in watched and event.type() in (
                 QEvent.Resize, QEvent.Move, QEvent.Show, QEvent.Hide):
             if event.type() == QEvent.Move and obj in self._dock_windows().values():
-                if QApplication.mouseButtons() & Qt.LeftButton:
+                if (QApplication.mouseButtons() & Qt.LeftButton
+                        and not self.__dict__.get('_dock_moving')
+                        and not getattr(self, 'is_drawing_free_stroke', False)
+                        # dragged by hand: the pointer is on it (by its header)
+                        and obj.frameGeometry().contains(QCursor.pos())):
                     self._dock_hint(obj)        # being dragged: the dock zone it is over
             elif event.type() == QEvent.Move and QApplication.mouseButtons() & Qt.LeftButton:
                 pass        # a canvas panel being dragged: the dock follows when it is dropped
@@ -13250,7 +13544,8 @@ class RandomImageViewer(QMainWindow):
             # Started before its messages are hooked up: launching says
             # nothing on the status bar (only in the log); later changes do.
             self._colour_sync = ColorSyncServer(self)
-            self._colour_sync.colour_received.connect(self._on_synced_colour)
+            self._colour_sync.colour_received.connect(self._on_penguin_colour)
+            self._colour_sync.second_received.connect(self._on_synced_second)
             self._colour_sync.start()
             self._on_colour_sync_state(self._colour_sync.state, quiet=True)
             self._colour_sync.status_changed.connect(self._on_colour_sync_state)
@@ -13310,6 +13605,25 @@ class RandomImageViewer(QMainWindow):
         if getattr(self, 'free_draw_mode', False):
             self.apply_tool_cursor()        # the cursor's rim shows the new colour
         self.status.showMessage(f"{source}: {QColor(colour).name()}", 2000)
+
+    def _on_penguin_colour(self, colour):
+        """🐧 A colour from ColorPenguin: the pen colour and the second colour
+        (the 🌈 gradient's other end) both. Penguin sends one colour, the same
+        SET_BRUSH_COLOR for either of its swatches and for an Alt-click, so
+        there is no telling its second colour apart - the user's choice:
+        both follow it."""
+        self._on_synced_colour(colour)
+        self.set_second_color(QColor(colour), from_picker=True)    # (quiet: the pen's message shows)
+        gp = self.__dict__.get('_gradient_popup')
+        if gp is not None and gp.isVisible():
+            gp.set_color(QColor(colour))        # an open Second colour picker follows
+        self._sync_color_popup(force=True)
+
+    def _on_synced_second(self, colour):
+        """🐧 The second colour (the 🌈 gradient's other end) from ColorPenguin."""
+        self.set_second_color(QColor(colour))       # (the open Second colour picker follows)
+        self._sync_color_popup(force=True)
+        self.status.showMessage(f"🐧 Second colour from ColorPenguin: {QColor(colour).name()}", 2000)
 
     def _apply_waiting_synced_colour(self):
         self._synced_retry = False
@@ -15348,7 +15662,9 @@ class RandomImageViewer(QMainWindow):
         if base is None or base.isNull():
             return {}
         if not self.studio_mode:
-            return {'picture': QRect(0, 0, base.width(), base.height())}
+            # (the painting lies on the picture: the same piece, without it)
+            whole = QRect(0, 0, base.width(), base.height())
+            return {'picture': whole, 'painting': QRect(whole)}
         off = self._studio_offset(base)
         return {'painting': QRect(0, 0, base.width(), base.height()),
                 'picture': QRect(off, 0, base.width(), base.height()),
@@ -15358,14 +15674,22 @@ class RandomImageViewer(QMainWindow):
         w, h = rect.width() * k, rect.height() * k
         return max(w, h) <= self._EXPORT_MAX_SIDE and w * h <= self._EXPORT_MAX_PIXELS
 
-    def _render_sheet_part(self, rect, k, paper=True, grey=True):
+    def _render_sheet_part(self, rect, k, paper=True, grey=True, picture=True, sheet=True):
         """*rect* of the sheet (picture coordinates, upright, unflipped) at
         *k* times its size: the canvas, the picture from its file and every
         shown layer laid again at that size. The view's effects are left
         out - they are a way of looking, and they depend on the view's size.
         *paper* False: no canvas paper (📄 layers, the sketch's sheet) - the
         marks alone, on transparent. *grey* False: no ◧ Studio grey under
-        the canvas (🎨 Painting only is saved on transparent)."""
+        the canvas (🎨 Painting only is saved on transparent). *picture*
+        False: not the picture (the painting over it alone); *sheet* False:
+        not the canvas under the picture (a sketch's grey) either."""
+        if not sheet and self.__dict__.get('under_canvas_visible'):
+            self.under_canvas_visible = False
+            try:
+                return self._render_sheet_part(rect, k, paper, grey, picture)
+            finally:
+                self.under_canvas_visible = True
         path = self.current_image
         base = self.pixmap_cache[path]
         off = self._studio_offset(base) if self.studio_mode else 0
@@ -15381,7 +15705,7 @@ class RandomImageViewer(QMainWindow):
             painter.fillRect(QRectF(ox, oy, base.width() * k, base.height() * k),
                              QColor(*self._CANVAS_FILL))
         target = QRectF(ox + off * k, oy, base.width() * k, base.height() * k)
-        if self.image_visible and target.intersects(QRectF(0, 0, w, h)):
+        if picture and self.image_visible and target.intersects(QRectF(0, 0, w, h)):
             painter.save()
             painter.setOpacity(self._picture_look()[0] / 100)
             painter.drawImage(target, self._picture_at(path, target.size().toSize(), base))
@@ -15464,11 +15788,13 @@ class RandomImageViewer(QMainWindow):
             try:
                 image = self._render_sheet_part(
                     rect, k, paper=not (part == 'picture' and not self.image_visible),
-                    grey=part != 'painting')
+                    grey=part != 'painting', picture=part != 'painting',
+                    sheet=part != 'painting')
             finally:
                 self._export_tick = self._export_picture_done = None
             stem = os.path.splitext(os.path.basename(self.current_image))[0]
-            name = {'painting': 'painting', 'picture': 'picture', 'both': 'studio'}[part]
+            name = {'painting': 'painting', 'picture': 'sketch' if self._is_sketch() else 'picture',
+                    'both': 'studio'}[part]
             file_path = self._unique_download_path(f"{stem}_{name}_{k}x", ".png")
             progress(0.85, "writing PNG")
             if self._write_png_with_progress(image, file_path,
@@ -15488,6 +15814,96 @@ class RandomImageViewer(QMainWindow):
 
     _export_tick = None             # called after each mark laid for a file (💾 progress)
     _export_picture_done = None     # ... and once the picture is down
+
+    def _is_sketch(self):
+        """📝 The picture is a new sketch's blank sheet (not a picture of yours)."""
+        return bool(self.current_image) and os.path.basename(self.current_image).startswith("sketch_")
+
+    def _layers_to_save(self):
+        """The layers 'Each layer as its own PNG' saves: the shown ones with
+        anything on them, bottom to top."""
+        return [layer for layer in self.layers if layer.visible and layer.has_content()]
+
+    def save_layers(self, k):
+        """💾 menu: every shown layer as a PNG of its own, at *k* times, on
+        transparent and the size of the whole sheet - so they lie on each other
+        again in any program. Its opacity is in it; a blend mode (Multiply ...)
+        is not, it needs what is under it - set it again there. The picture
+        goes in too, as the bottom one (not a sketch's blank sheet). Into one
+        folder in Downloads, numbered bottom to top."""
+        import re
+        self.commit_selection()
+        parts = self._export_parts()
+        rect = parts.get('both' if self.studio_mode else 'picture')
+        layers = self._layers_to_save()
+        if rect is None or not layers:
+            self.status.showMessage("No layer with anything on it to save", 4000)
+            return
+        stem = os.path.splitext(os.path.basename(self.current_image))[0]
+        folder = self._unique_download_path(f"{stem}_layers_{k}x", "")
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            print(f"save_layers: {e!r}")
+            self.status.showMessage("Could not make the folder in Downloads", 4000)
+            return
+        busy = getattr(self, '_busy_line', None)
+        size = f"{rect.width() * k} × {rect.height() * k}"
+        with_picture = self.image_visible and not self._is_sketch()
+        jobs = (['picture'] if with_picture else []) + layers
+        working = self._working(f"\U0001F4BE Saving {len(jobs)} layers, {size} px")
+        card = working.__enter__()
+
+        def progress(fraction, what):
+            if busy is not None:
+                busy.show_progress(fraction)
+                busy.repaint()
+            card.set(fraction, what)
+            self.status.showMessage(f"💾 Saving layers {size} — {what} {fraction * 100:.0f}%")
+            self.status.repaint()
+
+        shown = [layer.visible for layer in self.layers]
+        written = 0
+        try:
+            for n, job in enumerate(jobs):
+                share = (n / len(jobs), (n + 1) / len(jobs))
+                if job == 'picture':
+                    what, name = "picture", "picture"
+                    for layer in self.layers:
+                        layer.visible = False
+                    try:
+                        progress(share[0], what)
+                        image = self._render_sheet_part(rect, k, paper=False, grey=False, sheet=False)
+                    finally:
+                        for layer, was in zip(self.layers, shown):
+                            layer.visible = was
+                else:
+                    what = name = job.name
+                    for layer in self.layers:
+                        layer.visible = layer is job
+                    try:
+                        progress(share[0], what)
+                        image = self._render_sheet_part(rect, k, grey=False, picture=False, sheet=False)
+                    finally:
+                        for layer, was in zip(self.layers, shown):
+                            layer.visible = was
+                safe = re.sub(r'[^\w\- ]+', '_', name).strip() or "layer"
+                path = os.path.join(folder, f"{n + (0 if with_picture else 1):02d}_{safe}.png")
+                lo, hi = share
+                if self._write_png_with_progress(
+                        image, path, lambda f: progress(lo + (hi - lo) * (0.5 + 0.5 * f), what)):
+                    written += 1
+            self.status.showMessage(
+                f"Saved {written} layers to Downloads\\{os.path.basename(folder)} ({size})", 8000)
+        except Exception as e:
+            print(f"Error saving layers: {e!r}")
+            self.status.showMessage("Error saving the layers", 4000)
+        finally:
+            for layer, was in zip(self.layers, shown):
+                layer.visible = was
+            working.__exit__(None, None, None)
+            if busy is not None and getattr(self, '_settle_job', None) is None:
+                busy.hide()
 
     def _write_png_with_progress(self, image, path, report):
         """Write *image* as PNG, encoded on a worker thread (OpenCV lets go of
@@ -15533,10 +15949,17 @@ class RandomImageViewer(QMainWindow):
         """💾's menu: the view as shown, or a part of the sheet at 1x / 2x / 4x."""
         from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         menu.addAction("💾 View as shown (effects included)", self.save_current_view)
         parts = self._export_parts()
-        labels = (('painting', "🎨 Painting only, transparent"),('picture', "🖼 Picture with its drawing"
-                   if not self.studio_mode else "🖼 Picture only"), ('both', "◧ Both side by side"))
+        if self.studio_mode:
+            whole = "🖼 Picture only"
+        elif self._is_sketch():
+            whole = "📝 Sketch"
+        else:
+            whole = "🖼 Picture with its drawing"
+        labels = (('picture', whole), ('painting', "🎨 Painting only, transparent"),
+                  ('both', "◧ Both side by side"))
         for part, label in labels:
             rect = parts.get(part)
             if rect is None:
@@ -15546,6 +15969,20 @@ class RandomImageViewer(QMainWindow):
                 act = menu.addAction(f"{label} — {k}×  ({rect.width() * k} × {rect.height() * k})",
                                      lambda p=part, s=k: self.save_sheet_part(p, s))
                 act.setEnabled(self._export_fits(rect, k))
+        # 📚 each layer a PNG of its own (into one folder)
+        rect = parts.get('both' if self.studio_mode else 'picture')
+        if rect is not None:
+            layers = self._layers_to_save()
+            menu.addSeparator()
+            for k in (1, 2, 4):
+                act = menu.addAction(
+                    f"📚 Each layer as its own PNG ({len(layers)}) — {k}×  "
+                    f"({rect.width() * k} × {rect.height() * k})",
+                    lambda s=k: self.save_layers(s))
+                act.setEnabled(bool(layers) and self._export_fits(rect, k))
+                act.setToolTip("Every shown layer on transparent, the size of the whole sheet, "
+                               "numbered bottom to top in a folder in Downloads - they lie on "
+                               "each other again in any program")
         if len(parts):
             menu.addSeparator()
             note = menu.addAction("Parts are laid again at that size, upright, without effects")
@@ -15554,8 +15991,9 @@ class RandomImageViewer(QMainWindow):
         menu.exec(at if at is not None else btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def _save_clicked(self):
-        """💾: in ◧ Studio, the menu (which side, what size); else the view."""
-        if self.studio_mode and self.current_image:
+        """💾: the menu (what, what size, each layer) - in ◧ Studio, a sketch
+        or a picture alike; with nothing open, the view."""
+        if self.current_image and self._export_parts():
             self.show_save_menu()
         else:
             self.save_current_view()
@@ -18404,6 +18842,12 @@ class RandomImageViewer(QMainWindow):
                 self._draw_fixed_overlays(p, tx['draw_x'], tx['draw_y'],
                                           tx['zoomed_width'], tx['zoomed_height'])
                 p.restore()
+        guide = self._grad_edit_guide()      # 🌈 the last gradient's handles
+        if guide:
+            p.save()
+            p.setRenderHint(QPainter.Antialiasing, True)
+            label._paint_fill_guide(p, guide)
+            p.restore()
 
     def _hide_gpu_view(self):
         """The plain canvas shows again: drawn now, on screen, and the GPU

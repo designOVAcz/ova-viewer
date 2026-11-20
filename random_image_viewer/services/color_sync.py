@@ -26,35 +26,92 @@ except Exception:       # pragma: no cover - a Qt build without WebSockets
 PORT = 8265             # Rebelle's default WebSocket port, which ColorPenguin uses
 
 
-def colour_from_event(text):
-    """The colour a Rebelle event sets, as a QColor, or None. Takes
+_SECOND_WORDS = ('SECOND', 'BACKGROUND', 'ALT')      # in an event_type / slot name
+_SECOND_KEYS = ('secondary_color', 'second_color', 'background_color', 'bg_color',
+                'secondaryColor', 'secondColor', 'backgroundColor')
+
+
+def _qcolour(colour):
+    """{'r','g','b'} (0..255, or 0..1 floats) or '#rrggbb' as a QColor, or None."""
+    if isinstance(colour, str):
+        c = QColor(colour)
+        return c if c.isValid() else None
+    if not isinstance(colour, dict):
+        return None
+    try:
+        rgb = [colour[k] for k in ('r', 'g', 'b')]
+        if all(isinstance(v, float) and 0.0 <= v <= 1.0 for v in rgb):
+            rgb = [v * 255.0 for v in rgb]      # 0..1 floats, should anyone send them
+        r, g, b = (max(0, min(255, int(round(float(v))))) for v in rgb)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return QColor(r, g, b)
+
+
+def _is_second_slot(event):
+    """An event marked as for the second (secondary / background) colour."""
+    kind = str(event.get('event_type') or '').upper()
+    if any(w in kind for w in _SECOND_WORDS):
+        return True
+    if event.get('secondary') is True or event.get('second') is True:
+        return True
+    slot = event.get('slot', event.get('target', event.get('index')))
+    if isinstance(slot, str):
+        return any(w in slot.upper() for w in _SECOND_WORDS)
+    return isinstance(slot, int) and not isinstance(slot, bool) and slot == 1
+
+
+def colours_from_event(text):
+    """[(slot, QColor)] a Rebelle event sets, slot 'pen' or 'second'. Takes
     SET_BRUSH_COLOR and SET_BRUSH with a colour, alone or in a list (as a
-    Motion IO frame holds them); the last colour wins."""
+    Motion IO frame holds them). The second colour, should a sender pass one:
+    an event named for it (…SECONDARY… / …BACKGROUND…), one marked as its slot,
+    or a secondary_color / background_color beside the colour."""
     try:
         data = json.loads(text)
     except (TypeError, ValueError):
-        return None
+        return []
     if isinstance(data, dict) and isinstance(data.get('events'), list):
         data = data['events']
     events = data if isinstance(data, list) else [data]
-    found = None
+    found = []
     for event in events:
         if not isinstance(event, dict):
             continue
-        if event.get('event_type') not in ('SET_BRUSH_COLOR', 'SET_BRUSH'):
+        kind = str(event.get('event_type') or '').upper()
+        if 'COLOR' not in kind and 'COLOUR' not in kind and kind != 'SET_BRUSH':
             continue
-        colour = event.get('color')
-        if not isinstance(colour, dict):
-            continue
-        try:
-            rgb = [colour[k] for k in ('r', 'g', 'b')]
-            if all(isinstance(v, float) and 0.0 <= v <= 1.0 for v in rgb):
-                rgb = [v * 255.0 for v in rgb]      # 0..1 floats, should anyone send them
-            r, g, b = (max(0, min(255, int(round(float(v))))) for v in rgb)
-        except (KeyError, TypeError, ValueError):
-            continue
-        found = QColor(r, g, b)
+        colour = _qcolour(event.get('color', event.get('colour')))
+        if colour is not None:
+            found.append(('second' if _is_second_slot(event) else 'pen', colour))
+        for key in _SECOND_KEYS:
+            second = _qcolour(event.get(key))
+            if second is not None:
+                found.append(('second', second))
+                break
     return found
+
+
+def colour_from_event(text):
+    """The pen colour a Rebelle event sets, as a QColor, or None (the last
+    one wins). See colours_from_event for the second colour too."""
+    pens = [c for slot, c in colours_from_event(text) if slot == 'pen']
+    return pens[-1] if pens else None
+
+
+def event_shape(text):
+    """A short key for what kind of message *text* is (its event types and
+    their fields), so each kind is logged once - see ColorSyncServer.seen."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return 'not json'
+    if isinstance(data, dict) and isinstance(data.get('events'), list):
+        data = data['events']
+    events = data if isinstance(data, list) else [data]
+    return '|'.join(
+        f"{e.get('event_type')}:{','.join(sorted(e))}" if isinstance(e, dict) else type(e).__name__
+        for e in events[:6])
 
 
 def _answers(address, port, wait_ms=150):
@@ -78,6 +135,7 @@ class ColorSyncServer(QObject):
     back once the port is free. status_changed says which."""
 
     colour_received = Signal(QColor)
+    second_received = Signal(QColor)    # the second colour, when the sender marks one
     status_changed = Signal(str)        # 'listening', 'giving_way', 'off'
 
     CHECK_MS = 5000
@@ -89,6 +147,7 @@ class ColorSyncServer(QObject):
         self._clients = []
         self.error = ""
         self.state = 'off'
+        self._seen = set()          # kinds of message logged once (event_shape)
         self._watch = QTimer(self)
         self._watch.setInterval(self.CHECK_MS)
         self._watch.timeout.connect(self._check)
@@ -178,6 +237,14 @@ class ColorSyncServer(QObject):
             pass                # went with the server (closed with it)
 
     def _on_text(self, text):
-        colour = colour_from_event(text)
-        if colour is not None:
-            self.colour_received.emit(colour)
+        # Each kind of message once into the log (Show Log): what the sender
+        # really sends, e.g. for its second colour.
+        shape = event_shape(text)
+        if shape not in self._seen:
+            self._seen.add(shape)
+            print(f"🐧 Colour sync: new kind of message: {text[:400]}")
+        for slot, colour in colours_from_event(text):
+            if slot == 'second':
+                self.second_received.emit(colour)
+            else:
+                self.colour_received.emit(colour)

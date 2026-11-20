@@ -6,6 +6,7 @@ after a tag gets a unique PEP 440 version automatically - no file to edit:
     v1.2.0 tag, clean checkout        -> 1.2.0
     3 commits after v1.2.0            -> 1.2.0+3.gabc1234
     ... plus uncommitted changes      -> 1.2.0+3.gabc1234.dirty
+    on the tag, uncommitted changes   -> 1.2.0+gabc1234.dirty
 
 Running from a git checkout asks ``git describe``, so the number follows every
 commit. A frozen build cannot ask git, so the PyInstaller spec stamps the
@@ -50,6 +51,10 @@ def version_from_git(repo_dir=_REPO_DIR):
     if int(m["distance"]):
         local += [m["distance"], "g" + m["sha"]]
     if m["dirty"]:
+        # Right on a tag but with changes not committed: which commit they
+        # sit on still matters (1.4.1+g8a95379.dirty, not 1.4.1+dirty).
+        if not local:
+            local.append("g" + m["sha"])
         local.append("dirty")
     return version + ("+" + ".".join(local) if local else "")
 

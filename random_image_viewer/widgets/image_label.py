@@ -142,8 +142,8 @@ class ImageLabel(QLabel):
             box = box.united(QRectF(s.x() - r, s.y() - r, 2 * r, 2 * r))
         return QRegion(box.toAlignedRect())
 
-    def _paint_fill_guide(self, painter):
-        guide = self._fill_guide
+    def _paint_fill_guide(self, painter, guide=None):
+        guide = guide or self._fill_guide
         if not guide:
             return
         from PySide6.QtCore import QPointF
@@ -324,6 +324,13 @@ class ImageLabel(QLabel):
             painter.end()
         overlay = getattr(self, '_fill_overlay', None)
         if not overlay:
+            # 🌈 the last gradient's handles, left to drag (see _grad_edit_guide)
+            guide = viewer._grad_edit_guide() if viewer is not None and hasattr(viewer, '_grad_edit_guide') else None
+            if guide:
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                self._paint_fill_guide(painter, guide)
+                painter.end()
             return
         points, color, open_path, stroke_width = overlay
         if len(points) < (2 if open_path else 3):
@@ -1361,6 +1368,16 @@ class ImageLabel(QLabel):
             event.accept()
             return
 
+        # 🌈 A handle of the last gradient being dragged (see _grad_edit_press) -
+        # before the polygon's hover, which would swallow the drag
+        if (self.parent_viewer and self.parent_viewer.__dict__.get('_grad_drag')
+                and (event.buttons() & Qt.LeftButton)):
+            ox, oy = self.parent_viewer.map_fill_input(event.position())
+            if ox is not None and oy is not None:
+                self.parent_viewer.grad_edit_move(ox, oy)
+            event.accept()
+            return
+
         # A polygon being placed: the loose edge follows the pointer, whether
         # or not a button is held (right-drag panning still falls through).
         if self.parent_viewer and getattr(self.parent_viewer, 'fill_mode', None) in self.parent_viewer._CLICK_SHAPES:
@@ -1853,6 +1870,13 @@ class ImageLabel(QLabel):
             self.parent_viewer.free_draw_mode and self.parent_viewer.is_drawing_free_stroke):
             print(f"Mouse release in free draw mode")
             self.parent_viewer.end_free_draw_stroke()
+            event.accept()
+            return
+
+        # 🌈 a gradient handle let go
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.__dict__.get('_grad_drag')):
+            self.parent_viewer.grad_edit_end()
             event.accept()
             return
 

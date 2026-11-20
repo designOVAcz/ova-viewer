@@ -17,117 +17,160 @@ Signals:
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                QLabel, QLineEdit, QSizePolicy, QToolButton)
-from PySide6.QtGui import QColor, QPainter, QImage, QPen, QLinearGradient
-from PySide6.QtCore import Qt, Signal, QRect, QPoint, QEvent
+from PySide6.QtGui import QColor, QPainter, QImage, QPen, QLinearGradient, QPainterPath
+from PySide6.QtCore import Qt, Signal, QRect, QRectF, QPoint, QPointF, QEvent
+
+from random_image_viewer.drawing import okhsl
 
 
-class _SquareField(QWidget):
-    """Saturation (x) against value (y) for one hue."""
+_HUE0 = 0.6        # the hue (OKLab, 0..1) at the field's left edge: cyan-blue,
+                   # so violet, red, yellow, green follow across it
 
-    changed = Signal(float, float)   # saturation, value - both 0..1
+
+def _rgb_image(rgb):
+    """(h, w, 3) sRGB 0..1 -> a QImage (copied, owns its pixels)."""
+    import numpy as np
+    a = np.ascontiguousarray((np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8))
+    h, w = a.shape[:2]
+    return QImage(a.data, w, h, w * 3, QImage.Format_RGB888).copy()
+
+
+def _rounded(rect, radius):
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect), radius, radius)
+    return path
+
+
+class _HueLightField(QWidget):
+    """Every hue across, lightness down (white top, black bottom), at one
+    saturation (_SatBar) - in OKLab (drawing/okhsl.py), so a row is one
+    lightness to the eye and every colour shown can be painted."""
+
+    changed = Signal(float, float)   # hue, lightness - both 0..1
+
+    SCALE = 2           # worked out at half size, scaled up smooth (it is soft anyway)
+    _cmax = {}          # (w, h) -> the most chroma per cell (the costly part, kept)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(168, 128)
+        self.setFixedSize(204, 172)
         self.setCursor(Qt.CrossCursor)
-        self._hue = 0.0
-        self._sat = 1.0
-        self._val = 1.0
+        self._hue, self._sat, self._light = 0.08, 0.6, 0.6
+        self._colour = QColor(Qt.white)
         self._cache = None
-        self._cache_hue = None
+        self._cache_sat = None
 
-    def set_hue(self, hue):
-        if abs(hue - self._hue) > 1e-6:
-            self._hue = hue
+    def set_state(self, hue, sat, light, colour):
+        if self._cache_sat is None or abs(sat - self._cache_sat) > 1e-4:
             self._cache = None
+        self._hue, self._sat, self._light = hue, sat, light
+        self._colour = QColor(colour)
         self.update()
 
-    def set_sv(self, sat, val):
-        self._sat, self._val = sat, val
-        self.update()
+    def _grid(self):
+        import numpy as np
+        w, h = max(2, self.width() // self.SCALE), max(2, self.height() // self.SCALE)
+        hue = ((_HUE0 + np.arange(w) / (w - 1)) % 1.0)[None, :]
+        light = (1.0 - np.arange(h) / (h - 1))[:, None]
+        key = (w, h)
+        if key not in self._cmax:
+            self._cmax[key] = okhsl.max_chroma(np.broadcast_to(light, (h, w)),
+                                               np.broadcast_to(hue * 2 * np.pi, (h, w)))
+        return hue, light, self._cmax[key]
 
     def _render(self):
-        """Build the gradient once per hue — it is the expensive part."""
-        w, h = self.width(), self.height()
-        img = QImage(w, h, QImage.Format_RGB32)
-        for y in range(h):
-            val = 1.0 - y / max(1, h - 1)
-            for x in range(w):
-                sat = x / max(1, w - 1)
-                img.setPixelColor(x, y, QColor.fromHsvF(self._hue, sat, val))
-        self._cache = img
-        self._cache_hue = self._hue
+        hue, light, cmax = self._grid()
+        small = _rgb_image(okhsl.to_rgb(hue, self._sat, light, cmax))
+        self._cache = small.scaled(self.width(), self.height(), Qt.IgnoreAspectRatio,
+                                   Qt.SmoothTransformation)
+        self._cache_sat = self._sat
+
+    def _xy(self):
+        x = ((self._hue - _HUE0) % 1.0) * (self.width() - 1)
+        y = (1.0 - self._light) * (self.height() - 1)
+        return QPointF(x, y)
 
     def paintEvent(self, event):
-        if self._cache is None or self._cache_hue != self._hue:
+        if self._cache is None:
             self._render()
         p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setClipPath(_rounded(self.rect(), 6))
         p.drawImage(0, 0, self._cache)
-        x = int(self._sat * (self.width() - 1))
-        y = int((1.0 - self._val) * (self.height() - 1))
-        ring = Qt.white if self._val < 0.6 else Qt.black
-        p.setPen(QPen(ring, 1))
-        p.setBrush(Qt.NoBrush)
-        p.drawEllipse(QPoint(x, y), 5, 5)
-        p.setPen(QPen(Qt.black if ring == Qt.white else Qt.white, 1))
-        p.drawEllipse(QPoint(x, y), 6, 6)
+        p.setClipping(False)
+        # the colour in a ring, where it is
+        at = self._xy()
+        p.setBrush(self._colour)
+        p.setPen(QPen(QColor(0, 0, 0, 120), 3.5))
+        p.drawEllipse(at, 10, 10)
+        p.setPen(QPen(QColor(235, 235, 235), 2))
+        p.drawEllipse(at, 10, 10)
         p.end()
 
     def _pick(self, pos):
-        sat = min(max(pos.x(), 0), self.width() - 1) / max(1, self.width() - 1)
-        val = 1.0 - min(max(pos.y(), 0), self.height() - 1) / max(1, self.height() - 1)
-        self._sat, self._val = sat, val
+        x = min(max(pos.x(), 0.0), self.width() - 1.0)
+        y = min(max(pos.y(), 0.0), self.height() - 1.0)
+        self._hue = (_HUE0 + x / max(1, self.width() - 1)) % 1.0
+        self._light = 1.0 - y / max(1, self.height() - 1)
         self.update()
-        self.changed.emit(sat, val)
+        self.changed.emit(self._hue, self._light)
 
     def mousePressEvent(self, event):
-        self._pick(event.position().toPoint())
+        self._pick(event.position())
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.LeftButton:
-            self._pick(event.position().toPoint())
+            self._pick(event.position())
 
 
-class _HueStrip(QWidget):
-    """Vertical hue selector."""
+class _SatBar(QWidget):
+    """Saturation, under the field: from the grey of the colour's lightness
+    to the most intense the screen holds at its hue and lightness."""
 
-    changed = Signal(float)          # hue 0..1
+    changed = Signal(float)          # saturation 0..1
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(18, 128)
+        self.setFixedSize(204, 22)
         self.setCursor(Qt.CrossCursor)
-        self._hue = 0.0
+        self._hue, self._sat, self._light = 0.08, 0.6, 0.6
 
-    def set_hue(self, hue):
-        self._hue = hue
+    def set_state(self, hue, sat, light):
+        self._hue, self._sat, self._light = hue, sat, light
         self.update()
 
     def paintEvent(self, event):
+        import numpy as np
         p = QPainter(self)
-        grad = QLinearGradient(0, 0, 0, self.height())
-        for i in range(7):
-            grad.setColorAt(i / 6.0, QColor.fromHsvF(i / 6.0, 1.0, 1.0))
-        p.fillRect(self.rect(), grad)
-        y = int(self._hue * (self.height() - 1))
-        p.setPen(QPen(Qt.white, 2))
-        p.drawLine(0, y, self.width(), y)
-        p.setPen(QPen(Qt.black, 1))
-        p.drawLine(0, y, self.width(), y)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        s = np.linspace(0.0, 1.0, 17)
+        rgb = okhsl.to_rgb(np.full(17, self._hue), s, np.full(17, self._light))
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        for t, c in zip(s, rgb):
+            grad.setColorAt(float(t), QColor.fromRgbF(*[float(v) for v in np.clip(c, 0, 1)]))
+        p.fillPath(_rounded(self.rect(), 5), grad)
+        # the handle: a slim upright pill
+        x = 4 + self._sat * (self.width() - 9)
+        pill = QRectF(x - 3.5, 2, 7, self.height() - 4)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 140), 3))
+        p.drawRoundedRect(pill, 3.5, 3.5)
+        p.setPen(QPen(QColor(235, 235, 235), 1.6))
+        p.drawRoundedRect(pill, 3.5, 3.5)
         p.end()
 
     def _pick(self, pos):
-        hue = min(max(pos.y(), 0), self.height() - 1) / max(1, self.height() - 1)
-        self._hue = hue
+        s = (min(max(pos.x(), 4.0), self.width() - 5.0) - 4.0) / max(1, self.width() - 9)
+        self._sat = s
         self.update()
-        self.changed.emit(hue)
+        self.changed.emit(s)
 
     def mousePressEvent(self, event):
-        self._pick(event.position().toPoint())
+        self._pick(event.position())
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.LeftButton:
-            self._pick(event.position().toPoint())
+            self._pick(event.position())
 
 
 class _Swatches(QWidget):
@@ -291,13 +334,16 @@ class ColorPickerPopup(QWidget):
         header.addWidget(self._close_btn, 0)
         inner.addLayout(header)
 
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        self._field = _SquareField()
-        self._strip = _HueStrip()
-        top.addWidget(self._field)
-        top.addWidget(self._strip)
-        inner.addLayout(top)
+        # hue across, lightness down, saturation on the bar below (OKLab)
+        self._hsl = (0.08, 0.6, 0.6)
+        self._field = _HueLightField()
+        self._field.setToolTip("Hue across, light to dark down - every colour at the same "
+                               "lightness looks equally light")
+        self._bar = _SatBar()
+        self._bar.setToolTip("Saturation: from grey to the most intense colour the screen shows")
+        inner.addWidget(self._field)
+        inner.addSpacing(-2)
+        inner.addWidget(self._bar)
 
         row = QHBoxLayout()
         row.setSpacing(6)
@@ -341,7 +387,7 @@ class ColorPickerPopup(QWidget):
         inner.addWidget(self._swatches)
 
         self._field.changed.connect(self._on_field)
-        self._strip.changed.connect(self._on_strip)
+        self._bar.changed.connect(self._on_bar)
 
     # ── public API ──
     def enable_second(self, on=True):
@@ -362,12 +408,16 @@ class ColorPickerPopup(QWidget):
     def set_color(self, color):
         """Show *color* without emitting (used when opening / syncing)."""
         self._updating = True
-        self._color = QColor(color)
-        h, s, v, _ = self._color.getHsvF()
-        h = max(0.0, h)          # achromatic colours report hue -1
-        self._field.set_hue(h)
-        self._field.set_sv(s, v)
-        self._strip.set_hue(h)
+        new = QColor(color)
+        if new.name() != self._color.name() or not getattr(self, '_shown_once', False):
+            # (our own colour coming back - the app echoes what we sent - is
+            # left where it is: rounding to 8 bits would nudge the ring)
+            self._shown_once = True
+            h, s, l = okhsl.from_rgb(new.redF(), new.greenF(), new.blueF())
+            if h is None:
+                h = self._hsl[0]        # a grey: keep the hue it had
+            self._show_hsl(h, s, l, new)
+        self._color = new
         self._sync_readout()
         self._updating = False
 
@@ -450,20 +500,23 @@ class ColorPickerPopup(QWidget):
         if not self._updating:
             self.color_picked.emit(QColor(self._color))
 
-    def _on_field(self, sat, val):
-        h = max(0.0, self._color.hueF())
-        if self._color.saturationF() == 0.0:
-            h = self._strip._hue
-        self._color = QColor.fromHsvF(h, sat, val)
+    def _show_hsl(self, h, s, l, colour):
+        self._hsl = (h, s, l)
+        self._field.set_state(h, s, l, colour)
+        self._bar.set_state(h, s, l)
+
+    def _set_hsl(self, h, s, l):
+        r, g, b = (float(v) for v in okhsl.to_rgb(h, s, l))
+        colour = QColor.fromRgbF(r, g, b)
+        self._color = colour
+        self._show_hsl(h, s, l, colour)
         self._emit()
 
-    def _on_strip(self, hue):
-        _, s, v, _ = self._color.getHsvF()
-        if s <= 0.0:
-            s = 1.0
-        self._field.set_hue(hue)
-        self._color = QColor.fromHsvF(hue, s, v)
-        self._emit()
+    def _on_field(self, hue, light):
+        self._set_hsl(hue, self._hsl[1], light)
+
+    def _on_bar(self, sat):
+        self._set_hsl(self._hsl[0], sat, self._hsl[2])
 
     def _on_swatch(self, color):
         if self._second_on and QApplication.keyboardModifiers() & Qt.AltModifier:
