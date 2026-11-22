@@ -135,7 +135,7 @@ class ImageLabel(QLabel):
         from PySide6.QtCore import QRectF
         import math as _m
         s, e, radial = guide[0], guide[1], guide[2]
-        pad = self._GUIDE_HANDLE + 4
+        pad = self._GUIDE_HANDLE + 12               # (the selected node's ring too)
         box = QRectF(s, e).normalized().adjusted(-pad, -pad, pad, pad)
         if radial:
             r = _m.hypot(e.x() - s.x(), e.y() - s.y()) + 3
@@ -150,6 +150,7 @@ class ImageLabel(QLabel):
         import math as _m
         s, e, radial, c0, c1 = guide[:5]
         mid = guide[5] if len(guide) > 5 else 0.5
+        picked = guide[6] if len(guide) > 6 else None     # the node a colour picked goes to
         painter.setBrush(Qt.NoBrush)
         if radial:
             r = _m.hypot(e.x() - s.x(), e.y() - s.y())
@@ -176,7 +177,14 @@ class ImageLabel(QLabel):
         painter.drawPolygon(diamond)
         painter.setPen(QPen(QColor(255, 255, 255), 1.2))
         painter.drawPolygon(diamond)
-        for at, colour in ((s, c0), (e, c1)):
+        for name, at, colour in (('start', s, c0), ('end', e, c1)):
+            if name == picked:
+                # selected: a wide ring round it (dark under bright), seen on any picture
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor(0, 0, 0, 200), 5.0))
+                painter.drawEllipse(at, h + 5, h + 5)
+                painter.setPen(QPen(QColor(255, 214, 0), 2.5))
+                painter.drawEllipse(at, h + 5, h + 5)
             if colour is None:
                 # transparent: a little checkerboard
                 painter.setPen(Qt.NoPen)
@@ -315,6 +323,11 @@ class ImageLabel(QLabel):
             painter.end()
         else:
             super().paintEvent(event)
+        if viewer is not None and (getattr(viewer, 'dot_grid', False) or getattr(viewer, 'cross_grid', False)):
+            painter = QPainter(self)
+            painter.setClipRegion(event.region())
+            viewer.paint_dot_grid(painter)      # ∴ over the view, never in it
+            painter.end()
         frame = viewer._crop_screen_rect() if viewer is not None else None
         if frame is not None:
             self._paint_crop_frame(frame)
@@ -1355,6 +1368,9 @@ class ImageLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if (self.parent_viewer is not None and not event.buttons()
+                and getattr(self.parent_viewer, 'free_draw_mode', False)):
+            self.parent_viewer.note_hover_move(event.position())   # a stroke-turned tip's way
         # ✂ Crop: the frame follows a drag; hovering shows what would be grabbed.
         # (Right-drag panning still falls through.)
         if (self.parent_viewer and self.parent_viewer.crop_mode
@@ -1696,6 +1712,7 @@ class ImageLabel(QLabel):
                 # waits a moment after (see _on_touch_pan).
                 self.parent_viewer._pen_touch_time = time.monotonic()
             if hover and not self.parent_viewer.is_drawing_free_stroke:
+                self.parent_viewer.note_hover_move(event.position())   # (its way, no lean)
                 self.parent_viewer.refresh_texture_cursor()   # hovering: turn with the lean
             # The pen turned round: its eraser end rubs out (🧽 Erase mode).
             if event.type() in (QTabletEvent.TabletEnterProximity, QTabletEvent.TabletMove,

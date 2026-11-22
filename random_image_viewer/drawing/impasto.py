@@ -172,6 +172,129 @@ def light(image, settings=None, scale=1.0, use_gpu=True):
     return out
 
 
+# -- ⛰ lit from the paint's real thickness ----------------------------------
+#
+# The main window lays a thickness map beside each impasto layer's colour
+# (RandomImageViewer._update_height): every stroke laid again with its own
+# tip, white, its opacity the paint's thickness - thick where the stroke
+# starts, thinning as the brush runs dry, the hairs' gaps as real grooves,
+# coats building up over each other. Lit from that, nothing comes from the
+# colours (the "emboss" look: every colour edge a ridge) and strokes keep the
+# shape of the brush that laid them:
+#
+#   * relief   - the thickness, its fine detail (hairs) by Grooves;
+#   * ridges   - paint pushed up along a stroke's edges (Edges, Edge width);
+#   * light    - soft (wrapped), from Light at 40° up: flat paint keeps its
+#                colour exactly, slopes turn to or away from the light;
+#   * hollows  - shadowed (ambient occlusion: lower than what is round them);
+#   * gloss    - a wet highlight on the ridges, broken up by the relief, not
+#                a plastic sheen over everything.
+
+LIGHT_UP = math.radians(40.0)
+
+
+def _height_array(height):
+    """The thickness map (RGBA64 premultiplied QImage) as float32 0..1 (its alpha)."""
+    w, h, line = height.width(), height.height(), height.bytesPerLine()
+    data = np.frombuffer(height.constBits(), np.uint16, count=line // 2 * h).reshape(h, line // 2)
+    return data[:, :w * 4].reshape(h, w, 4)[:, :, 3].astype(np.float32) * np.float32(1.0 / 65535.0)
+
+
+def light_height(image, height, settings=None, scale=1.0, boxes=None, into=None):
+    """*image* (premultiplied ARGB32, a layer's colour) lit from *height*
+    (its thickness map, same size). *scale*: image px per picture px.
+    *boxes*: only these QRects (what changed) - the rest of *into* (the
+    last lit image) kept; None: all of it. Returns the lit QImage."""
+    if cv2 is None or image.isNull() or height is None or height.isNull():
+        return light(image, settings, scale)
+    s = dict(DEFAULTS, **(settings or {}))
+    src = image if image.format() == QImage.Format_ARGB32_Premultiplied else \
+        image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    out = into.copy() if (into is not None and boxes is not None and into.size() == src.size()) else src.copy()
+    if into is None or boxes is None or into.size() != src.size():
+        boxes = None
+    pixels = _array(src)
+    H_all = _height_array(height)
+    if H_all.shape != pixels.shape[:2]:
+        # (the map is kept smaller than the colour: brought up to its size)
+        H_all = cv2.resize(H_all, (pixels.shape[1], pixels.shape[0]), interpolation=cv2.INTER_LINEAR)
+    Hh, Ww = H_all.shape
+    scale = max(0.05, float(scale))
+    fine = max(0.6, 1.6 * scale)                     # what counts as fine detail (hairs)
+    edge_sigma = max(0.8, s['edge_width'] * scale)
+    ao_sigma = max(1.5, 7.0 * scale)
+    pad = int(math.ceil(max(edge_sigma, ao_sigma, fine) * 3)) + 3
+    if boxes is None:
+        a8 = np.ascontiguousarray(pixels[:, :, 3])
+        x, y, w, h = cv2.boundingRect(np.maximum(a8, (H_all > 0.002).astype(np.uint8) * 255))
+        if w == 0 or h == 0:
+            return out
+        regions = [(x, y, w, h)]
+    else:
+        regions = [(b.x(), b.y(), b.width(), b.height()) for b in boxes if not b.isEmpty()]
+    dst = _array(out, write=True)
+    for (x, y, w, h) in regions:
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(Ww, x + w + pad), min(Hh, y + h + pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        part = np.ascontiguousarray(pixels[y0:y1, x0:x1])
+        lit = _light_height_part(part, H_all[y0:y1, x0:x1], s, scale, fine, edge_sigma, ao_sigma)
+        # only the box itself goes back (the margin was context for the blurs)
+        bx0, by0 = max(0, x) - x0, max(0, y) - y0
+        bx1, by1 = min(Ww, x + w) - x0, min(Hh, y + h) - y0
+        dst[y0 + by0:y0 + by1, x0 + bx0:x0 + bx1] = lit[by0:by1, bx0:bx1]
+    return out
+
+
+def _light_height_part(part, H, s, scale, fine, edge_sigma, ao_sigma):
+    f32 = np.float32
+    a = part[:, :, 3].astype(f32) * f32(1 / 255.0)
+    # relief: the broad body of the paint, its fine detail (hairs) by Grooves
+    base = cv2.GaussianBlur(H, (0, 0), fine)
+    detail = f32(0.25 + 0.9 * s['grooves'] / 100.0)
+    rel = base + detail * (H - base)
+    # ridges: paint pushed up just inside a stroke's edge
+    if s['edges']:
+        soft = cv2.GaussianBlur(H, (0, 0), edge_sigma)
+        rel += f32(1.2 * s['edges'] / 100.0) * np.maximum(H - soft, 0) * np.minimum(H * 3.0, 1.0)
+    bump = f32(8.4 * s['depth'] / 100.0 * scale / 8.0)     # (as the GPU's: 4.2·depth·k per 2 px)
+    gx = cv2.Sobel(rel, cv2.CV_32F, 1, 0, ksize=3, scale=float(bump), borderType=cv2.BORDER_REPLICATE)
+    gy = cv2.Sobel(rel, cv2.CV_32F, 0, 1, ksize=3, scale=float(bump), borderType=cv2.BORDER_REPLICATE)
+    inv = 1.0 / np.sqrt(gx * gx + gy * gy + 1.0)
+    nx, ny, nz = -gx * inv, -gy * inv, inv
+    az = math.radians(s['light'])
+    lx, ly, lz = math.cos(az) * math.cos(LIGHT_UP), math.sin(az) * math.cos(LIGHT_UP), math.sin(LIGHT_UP)
+    ndl = nx * f32(lx) + ny * f32(ly) + nz * f32(lz)
+    # soft light: wrapped, so a slope away from it darkens gently, never to black
+    wrap = f32(0.45)
+    lit_now = np.maximum((ndl + wrap) / (1.0 + wrap), 0.0)
+    lit_flat = f32((lz + 0.45) / 1.45)
+    shade = 1.0 + f32(0.9) * (lit_now - lit_flat) / lit_flat
+    # hollows: lower than their surroundings - grooves, gaps, valleys
+    around = cv2.GaussianBlur(rel, (0, 0), ao_sigma)
+    occ = np.clip((around - rel) * f32(3.0 * s['depth'] / 100.0 + 0.5), 0.0, 1.0)
+    shade *= 1.0 - f32(0.38) * occ
+    shade = np.clip(shade, 0.5, 1.45)
+    # gloss: a highlight where a ridge faces the light (half vector), its
+    # strength broken up by the relief - wet paint, not a plastic sheen
+    sp = 0.0
+    if s['gloss']:
+        hx, hy, hz = lx, ly, lz + 1.0
+        hn = math.sqrt(hx * hx + hy * hy + hz * hz)
+        ndh = np.maximum(nx * f32(hx / hn) + ny * f32(hy / hn) + nz * f32(hz / hn), 0.0)
+        flat_spec = f32((hz / hn) ** 28)
+        ridge = np.clip((rel - around) * 6.0 + 0.5, 0.0, 1.0)
+        sp = np.maximum(ndh ** f32(28) - flat_spec, 0.0) * (0.35 + 0.65 * ridge)
+        sp = sp * f32(1.6 * s['gloss'] / 100.0) * 255.0 * a
+    out = part.copy()
+    alpha = part[:, :, 3].astype(f32)
+    for c in range(3):
+        v = part[:, :, c].astype(f32) * shade + sp
+        out[:, :, c] = (np.clip(np.minimum(v, alpha), 0, 255) + 0.5).astype(np.uint8)
+    return out
+
+
 def _light_gpu(part, ab, gb, s, scale):
     global _program, _gpu_failed
     gpu = _gpu

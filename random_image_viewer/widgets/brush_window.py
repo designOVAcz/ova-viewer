@@ -53,10 +53,20 @@ class BrushWindow(QWidget):
         ('soft_softness', 'Softness', (0, 100), '%',
          "Soft tip: how much of its radius fades out - 0 % a hard disc, 100 % all feather "
          "(an airbrush)"),
-        ('spray_spread', 'Spread', (1, 20), '×',
+        ('spray_spread', 'Spread', (1, 60), '×',
          "Spray: the cloud is the brush size times this - up to 20x (400 px -> 8000 px)"),
-        ('spray_density', 'Specks', (1, 3000), '', "Spray: specks per stamp - few for a sparse dusting"),
+        ('spray_density', 'Specks', (1, 20000), '', "Spray: specks per stamp - few for a sparse dusting, "
+         "thousands with a big Spread to cover large areas"),
         ('spray_speck', 'Speck', (1, 60), 'px', "Spray: speck size as drawn (screen px); they vary down to about half"),
+        ('hair_count', 'Hairs', (4, 200), '', "Hair brush: how many hairs across the tip - few for "
+                                               "coarse streaks, many for a fine, dense brush"),
+        ('hair_vary', 'Vary', (0, 100), '%', "Hair brush: how much the hairs differ in thickness and "
+                                             "strength - the gaps and faint hairs run along the stroke as streaks"),
+        ('hair_ragged', 'Ragged', (0, 100), '%', "Hair brush: how much the hairs differ in length - a "
+                                                 "frayed start and end of each stroke"),
+        ('hair_soft', 'Hair edge', (0, 100), '%', "Hair brush: hard (0) to soft hair edges"),
+        ('hair_seed', 'Brush #', (0, 99), '', "Hair brush: another number, another brush - the same "
+                                              "settings with other hairs"),
         ('rake_tines', 'Tines', (2, 40), '', "Rake: how many tines in the row (the row is the brush size wide)"),
         ('rake_tine', 'Tine', (5, 100), '%', "Rake: each tine's thickness, as a share of the gap between "
                                              "them - 100 % and they touch"),
@@ -400,6 +410,39 @@ class BrushWindow(QWidget):
         self._shape_gradient.toggled.connect(lambda on: self._emit('shape_gradient', on))
         inner.addWidget(self._shape_gradient)
 
+        # ✨ starfield fills: shapes fill with tiny random specks
+        self._shape_stars = QCheckBox("✨ Shapes fill with stars")
+        self._shape_stars.setToolTip(
+            "Lasso, polygon, rectangle, ellipse and triangle fill with a starfield: tiny random "
+            "specks of the pen colour - most the smallest size and faint, a few bigger and "
+            "brighter. Hue / Sat / Value ± above vary their colours. Drag a rectangle over "
+            "the whole canvas to fill it in one go")
+        self._shape_stars.toggled.connect(lambda on: self._emit('shape_stars', on))
+        inner.addWidget(self._shape_stars)
+        self._star_sliders = {}
+        for key, label, (lo, hi), unit, tip in (
+                ('stars_amount', 'Stars', (1, 100), '',
+                 "How many stars: a few (1) to a dense dust (100)"),
+                ('stars_size', 'Star size', (1, 8), 'px',
+                 "The smallest star, in real screen pixels as drawn (1 = a single pixel); "
+                 "a few grow up to 5x")):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            name = QLabel(label)
+            name.setFixedWidth(52)
+            row.addWidget(name)
+            slider = ClickableSlider(Qt.Horizontal)
+            slider.setRange(lo, hi)
+            slider.setToolTip(tip)
+            value = QLabel("")
+            value.setFixedWidth(36)
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            slider.valueChanged.connect(lambda v, k=key, u=unit, lab=value: self._on_slider(k, v, u, lab))
+            row.addWidget(slider, 1)
+            row.addWidget(value)
+            inner.addLayout(row)
+            self._star_sliders[key] = (slider, value, unit)
+
         checks = QHBoxLayout()
         checks.setContentsMargins(0, 0, 0, 0)
         checks.addWidget(QLabel("Pressure:"))
@@ -532,6 +575,11 @@ class BrushWindow(QWidget):
         self._gradient_to.setCurrentIndex(1 if to else 0)
         self._gradient_swatch.setEnabled(bool(to))
         self._shape_gradient.setChecked(bool(settings.get('shape_gradient', False)))
+        self._shape_stars.setChecked(bool(settings.get('shape_stars', False)))
+        for key, (slider, value, unit) in self._star_sliders.items():
+            v = int(settings.get(key, {'stars_amount': 40, 'stars_size': 1}[key]))
+            slider.setValue(v)
+            value.setText(f"{v}{unit}")
         mid = int(settings.get('gradient_mid', 50))
         self._gradient_mid.setValue(mid)
         self._gradient_mid_value.setText(f"{mid}%")
@@ -560,6 +608,7 @@ class BrushWindow(QWidget):
         changed = False
         for key, widgets in self._slider_rows.items():
             for prefix, shown in (('spray_', spray), ('rake_', rake),
+                                  ('hair_', bool(path) and path.startswith(':hairs')),
                                   ('soft_', bool(path) and path.startswith(':soft')),
                                   ('smear_', self._mode_value == 'smear'),
                                   ('push_', self._mode_value == 'push')):

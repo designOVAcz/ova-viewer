@@ -103,6 +103,7 @@ class Layer:
         layer itself, its blend, opacity and effects stay for the next one."""
         for marks in self.marks.values():
             marks.clear()
+        self.__dict__.pop('_redo', None)    # ↷ nothing of it to put back
         self.fill = None
         self.raster = None
 

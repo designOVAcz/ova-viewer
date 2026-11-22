@@ -56,6 +56,9 @@ DEFAULT_SETTINGS = {
     'gradient': 'linear',       # 🌈 the gradient tool: 'linear' or 'radial'
     'gradient_to': '',          # 🌈 ... from the pen colour to this ('#rrggbb'), '' = transparent
     'shape_gradient': False,    # 🌈 shapes fill with the gradient instead of one colour
+    'shape_stars': False,       # ✨ shapes fill with a starfield (tiny random specks) instead
+    'stars_amount': 40,         # ✨ 1..100: how many (20·v² per megapixel of picture)
+    'stars_size': 1,            # ✨ the smallest star, real screen px as drawn (a few grow ~5x)
     'gradient_mid': 50,         # 🌈 % along it where the colours are half mixed (gradient_bias)
     'mode_marks': True,         # in a mode other than Paint, lines run the brush along
                                 #   them and shapes run it over their area (clipped to it)
@@ -79,6 +82,11 @@ DEFAULT_SETTINGS = {
     'rake_tine': 45,            # Rake tip: each tine's thickness, % of the gap between them
     'rake_wobble': 25,          # Rake tip: % the tines differ in size, place and strength
     'soft_softness': 60,        # Soft tip: % of the radius that fades out (100: all feather)
+    'hair_count': 48,           # 🖌 Hair brush: hairs across the tip
+    'hair_vary': 50,            # 🖌 ... % they differ in thickness / strength (gaps: streaks)
+    'hair_ragged': 40,          # 🖌 ... % they differ in length and start (frayed ends)
+    'hair_soft': 30,            # 🖌 ... % soft hair edges
+    'hair_seed': 17,            # 🖌 ... which brush (another seed: other hairs)
     'smear_grab': 70,           # Smear: % how firmly hairs grab paint that stands out
     'smear_edge': 25,           # Smear: % how much it must stand out to be grabbed
     'smear_blur': 20,           # Smear: % how much the hairs also blend what they pass
@@ -109,7 +117,8 @@ DUST = ':dust'          # the built-in airbrush / particle tip (a cloud of speck
 SPRAY = ':spray'        # the procedural spray: specks drawn as dots, sharp at any size
 RAKE = ':rake'          # a rake: tines in a row, dragged into parallel lines (see rake_path)
 SOFT = ':soft'          # a feathered round: solid middle, edge fading by Softness (see soft_path)
-SPRAY_SPREAD_MAX = 20
+HAIRS = ':hairs'        # 🖌 a procedural hair brush: uneven hairs, frayed ends (see hairs_path)
+SPRAY_SPREAD_MAX = 60      # (20 was too little to cover a large canvas)
 PARTICLE_COLOURS = 16   # 'particles' jitter: colours a stamp's specks are spread over
 PARTICLE_SETS = 16      # ... and the different colourings a stroke picks from
 STREAKS = 32            # colour bands across the tip, with 'streaks' jitter
@@ -975,6 +984,93 @@ def _rake_image(tines=8, tine=45, wobble=25, seed=3):
     return image
 
 
+def _hairs_image(hairs=48, vary=50, ragged=40, soft=30, seed=17):
+    """🖌 A procedural hair brush (as HeavyPaint's bristle brushes): *hairs*
+    hairs side by side across the stroke (the image is upright: across = y,
+    along the stroke = x). Each hair a short streak of its own thickness and
+    strength (*vary* %: from a tidy row to uneven, some hairs thin, faint or
+    missing - the gaps that run along a flat stroke as streaks), its own
+    length and start (*ragged* %: a frayed beginning and end) and edge
+    (*soft* %). The outer hairs thinner and weaker, a few strays past them.
+    Laid with numpy - a few ms - and sharp at any size, as Rake."""
+    rng = np.random.default_rng(seed)
+    H, W = 512, 288                     # across, along (long: room for frayed ends)
+    hairs = max(4, min(400, int(hairs)))
+    v, rg, sf = vary / 100.0, ragged / 100.0, soft / 100.0
+    pitch = H * 0.92 / hairs            # the row fills ~92 % of the width, strays outside
+    ys = np.arange(H, dtype=np.float32)[:, None]
+    xs = np.arange(W, dtype=np.float32)[None, :]
+    alpha = np.zeros((H, W), np.float32)
+    centres = (H * 0.04 + (np.arange(hairs) + 0.5) * pitch
+               + rng.uniform(-0.35, 0.35, hairs) * pitch * v)
+    # a few strays past the edges
+    strays = int(round(hairs * 0.08 * (0.3 + v)))
+    if strays:
+        side = rng.choice([-1.0, 1.0], strays)
+        out = rng.uniform(0.0, H * 0.05, strays)
+        centres = np.concatenate([centres, np.where(side < 0, H * 0.04 - out, H * 0.96 + out)])
+    for i, cy in enumerate(centres):
+        edge = abs(cy - H / 2) / (H / 2)                   # 0 middle .. 1 rim
+        stray = i >= hairs
+        thin = 1.0 - 0.55 * max(0.0, edge - 0.6) / 0.4 if not stray else 0.45
+        width = pitch * (0.55 + 0.6 * rng.random() * (0.3 + v)) * thin
+        strength = 1.0 - v * 0.75 * rng.random() ** 1.6
+        if stray or edge > 0.8:
+            strength *= rng.uniform(0.35, 0.8)
+        if rng.random() < 0.12 * v:
+            strength *= 0.25                                # a hair that hardly holds paint
+        # along: its own start and length (frayed ends)
+        # (skewed: most hairs near the full length, a few much shorter or
+        # starting late - the long frayed hairs at a stroke's start and end)
+        start = (rng.random() ** 1.8) * 0.65 * rg * W
+        length = W * (1.0 - (rng.random() ** 1.8) * 0.7 * rg) - start
+        x0, x1 = start, start + max(W * 0.18, length)
+        half = max(0.6, width / 2.0)
+        # only the rows it covers (the whole image per hair: ~140 ms a tip)
+        r0, r1 = max(0, int(cy - half) - 1), min(H, int(cy + half) + 2)
+        if r1 <= r0:
+            continue
+        # across: a rounded profile, edge softness by *soft*
+        d = np.abs(ys[r0:r1] - cy) / half
+        across = np.clip((1.0 - d) / max(0.08, sf * 0.9 + 0.08), 0.0, 1.0)
+        across = across * across * (3 - 2 * across)
+        fade = max(1.5, W * 0.06)
+        along = np.clip(np.minimum(xs - x0, x1 - xs) / fade, 0.0, 1.0)
+        np.maximum(alpha[r0:r1], strength * across * along, out=alpha[r0:r1])
+    a8 = (np.clip(alpha, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    bgra = np.empty((H, W, 4), np.uint8)
+    bgra[..., :3] = 255
+    bgra[..., 3] = a8
+    return QImage(bgra.data, W, H, W * 4, QImage.Format_ARGB32).copy()
+
+
+def hairs_path(settings):
+    """The Hair brush with its settings, as a path a stroke keeps (the same
+    hairs at any zoom): ':hairs?n=<hairs>&v=<vary %>&r=<ragged %>&s=<soft %>&k=<seed>'."""
+    n = max(4, min(400, int(settings.get('hair_count', 48))))
+    v = max(0, min(100, int(settings.get('hair_vary', 50))))
+    r = max(0, min(100, int(settings.get('hair_ragged', 40))))
+    s = max(0, min(100, int(settings.get('hair_soft', 30))))
+    k = max(0, min(999, int(settings.get('hair_seed', 17))))
+    return f"{HAIRS}?n={n}&v={v}&r={r}&s={s}&k={k}"
+
+
+def _hairs_tip(path):
+    """A Hair brush for *path* (see hairs_path, or HAIRS for the defaults)."""
+    values = {'n': DEFAULT_SETTINGS['hair_count'], 'v': DEFAULT_SETTINGS['hair_vary'],
+              'r': DEFAULT_SETTINGS['hair_ragged'], 's': DEFAULT_SETTINGS['hair_soft'],
+              'k': DEFAULT_SETTINGS['hair_seed']}
+    if '?' in path:
+        for part in path.split('?', 1)[1].split('&'):
+            try:
+                key, value = part.split('=', 1)
+                values[key] = int(value)
+            except ValueError:
+                pass
+    return BrushTexture(path, _hairs_image(values['n'], values['v'], values['r'], values['s'],
+                                           seed=values['k']), "Hair brush (procedural)")
+
+
 def rake_path(settings):
     """The Rake tip with its settings, as a path a stroke keeps (it lays the
     same tines again at any zoom): ':rake?t=<tines>&w=<tine %>&j=<wobble %>'."""
@@ -1095,6 +1191,10 @@ def load_texture(path):
     if path and (path == SOFT or path.startswith(SOFT + '?')):
         if path not in _textures:
             _textures[path] = _soft_tip(path)
+        return _textures[path]
+    if path and (path == HAIRS or path.startswith(HAIRS + '?')):
+        if path not in _textures:
+            _textures[path] = _hairs_tip(path)
         return _textures[path]
     if path in _BUILT_IN:
         if path not in _textures:

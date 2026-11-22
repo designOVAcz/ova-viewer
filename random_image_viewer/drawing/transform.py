@@ -161,6 +161,10 @@ def apply(marks, t):
             grad = dict(mark['gradient'])       # (a new one: the undo snapshot keeps the old)
             grad['start'], grad['end'] = moved(grad['start'])[:2], moved(grad['end'])[:2]
             mark['gradient'] = grad
+        if kind == 'fill' and mark.get('stars'):
+            stars = dict(mark['stars'])         # ✨ (a new one: the undo snapshot keeps the old)
+            stars['speck'] = stars.get('speck', 1.0) * scale
+            mark['stars'] = stars
         if kind in ('free_line', 'fill') and mark.get('pic_width'):
             mark['pic_width'] = mark['pic_width'] * scale     # a painted line's width
         if kind in ('free_line', 'fill') and mark.get('jitter'):
