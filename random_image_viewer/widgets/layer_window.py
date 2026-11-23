@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, Signal
 
 from random_image_viewer.drawing.layers import BLEND_MODES
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
+from random_image_viewer.widgets.title_drag import on_title_row
 
 
 class LayerWindow(QWidget):
@@ -85,6 +86,7 @@ class LayerWindow(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         self._header = QLabel("\U0001F4DA Layers")
         self._header.setCursor(Qt.SizeAllCursor)
+        self._header.setToolTip("Drag here to move the panel")
         header.addWidget(self._header, 1)
         close_btn = QToolButton()
         close_btn.setText("✕")
@@ -412,7 +414,9 @@ class LayerWindow(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # by the title row alone: a slider just missed moved the whole panel
+            self._drag_offset = (event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                                 if on_title_row(self, self._header, event) else None)
             self._dragged = False
             event.accept()
 

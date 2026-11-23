@@ -74,7 +74,7 @@ class ImageLabel(QLabel):
 
     _FILL_FRAME = 1.0 / 60.0
 
-    def set_fill_overlay(self, points, color, appended=False, open_path=False, stroke_width=0):
+    def set_fill_overlay(self, points, color, appended=False, open_path=False, stroke_width=0, dashed=False):
         """Show *points* (widget coordinates) as a filled shape over the image.
 
         ``appended`` means the caller only added one vertex to the same outline
@@ -89,7 +89,8 @@ class ImageLabel(QLabel):
         previous = self._fill_overlay
         pts = points if appended else list(points)
         from PySide6.QtGui import QBrush
-        brush = color if isinstance(color, QBrush) else QColor(color)     # (🌈 a gradient)
+        brush = (color if isinstance(color, QBrush) or (callable(color) and not isinstance(color, QColor))
+                 else QColor(color))        # (🌈 a gradient; a line's paints itself)
         self._fill_overlay = (pts, brush, open_path, stroke_width) if pts else None
         if open_path or (previous and previous[2]):
             changed = self._outline_region(
@@ -103,7 +104,27 @@ class ImageLabel(QLabel):
                    else QRegion())
             new = QRegion(QPolygon(pts)) if pts and len(pts) >= 3 else QRegion()
             changed = old.xored(new)
+        was_dashed, self._fill_dashed = getattr(self, '_fill_dashed', False), bool(dashed)
+        if dashed or was_dashed:
+            # (the dashes shift along every edge as it grows: all of it again)
+            changed = self._outline_region(previous[0] if previous else None,
+                                           previous[3] if previous else 0).united(
+                self._outline_region(pts, stroke_width)).united(changed)
         self._queue_fill_repaint(changed)
+
+    @staticmethod
+    def paint_dashes(painter, points, closed=False):
+        """An outline that shows on any paint: white dashes on dark ones."""
+        from PySide6.QtGui import QPolygonF
+        shape = QPolygonF([QPointF(p) for p in points])
+        painter.setBrush(Qt.NoBrush)
+        for pen in (QPen(QColor(0, 0, 0, 220), 2), QPen(QColor(255, 255, 255), 2, Qt.DashLine)):
+            pen.setCapStyle(Qt.FlatCap)
+            painter.setPen(pen)
+            if closed:
+                painter.drawPolygon(shape)
+            else:
+                painter.drawPolyline(shape)
 
     # Radius of the ring marking a polygon's first corner (click it to close).
     _CORNER_RING = 5
@@ -137,6 +158,9 @@ class ImageLabel(QLabel):
         s, e, radial = guide[0], guide[1], guide[2]
         pad = self._GUIDE_HANDLE + 12               # (the selected node's ring too)
         box = QRectF(s, e).normalized().adjusted(-pad, -pad, pad, pad)
+        way = guide[7] if len(guide) > 7 else None      # along a polyline
+        for p in way or ():
+            box = box.united(QRectF(p.x() - pad, p.y() - pad, 2 * pad, 2 * pad))
         if radial:
             r = _m.hypot(e.x() - s.x(), e.y() - s.y()) + 3
             box = box.united(QRectF(s.x() - r, s.y() - r, 2 * r, 2 * r))
@@ -160,15 +184,20 @@ class ImageLabel(QLabel):
             painter.setPen(dash)
             painter.drawEllipse(s, r, r)
         # the line: dark under light, seen on any picture
-        painter.setPen(QPen(QColor(0, 0, 0, 170), 4, Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(s, e)
-        painter.setPen(QPen(QColor(255, 255, 255, 240), 2, Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(s, e)
+        way = guide[7] if len(guide) > 7 else None      # along a polyline
+        for pen in (QPen(QColor(0, 0, 0, 170), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin),
+                    QPen(QColor(255, 255, 255, 240), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)):
+            painter.setPen(pen)
+            if way:
+                painter.drawPolyline(way)
+            else:
+                painter.drawLine(s, e)
         h = self._GUIDE_HANDLE
         # the middle (the brush panel's Middle slider): a small diamond where
         # the two colours are half mixed
         from PySide6.QtGui import QPolygonF
-        m = QPointF(s.x() + (e.x() - s.x()) * mid, s.y() + (e.y() - s.y()) * mid)
+        m = ((guide[8] if len(guide) > 8 else None)
+             or QPointF(s.x() + (e.x() - s.x()) * mid, s.y() + (e.y() - s.y()) * mid))
         d = h * 0.7
         diamond = QPolygonF([QPointF(m.x(), m.y() - d), QPointF(m.x() + d, m.y()),
                              QPointF(m.x(), m.y() + d), QPointF(m.x() - d, m.y())])
@@ -221,7 +250,17 @@ class ImageLabel(QLabel):
             elif len(pts) >= 3:
                 region = region.united(QRegion(QPolygon(pts)))
         if not region.isEmpty():
-            self.update(self._grow_region(region))
+            self._update_overlay(self._grow_region(region))
+
+    def _update_overlay(self, region):
+        """The tool overlay changed in *region*: repainted on the canvas that
+        shows - the GPU's straight (through the label, under its window, each
+        came back as the whole canvas)."""
+        viewer = self.parent_viewer
+        if viewer is not None and viewer.__dict__.get('_gpu_display'):
+            viewer._live_update(region.boundingRect())
+        else:
+            self.update(region)
 
     def _queue_fill_repaint(self, region):
         """Collect *region* and repaint it now, or on the next frame tick."""
@@ -245,7 +284,7 @@ class ImageLabel(QLabel):
         self._fill_last_paint = time.monotonic()
         pending, self._fill_pending = self._fill_pending, None
         if pending is not None and not pending.isEmpty():
-            self.update(self._grow_region(pending))
+            self._update_overlay(self._grow_region(pending))
 
     @staticmethod
     def _grow_region(region, px=2):
@@ -335,40 +374,57 @@ class ImageLabel(QLabel):
             painter = QPainter(self)
             viewer.paint_selection_overlay(painter)     # ⬚ the selection and its frame
             painter.end()
+        if (getattr(self, '_fill_overlay', None)
+                or (viewer is not None and viewer.__dict__.get('_grad_edit') is not None)):
+            painter = QPainter(self)
+            painter.setClipRegion(event.region())
+            self.paint_tool_overlay(painter)
+            painter.end()
+
+    def paint_tool_overlay(self, painter):
+        """The shape or polyline being placed, or the last gradient's handles:
+        painted on the label, and by the GPU canvas over its frame."""
+        viewer = self.parent_viewer
         overlay = getattr(self, '_fill_overlay', None)
         if not overlay:
             # 🌈 the last gradient's handles, left to drag (see _grad_edit_guide)
             guide = viewer._grad_edit_guide() if viewer is not None and hasattr(viewer, '_grad_edit_guide') else None
             if guide:
-                painter = QPainter(self)
                 painter.setRenderHint(QPainter.Antialiasing, True)
                 self._paint_fill_guide(painter, guide)
-                painter.end()
             return
         points, color, open_path, stroke_width = overlay
         if len(points) < (2 if open_path else 3):
             return
-        painter = QPainter(self)
-        painter.setClipRegion(event.region())
         # The same colour and smoothing the committed fill gets, so letting go
         # of the mouse changes nothing on screen.
         painter.setRenderHint(QPainter.Antialiasing, True)
         if stroke_width:
             # A polyline being placed: just its edges, in the real line width.
             painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(color, stroke_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawPolyline(QPolygon(points))
+            if callable(color) and not isinstance(color, QColor):
+                color(painter, points)          # 🌈 a line with a gradient paints itself
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                if self._fill_guide:
+                    self._paint_fill_guide(painter)     # a node dragged: no corner ring
+                    return
+            else:
+                painter.setPen(QPen(color, stroke_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.drawPolyline(QPolygon(points))
+                if getattr(self, '_fill_dashed', False):
+                    self.paint_dashes(painter, points)      # the brush's way
             first = points[0]
             painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
             painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
             painter.setPen(QPen(QColor(255, 255, 255), 1))
             painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
-            painter.end()
             return
         if len(points) >= 3:
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawPolygon(QPolygon(points))
+        if getattr(self, '_fill_dashed', False):
+            self.paint_dashes(painter, points, closed=not open_path)        # a mode works in here
         if open_path:
             # A polygon being placed: its edges so far plus the loose one to
             # the pointer, and a ring on the first corner - click it to close.
@@ -383,7 +439,6 @@ class ImageLabel(QLabel):
             painter.setPen(QPen(QColor(255, 255, 255), 1))
             painter.drawEllipse(first, self._CORNER_RING, self._CORNER_RING)
         self._paint_fill_guide(painter)     # 🌈 where the gradient runs
-        painter.end()
 
     def start_animation(self, file_path, scaled_size=None):
         """Start playing an animated GIF using QMovie as a frame source.
@@ -1252,6 +1307,14 @@ class ImageLabel(QLabel):
                 pressure = getattr(event, 'pressure', lambda: 1.0)()
                 if callable(pressure):
                     pressure = pressure()
+                # The pen just went down: its own pressure (the mouse press
+                # made from it carries none - it read 1.0, full strength).
+                if pressure == 1.0 and self._pen_down_recently():
+                    pressure = self.parent_viewer._tablet_pressure
+                # Smoothing starts again with each stroke: carried on from
+                # the last one (1.0 at launch) the very first stroke after
+                # start began at full pressure - a wide, bright block.
+                self.parent_viewer._last_pressure = None
 
             # Normalize pressure to 0.1-1.0 range for better control
             pressure = max(0.1, min(1.0, pressure))
@@ -1348,8 +1411,11 @@ class ImageLabel(QLabel):
                     # it there (no second click); a plain click still starts the
                     # click-click line.
                     starting = getattr(self.parent_viewer, 'current_line_start', None) is None
-                    self._line_press_pos = QPointF(event.position()) if starting else None
-                    self.parent_viewer.add_free_line_point(original_x, original_y)
+                    if starting and self.parent_viewer._grad_edit_press(original_x, original_y):
+                        self._line_press_pos = None     # 🌈 a node of the line just drawn: no new one
+                    else:
+                        self._line_press_pos = QPointF(event.position()) if starting else None
+                        self.parent_viewer.add_free_line_point(original_x, original_y)
                 if self.parent_viewer.free_draw_mode:
                     print(f"Mouse press in free draw mode at ({original_x:.1f}, {original_y:.1f})")
                     self.parent_viewer.start_free_draw_stroke(original_x, original_y, pressure)
@@ -1498,8 +1564,8 @@ class ImageLabel(QLabel):
                 if callable(mouse_pressure):
                     mouse_pressure = mouse_pressure()
 
-                # If pressure is still 1.0, check if we have tablet pressure stored
-                if mouse_pressure == 1.0 and hasattr(self.parent_viewer, '_tablet_pressure'):
+                # If pressure is still 1.0, the pen's (a mouse has none: 1.0)
+                if mouse_pressure == 1.0 and self._pen_down_recently():
                     pressure = self.parent_viewer._tablet_pressure
                 else:
                     pressure = mouse_pressure
@@ -1507,8 +1573,9 @@ class ImageLabel(QLabel):
             # IMPROVED PRESSURE INTERPOLATION: Better range and smoothing
             pressure = max(0.05, min(1.0, pressure))  # Allow lighter minimum pressure
 
-            # PRESSURE SMOOTHING: Apply smoothing to reduce jitter
-            if hasattr(self.parent_viewer, '_last_pressure'):
+            # PRESSURE SMOOTHING: Apply smoothing to reduce jitter (not
+            # across strokes: the press sets it to None)
+            if getattr(self.parent_viewer, '_last_pressure', None) is not None:
                 smoothing_factor = 0.3
                 pressure = (smoothing_factor * pressure) + ((1 - smoothing_factor) * self.parent_viewer._last_pressure)
             self.parent_viewer._last_pressure = pressure
@@ -1682,6 +1749,12 @@ class ImageLabel(QLabel):
         self.setCursor(Qt.ArrowCursor if cur.shape() != Qt.ArrowCursor else Qt.CrossCursor)
         self.setCursor(cur)
 
+    def _pen_down_recently(self):
+        """The pen touched the tablet a moment ago: this mouse event is the
+        pen's (its pressure is the tablet's, see tabletEvent), not a mouse's."""
+        seen = getattr(self.parent_viewer, '_pen_touch_time', None)
+        return seen is not None and time.monotonic() - seen < 0.5
+
     def tabletEvent(self, event):
         """Handle tablet events ONLY for pen pressure during active drawing"""
         if self._pen_button_pan(event):
@@ -1711,6 +1784,10 @@ class ImageLabel(QLabel):
                 # The pen on the tablet (not hovering): a two-finger pan
                 # waits a moment after (see _on_touch_pan).
                 self.parent_viewer._pen_touch_time = time.monotonic()
+                # Its pressure kept from the press on, not only once a stroke
+                # is under way: the mouse press that starts the stroke carries
+                # none (see mousePressEvent).
+                self.parent_viewer._tablet_pressure = event.pressure()
             if hover and not self.parent_viewer.is_drawing_free_stroke:
                 self.parent_viewer.note_hover_move(event.position())   # (its way, no lean)
                 self.parent_viewer.refresh_texture_cursor()   # hovering: turn with the lean

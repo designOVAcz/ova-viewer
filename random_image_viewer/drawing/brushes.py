@@ -55,13 +55,13 @@ DEFAULT_SETTINGS = {
                                 #   blend and cover them); off: guides drawn over the paint
     'gradient': 'linear',       # 🌈 the gradient tool: 'linear' or 'radial'
     'gradient_to': '',          # 🌈 ... from the pen colour to this ('#rrggbb'), '' = transparent
+    'line_gradient': False,     # 🌈 lines and polylines take the gradient, along their way
     'shape_gradient': False,    # 🌈 shapes fill with the gradient instead of one colour
     'shape_stars': False,       # ✨ shapes fill with a starfield (tiny random specks) instead
+    'line_stars': False,        # ✨ lines and polylines paint a starfield along their way
     'stars_amount': 40,         # ✨ 1..100: how many (20·v² per megapixel of picture)
-    'stars_size': 1,            # ✨ the smallest star, real screen px as drawn (a few grow ~5x)
+    'stars_size': 1,            # ✨ the smallest star, real screen px as drawn (few medium, rare ones 5x)
     'gradient_mid': 50,         # 🌈 % along it where the colours are half mixed (gradient_bias)
-    'mode_marks': True,         # in a mode other than Paint, lines run the brush along
-                                #   them and shapes run it over their area (clipped to it)
     'jitter_per_stamp': False,  # True: every stamp its own colour; 'streaks':
                                 #   every streak across the tip its own colour;
                                 #   'particles': every speck its own colour
@@ -111,6 +111,10 @@ MODE_MIX = {'paint': 50, 'blend': 50, 'smudge': 70, 'history': 0, 'pick': 50, 'e
             'smear': 60, 'push': 85}
 BLEND_SHOW_MAX = 0.65   # Blend at Mix 100 %: at most this much of what is under shows through
 OPACITY_STEPS = 32      # flat strokes: stamp opacities are rounded to these
+# ... but the swept body (a one-pixel profile, cheap to keep per opacity) at
+# full 8-bit: in 32 steps, pressure easing off left a band at every step -
+# the stroke's end a stack of plates.
+BODY_STEPS = 255
 ROUND = ':round'        # the built-in soft round tip, for Round in Blend / Smudge
 BRISTLES = ':bristles'  # the built-in bristle tip (a row of hairs)
 DUST = ':dust'          # the built-in airbrush / particle tip (a cloud of specks)
@@ -121,6 +125,10 @@ HAIRS = ':hairs'        # 🖌 a procedural hair brush: uneven hairs, frayed end
 SPRAY_SPREAD_MAX = 60      # (20 was too little to cover a large canvas)
 PARTICLE_COLOURS = 16   # 'particles' jitter: colours a stamp's specks are spread over
 PARTICLE_SETS = 16      # ... and the different colourings a stroke picks from
+SPECKLED = 1000         # a particles tuple numbered from here: a flat stroke speckled
+                        # all along (see FlatStroke._specks). Lower: painted before
+                        # that, the body in the colours' average - they keep their look
+SPECK_TILE = 512        # cells a side of that speckle, repeated
 STREAKS = 32            # colour bands across the tip, with 'streaks' jitter
 STREAK_CACHE_BYTES = 48 << 20
 
@@ -210,6 +218,29 @@ def _streaked(source, rgb):
     p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
     p.drawImage(0, 0, source)
     p.end()
+    return image
+
+
+def is_speckled(rgb):
+    """Is *rgb* a particles colour tuple of a stroke speckled all along?"""
+    return isinstance(rgb, tuple) and rgb[0] <= -1 - SPECKLED
+
+
+_speck_tiles = {}
+
+
+def _speck_tile(rgb):
+    """The speckle for particles tuple *rgb*: a pixel a cell, each one of
+    its colours - the same every time for the same tuple."""
+    image = _speck_tiles.get(rgb)
+    if image is None:
+        colours = np.array(rgb[1:], np.uint32) | np.uint32(0xFF000000)
+        rng = np.random.default_rng([-rgb[0], *rgb[1:]])
+        cells = colours[rng.integers(0, len(colours), (SPECK_TILE, SPECK_TILE), dtype=np.uint8)]
+        image = QImage(cells.data, SPECK_TILE, SPECK_TILE, SPECK_TILE * 4, QImage.Format_RGB32).copy()
+        if len(_speck_tiles) >= 12:
+            _speck_tiles.pop(next(iter(_speck_tiles)))
+        _speck_tiles[rgb] = image
     return image
 
 
@@ -706,17 +737,19 @@ class BrushTexture:
         self._tints[key] = frame
         return frame
 
-    def frame_variant(self, level, turn, part, step=None, rgb=None):
-        """A motion_frame() mask as grey at opacity *step*, or coloured *rgb*
-        (one colour, or streaks - banded across the motion)."""
+    def frame_variant(self, level, turn, part, step=None, rgb=None, steps=OPACITY_STEPS):
+        """A motion_frame() mask as grey at opacity *step* / *steps*, or
+        coloured *rgb* (one colour, or streaks - banded across the motion)."""
         frame = self.motion_frame(level, turn)
         turn = int(round(turn / self.FRAME_STEP) * self.FRAME_STEP) % 360
         source = frame[part]
         if rgb is None:
-            key = ('mf-grey', level, turn, part, step)
+            key = ('mf-grey', level, turn, part, step, steps)
             image = self._tints.get(key)
             if image is None:
-                image = self._variant('grey', source, opacity=step / OPACITY_STEPS)
+                if len(self._tints) > 8192:     # (profiles at 255 opacities: kept in bounds)
+                    self._tints.clear()
+                image = self._variant('grey', source, opacity=step / steps)
                 self._tints[key] = image
             return image
         if isinstance(rgb, int):
@@ -1288,9 +1321,16 @@ class StampTrail:
         # stroke, each stamp one of them (turned at random it looks new), so
         # the stamps are cached instead of made one by one.
         self._particles = None
+        self.speckled = False
         if self.settings['jitter_per_stamp'] == 'particles' and len(set(self._palette)) > 1:
-            self._particles = [(-1 - i,) + tuple(self._rng.choice(self._palette)
-                                                 for _ in range(PARTICLE_COLOURS))
+            # (a tip dragged flat: speckled all along, see FlatStroke._specks.
+            # Not the soft round - each of its stamps is laid as it is.)
+            self.speckled = ((self.settings['flat'] or self.settings['mode'] == 'history')
+                             and self.settings['mode'] in ('paint', 'history')
+                             and not getattr(texture, 'stamp_max', False))
+            number = SPECKLED if self.speckled else 0
+            self._particles = [(-1 - number - i,) + tuple(self._rng.choice(self._palette)
+                                                          for _ in range(PARTICLE_COLOURS))
                                for i in range(PARTICLE_SETS)]
         self._last = None       # (x, y, pressure) of the previous point
         self._pending = None    # first point, waiting for a real pressure
@@ -1515,6 +1555,10 @@ class StampTrail:
                 self._walk(*raw)        # smoothing lagged: on to the pen's own last place
         self._curve_n = 0
         return self.stamps
+
+    # (No taper in / out: a stroke's start and end are as the pen paints
+    # them - its pressure. Tapers were tried and taken out: the stepped fade
+    # they laid over the flat stroke looked worse than the plain tip.)
 
     def _stamp_size(self, pressure):
         if self._pressure_on and self.settings['size_pressure']:
@@ -1770,6 +1814,26 @@ class FlatStroke:
         self._pend_view = None  # (view, scale) it was made under
         self._restart = False   # the head just set starts the stroke afresh (turned back)
         self.head = None
+        self._specks = None     # (QBrush, cells -> picture -> device): see _speck_field
+
+    def _speck_field(self, texture, stamp, view):
+        """Particles: the colour is a speckle of its own under the whole
+        stroke, the coverage cut out of it. Through the tip it could not
+        be: the swept body is a profile one pixel long, stretched along the
+        stroke, so only the first and last stamp had specks and the middle
+        came out as bands. Cells a speck big (as on the tip), hung on the
+        first stamp - its place, turn and size - so the stroke lays the same
+        specks live, burnt in, at any zoom, moved or turned."""
+        from PySide6.QtGui import QBrush
+        x, y, size, angle = stamp[:4]
+        tip = texture._levels[0]
+        long_side = max(tip.width(), tip.height())
+        cell = size * max(1, round(long_side / 160)) / long_side
+        place = QTransform()
+        place.translate(x, y)
+        place.rotateRadians(angle)
+        place.scale(cell, cell)
+        self._specks = (QBrush(_speck_tile(stamp[5])), place * view)
 
     @staticmethod
     def _turn(stamp, direction):
@@ -1904,6 +1968,22 @@ class FlatStroke:
             piece['start_cut'] = None           # the chain starts here: square
         self._pend = piece
 
+    @staticmethod
+    def piece_widths(piece, back, fwd):
+        """The body piece's width where its strip begins (*back* before its
+        start) and ends (*fwd* past its end): w0 -> w1 carried on in a
+        straight line, so the pieces' edges meet as one - kept within w0..w1
+        (round a sharp turn the strip reaches far past its joints, which
+        the clip cuts away)."""
+        (sx, sy), (ex, ey) = piece['s'], piece['e']
+        w0, w1 = piece['w0'], piece['w1']
+        span = math.hypot(ex - sx, ey - sy)
+        if span < 1e-9:
+            return w1, w1
+        slope = (w1 - w0) / span
+        lo, hi = min(w0, w1), max(w0, w1)
+        return (min(hi, max(lo, w0 - slope * back)), min(hi, max(lo, w1 + slope * fwd)))
+
     def _piece_strip(self, piece, view, scale):
         """(device transform of the 1-px profile over the piece, made long
         enough to reach both cuts; clip path in picture coords or None)."""
@@ -1927,9 +2007,25 @@ class FlatStroke:
         fwd = reach(piece.get('end_cut')) + px
         bx, by = sx - d[0] * back, sy - d[1] * back
         fx, fy = ex + d[0] * fwd, ey + d[1] * fwd
-        wd = piece['w1']
         h = piece['images'][0].height()
-        m = QTransform(fx - bx, fy - by, ax * wd / h, ay * wd / h, bx - ax * wd / 2, by - ay * wd / 2)
+        wb, wf = self.piece_widths(piece, back, fwd)
+        if abs(wb - wf) <= 1e-3 * max(wb, wf, 1e-6):
+            wd = wf
+            m = QTransform(fx - bx, fy - by, ax * wd / h, ay * wd / h, bx - ax * wd / 2, by - ay * wd / 2)
+        else:
+            # A trapezoid, the width going from the piece's start to its end:
+            # drawn at one width (its end's), every change of pressure left a
+            # step in the stroke's edge - a staircase where it narrowed.
+            m = QTransform()
+            ok = QTransform.quadToQuad(
+                QPolygonF([QPointF(0, 0), QPointF(1, 0), QPointF(1, h), QPointF(0, h)]),
+                QPolygonF([QPointF(bx - ax * wb / 2, by - ay * wb / 2),
+                           QPointF(fx - ax * wf / 2, fy - ay * wf / 2),
+                           QPointF(fx + ax * wf / 2, fy + ay * wf / 2),
+                           QPointF(bx + ax * wb / 2, by + ay * wb / 2)]), m)
+            if not ok:
+                wd = wf
+                m = QTransform(fx - bx, fy - by, ax * wd / h, ay * wd / h, bx - ax * wd / 2, by - ay * wd / 2)
         # the clip: between the two joint lines, wide enough for the strip
         side = half * 1.6 + px
 
@@ -2018,6 +2114,8 @@ class FlatStroke:
                 lay(_stamp_matrix(stamp, plain, view), plain, texture.coloured(level, stamp[5]))
                 continue
             is_first = self._first is None
+            if is_first and is_speckled(stamp[5]):
+                self._speck_field(texture, stamp, view)
             self._restart = False
             pieces = self._body(texture, level, stamp, tip_long, view, scale)
             if is_first:
@@ -2039,9 +2137,10 @@ class FlatStroke:
                     lay(self._frame_matrix(first, frame, d, tip_long, view),
                         texture.frame_variant(level, turn, 'whole', step=step),
                         texture.frame_variant(level, turn, 'whole', rgb=first[5]))
+            fine = max(1, min(BODY_STEPS, round(stamp[4] * BODY_STEPS)))
             for piece in pieces:
                 turn = piece['turn']
-                images = (texture.frame_variant(level, turn, 'profile', step=step),
+                images = (texture.frame_variant(level, turn, 'profile', step=fine, steps=BODY_STEPS),
                           texture.frame_variant(level, turn, 'profile', rgb=stamp[5]))
                 self._push_piece(piece, images, lay, view, scale)
             if self._pend is not None:
@@ -2137,9 +2236,22 @@ class FlatStroke:
         # alone decides how strong it is.
         # (Read the straight colour as opaque - converting ARGB32 to RGB32
         # would lay it over black first, darkening where it is part-laid.)
-        straight = colour.convertToFormat(QImage.Format_ARGB32)
-        straight.reinterpretAsFormat(QImage.Format_RGB32)
-        out = straight.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        if self._specks is None:
+            straight = colour.convertToFormat(QImage.Format_ARGB32)
+            straight.reinterpretAsFormat(QImage.Format_RGB32)
+            out = straight.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        else:
+            brush, to_device = self._specks
+            out = QImage(local.size(), QImage.Format_ARGB32_Premultiplied)
+            p = QPainter(out)
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            p.setBrushOrigin(0, 0)
+            # (the brush carries the mapping, not the painter: a rect dirty by
+            # the frame gets the very pixels the whole stroke would)
+            brush.setTransform(to_device * QTransform.fromTranslate(-self.rect.x() - local.x(),
+                                                                   -self.rect.y() - local.y()))
+            p.fillRect(out.rect(), brush)       # (unsmoothed: crisp specks)
+            p.end()
         if self.source is not None:
             # History: the picture's own pixels under the stroke, pixel for
             # pixel, with the brush colour mixed in by the tint.
@@ -2725,7 +2837,7 @@ class PushStroke(DragStroke):
 
     CL_MIN_TIP = 10 ** 9        # cv2.remap does it - the old OpenCL kernel moved whole pixels
 
-    def __init__(self, rect, work, strength, ice=0.4, backdrop=None):
+    def __init__(self, rect, work, strength, ice=0.4, backdrop=None, paint=None):
         super().__init__(rect, work, 0.5)
         clamp = lambda v: max(0.0, min(1.0, v))
         self.strength = clamp(strength)
@@ -2742,6 +2854,13 @@ class PushStroke(DragStroke):
             b = backdrop.convertToFormat(QImage.Format_ARGB32_Premultiplied)
             if (b.width(), b.height()) == (w, h):
                 self.backdrop = _image_array(b)
+        # *paint* (the layer's own, where *work* has it as seen - faded by
+        # its opacity, lit): what is kept is this, moved by the same field.
+        self.paint = None
+        if paint is not None:
+            own = paint.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            if (own.width(), own.height()) == (w, h):
+                self.paint = _image_array(own)
         self.disp = np.zeros((h, w, 2), np.float32)     # how far the paint at each pixel has come
         rng = np.random.default_rng(20261112)
         lag = rng.random((h, w), dtype=np.float32)
@@ -2866,7 +2985,21 @@ class PushStroke(DragStroke):
 
     def compose_layer(self, rect):
         """The layer's own pushed paint in device *rect*, where the push went."""
-        return super().compose(rect)
+        if self.paint is None:
+            return super().compose(rect)
+        local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        x0, y0, w, h = local.x(), local.y(), local.width(), local.height()
+        d = self.disp[y0:y0 + h, x0:x0 + w]
+        mx = np.arange(x0, x0 + w, dtype=np.float32)[None, :] - d[..., 0]
+        my = np.arange(y0, y0 + h, dtype=np.float32)[:, None] - d[..., 1]
+        if _cv2 is not None:
+            moved = _cv2.remap(self.paint, mx, my, _cv2.INTER_LINEAR, borderMode=_cv2.BORDER_REPLICATE)
+        else:
+            full_h, full_w = self.paint.shape[:2]
+            moved = self.paint[np.clip(np.rint(my), 0, full_h - 1).astype(np.intp),
+                               np.clip(np.rint(mx), 0, full_w - 1).astype(np.intp)]
+        a = self.reached[y0:y0 + h, x0:x0 + w].astype(np.uint16)[..., None]
+        return _array_image(((moved.astype(np.uint16) * a + 127) // 255).astype(np.uint8))
 
     def cut(self, rect):
         """Where the push replaces the layer's paint, in device *rect*: an

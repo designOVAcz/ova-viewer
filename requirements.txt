@@ -12,5 +12,6 @@ PyMuPDF>=1.28              # PDF / EPUB rendering (import pymupdf)
 opencv-python-headless>=5.0  # edge detection, video frame grabs (no cv2 GUI needed)
 numpy>=2.5
 Pillow>=12.0
+imagecodecs>=2026.11       # JPEG XL (.jxl) pictures - Qt and Pillow have no reader (see jxl_plugin)
 rarfile>=4.2               # .cbr archives (also needs UnRAR/7-Zip on PATH)
 pyopencl>=2026.1           # optional: GPU (OpenCL) LUT processing; CPU fallback if absent

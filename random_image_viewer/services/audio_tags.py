@@ -199,7 +199,7 @@ def _read(path, mtime, want_cover):
             got = None
             if ext == '.flac':
                 got = _flac(f, want_cover)
-            elif ext in ('.m4a', '.aac', '.mp4'):
+            elif ext in ('.m4a', '.m4b', '.aac', '.mp4'):
                 got = _mp4(f, want_cover)
             if got is None:
                 f.seek(0)
@@ -386,7 +386,7 @@ def _seconds(path, mtime):
                 return _flac_seconds(f)
             if ext == '.wav':
                 return _wav_seconds(f)
-            if ext in ('.m4a', '.mp4', '.aac'):
+            if ext in ('.m4a', '.m4b', '.mp4', '.aac'):
                 got = _mp4_seconds(f, size)
                 return got if got is not None else (_mp3_seconds(f, size) if ext == '.aac' else None)
             if ext in ('.ogg', '.opus'):

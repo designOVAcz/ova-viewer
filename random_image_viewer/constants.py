@@ -1,7 +1,8 @@
 import os
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp',
-                    '.jp2', '.j2k', '.jpf', '.jpx'}
+                    '.jp2', '.j2k', '.jpf', '.jpx',
+                    '.jxl'}     # JPEG XL: decoded by imagecodecs (see jxl_plugin)
 
 # Image formats that can hold an animation; Qt's QMovie plays both of these.
 # (Note .webp is a picture, .webm a video - they are different files.)
@@ -9,7 +10,8 @@ ANIMATED_EXTENSIONS = {'.gif', '.webp'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv'}
 # Music: played by the same media player as videos (timeline, volume, loop,
 # autoplay next), shown as a "now playing" card, listed by title in the grid.
-AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma'}
+AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.m4b', '.aac', '.ogg', '.opus', '.wma'}
+# (.m4b: an audiobook - AAC in an MP4 box like .m4a, often with chapters)
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
 # Document-style files supported as single playlist items (each opens in its

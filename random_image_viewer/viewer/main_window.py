@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QLayout, QWidgetAction
 
 from random_image_viewer.constants import (IMAGE_EXTENSIONS, MEDIA_EXTENSIONS, DOCUMENT_EXTENSIONS,
                                            PLAYLIST_EXTENSIONS)
-from random_image_viewer.version import get_version
+from random_image_viewer.version import get_version, get_build_time, short_version
 from random_image_viewer.platform_utils import (  # noqa: F401
     process_uptime_seconds,
     is_windows_dark_mode, enable_windows_dark_title_bar, setup_image_allocation_limit,
@@ -91,7 +91,7 @@ class Stroke(list):
         # image keeps it so); None for older ones and textured strokes.
         self.pic_width = None
         # The outline (picture points) it stays inside, or None: a shape run
-        # over with the brush (Lines & shapes use this mode).
+        # over with the brush (a mode other than Paint).
         self.clip = None
         # (view transform, image, top-left): the stroke as drawn live, reused
         # while the view is unchanged (see RandomImageViewer._paint_layer_marks).
@@ -162,6 +162,23 @@ class _BusyLine(QWidget):
         p.end()
 
 
+def _still_answering():
+    """Long work in the app's own thread: tell Windows the app is alive.
+    Without a look at its message queue for 5 s, Windows takes it for hung -
+    'not responding', and its windows (this card too) shown as a frozen black
+    ghost. A look that takes nothing out (PM_NOREMOVE) - no click or key is
+    handled half way through the work."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        msg = wintypes.MSG()
+        ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+    except Exception:
+        pass
+
+
 class _ProgressCard(QWidget):
     """⏳ A card in the middle of the canvas for work that keeps the app busy
     for a while - saving, opening a project, a shape run over with the
@@ -193,6 +210,7 @@ class _ProgressCard(QWidget):
         self.show()
         self.raise_()
         self.repaint()
+        _still_answering()
 
     def set(self, fraction, what=None):
         """How far (0..1) and the step it is on; painted at most ~30 times a
@@ -204,6 +222,8 @@ class _ProgressCard(QWidget):
         if self.isVisible() and (now - self._last > 0.033 or self.fraction >= 1.0):
             self._last = now
             self.repaint()
+            _still_answering()
+
 
     def finish(self):
         self.hide()
@@ -2180,14 +2200,15 @@ class RandomImageViewer(QMainWindow):
         layer.impasto_lit = (key, lit, image)
         return lit
 
-    def _layer_image(self, layer, device, view):
+    def _layer_image(self, layer, device, view, raw=False):
         """*layer* as a transparent image for this view: its picture-sized
-        image (see _layer_canvas) drawn to the view, the guides over it."""
+        image (see _layer_canvas) drawn to the view, the guides over it.
+        *raw*: its paint alone, as it is kept - not lit, no guides."""
         marks = list(self._ordered_marks(layer))
         paint = [(kind, m) for kind, m in marks if not self._is_guide(kind, m)]
-        guides = [(kind, m) for kind, m in marks if self._is_guide(kind, m)]
+        guides = [] if raw else [(kind, m) for kind, m in marks if self._is_guide(kind, m)]
         canvas, rect, k = self._layer_canvas(layer, paint)
-        lit = bool(layer.impasto)
+        lit = bool(layer.impasto) and not raw
         source = self._canvas_lit(layer, canvas, k) if lit else canvas
         out = QImage(device.width(), device.height(), QImage.Format_ARGB32_Premultiplied)
         out.fill(Qt.transparent)
@@ -2405,9 +2426,11 @@ class RandomImageViewer(QMainWindow):
             if kind in ('line', 'hline'):
                 # Ruler lines carry the size and colour they were placed with
                 # (see RulerLine); bare numbers from older code follow the pen.
+                width_ = getattr(mark, 'thickness', None) or self.line_thickness
+                if not self._exporting:
+                    width_ = self._line_window_width(width_, self._pixel_ratio(painter))
                 line_pen = QPen(getattr(mark, 'color', None) or self.line_color,
-                                (getattr(mark, 'thickness', None) or self.line_thickness) * self._export_pen_scale,
-                                Qt.SolidLine)
+                                width_ * self._export_pen_scale, Qt.SolidLine)
             if kind == 'line':
                 # A ruler line spans the whole picture, so it has no second
                 # coordinate to map - under 90/270 it becomes a horizontal one.
@@ -2465,17 +2488,26 @@ class RandomImageViewer(QMainWindow):
                         painter.drawLine(0, dy, canvas_width, dy)
 
             elif kind == 'free_line':
+                if mark is self.__dict__.get('_grad_held'):
+                    continue        # 🌈 a handle being dragged: the preview shows it
+                if mark.get('stars'):
+                    self._paint_star_fill(painter, mark, to_display,
+                                          QColor(mark.get('color') or self.line_color))
+                    continue
+                if mark.get('gradient'):
+                    self._paint_gradient_line(painter, mark, to_display, self._line_pen_width(mark, painter))
+                    continue
                 sx_, sy_ = to_display(*mark['start'])
                 ex_, ey_ = to_display(*mark['end'])
                 tolerance = 10
                 if (max(sx_, ex_) >= -tolerance and min(sx_, ex_) <= canvas_width + tolerance
                         and max(sy_, ey_) >= -tolerance and min(sy_, ey_) <= canvas_height + tolerance):
-                    width_ = self._line_pen_width(mark)
+                    width_ = self._line_pen_width(mark, painter)
 
-                    def line_(p, c, a=(sx_, sy_, ex_, ey_), w=width_):
+                    def line_(p, c, a=((sx_, sy_), (ex_, ey_)), w=width_):
                         p.setRenderHint(QPainter.Antialiasing, True)
                         p.setPen(QPen(c, w, Qt.SolidLine))
-                        p.drawLine(*a)
+                        p.drawLine(*self._hairline_points(p, a, w))
                         p.setRenderHint(QPainter.Antialiasing, False)
                     if mark.get('jitter'):
                         # 🎲 a colour per stamp / streak / speck (_mark_jitter)
@@ -2552,13 +2584,11 @@ class RandomImageViewer(QMainWindow):
     _clip_busy = set()          # strokes being painted inside their clip (see _paint_layer_marks)
 
     def _brush_mode_for_marks(self):
-        """The brush mode lines and shapes take ('Lines & shapes use this
-        mode', any mode but Paint), or None: they lay their colour."""
-        s = self.brush_settings
-        mode = s.get('mode', 'paint')
-        if not s.get('mode_marks', True) or mode == 'paint' or mode not in brushes.MODES:
-            return None
-        return mode
+        """The brush mode lines and shapes take - whichever is chosen, but
+        Paint - or None: they lay their colour. (A tick box could switch
+        this off: lost unseen, Push then drew plain rectangles.)"""
+        mode = self.brush_settings.get('mode', 'paint')
+        return mode if mode != 'paint' and mode in brushes.MODES else None
 
     def _brush_along(self, path, clip=None, report=None):
         """Run the brush (its mode, tip, size) along *path* (picture points)
@@ -2616,12 +2646,26 @@ class RandomImageViewer(QMainWindow):
         p.setBrush(QColor(0, 0, 0))
         p.drawPolygon(QPolygonF([to_image.map(QPointF(x, y)) for x, y in clip]))
         p.end()
-        cut = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
-        p = QPainter(cut)
-        p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-        p.drawImage(0, 0, mask)
-        p.end()
-        mark['image'] = cut
+        # A push's cut with it: left whole, it took away the paint outside
+        # the shape wherever the brush had swept.
+        for part in ('image', 'cut'):
+            if mark.get(part) is None:
+                continue
+            clipped = mark[part].convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            p = QPainter(clipped)
+            p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+            p.drawImage(0, 0, mask)
+            p.end()
+            mark[part] = clipped
+
+    def _mode_tool_hint(self):
+        """A line or shape tool is in hand with the brush in a mode: say
+        what it will do, and where colour is."""
+        mode = self._brush_mode_for_marks()
+        if mode is not None:
+            self.status.showMessage(
+                f"{mode.capitalize()}: the brush runs along the line / over the inside of the shape - "
+                "switch the brush to Paint for colour, gradient or stars", 6000)
 
     def _brush_over_shape(self, outline):
         """Run the brush over the whole shape *outline* (picture points):
@@ -2632,8 +2676,14 @@ class RandomImageViewer(QMainWindow):
         a = math.radians(self._shape_angle(pts))
         ca, sa = math.cos(a), math.sin(a)
         uv = [(x * ca + y * sa, -x * sa + y * ca) for x, y in pts]
-        spacing = max(1.0, 0.5 * float(self.line_thickness)) / self._view_scale()
         v_lo, v_hi = min(v for _, v in uv), max(v for _, v in uv)
+        # A brush far smaller than the shape runs it in hundreds of rows: a
+        # 1 px Push over a hand-sized lasso was minutes of work for next to
+        # nothing to see. At least so wide that it takes _SHAPE_ROWS rows.
+        across = (v_hi - v_lo) * self._view_scale()                     # screen px
+        size = max(float(self.line_thickness), 2.0 * across / self._SHAPE_ROWS)
+        self._shape_run_size = round(size)
+        spacing = max(1.0, 0.5 * size) / self._view_scale()
         rows = max(1, int(math.ceil((v_hi - v_lo) / spacing)))
         first = v_lo + ((v_hi - v_lo) - (rows - 1) * spacing) / 2
         path = []
@@ -2654,29 +2704,82 @@ class RandomImageViewer(QMainWindow):
         # As much brushing as covering the shape by hand: a second or a few
         # for a big shape in Smear / Push - say so meanwhile.
         mode = self.brush_settings.get('mode', '')
-        with self._working(f"Brushing the shape — {mode.capitalize()}") as card:
-            made = self._brush_along(path, clip=pts, report=card.set)
+        own = self.line_thickness
+        wider = round(size) > own
+        self.line_thickness = max(1, round(size))       # (for this run: the size slider keeps its own)
+        try:
+            with self._working(f"Brushing the shape — {mode.capitalize()}") as card:
+                made = self._brush_along(path, clip=pts, report=card.set)
+        finally:
+            self.line_thickness = own
+        note = (f" with a {round(size)} px brush - {own} px is too small for a shape" if wider else "")
         self.status.showMessage(
-            f"Shape run over in {mode.capitalize()} — Ctrl+Z to undo" if made
-            else "Nothing to work on inside the shape", 3000)
+            f"Shape run over in {mode.capitalize()}{note} — Ctrl+Z to undo" if made
+            else "Nothing to work on inside the shape", 6000 if wider else 3000)
         return made
+
+    _SHAPE_ROWS = 24        # a shape is run in at most this many rows (see _brush_over_shape)
 
     def _line_kind(self, mark):
         """A new free line / polyline (dict): paint, with its width in
         picture px as drawn now, or a guide - by 'Lines are paint'."""
         if self.brush_settings.get('lines_paint', True):
             mark['guide'] = False
-            mark['pic_width'] = mark.get('thickness', self.line_thickness) / self._view_scale()
+            width = self._line_window_width(mark.get('thickness', self.line_thickness))
+            mark['pic_width'] = width / self._view_scale()
         else:
             mark['guide'] = True
 
-    def _line_pen_width(self, mark):
+    def _line_window_width(self, thickness, ratio=None):
+        """A line of *thickness* in window px, where there are *ratio* real
+        pixels to one (the screen's, 1.5 at 150 %): half such a pixel or so
+        less, at every size alike, so 1 is one pixel of the screen - it was
+        1.5 of them, smeared over two to five."""
+        if ratio is None:
+            try:
+                ratio = float(self.image_label.devicePixelRatioF())
+            except Exception:
+                ratio = 1.0
+        if ratio <= 1.0 or thickness < 1:
+            return float(thickness)
+        return thickness - (1.0 - 1.0 / ratio)
+
+    @staticmethod
+    def _pixel_ratio(painter):
+        """Real pixels to one of *painter*'s: the GPU canvas's 1.5 at 150 %,
+        an image's 1."""
+        try:
+            return float(painter.device().devicePixelRatioF()) or 1.0
+        except Exception:
+            return 1.0
+
+    def _hairline_points(self, painter, points, width):
+        """*points* (painter coords) as QPointF - for a line about a pixel
+        wide on pixel centres: between two (where whole-number coords put
+        it), it came out as two rows at half strength."""
+        out = [QPointF(p) if hasattr(p, 'x') else QPointF(*p) for p in points]
+        world = painter.worldTransform() * QTransform.fromScale(*[self._pixel_ratio(painter)] * 2)
+        if width * math.sqrt(abs(world.determinant())) > 1.3:
+            return out
+        back, ok = world.inverted()
+        if not ok:
+            return out
+        snapped = []
+        for p in out:
+            q = world.map(p)
+            snapped.append(back.map(QPointF(math.floor(q.x() + 1e-6) + 0.5, math.floor(q.y() + 1e-6) + 0.5)))
+        return snapped
+
+    def _line_pen_width(self, mark, painter=None):
         """The pen width of a free line or polyline (a dict) on this device:
         a guide keeps its screen width; one painted into a layer image keeps
-        its width in picture px (pic_width), so it zooms with the paint."""
+        its width in picture px (pic_width), so it zooms with the paint -
+        never under one pixel of that image (a fainter, greyer line)."""
         width = mark.get('thickness') or self.line_thickness
         if self._canvas_k is not None:
-            return (mark.get('pic_width') or width / self._canvas_fit) * self._canvas_k
+            return max(1.0, (mark.get('pic_width') or width / self._canvas_fit) * self._canvas_k)
+        if painter is not None and not self._exporting:
+            width = self._line_window_width(width, self._pixel_ratio(painter))
         return width * self._export_pen_scale
 
     def _draw_pen_stroke(self, painter, mark, to_display, base, ink):
@@ -2691,12 +2794,13 @@ class RandomImageViewer(QMainWindow):
             thickness = self._pressure_to_thickness((ap + bp) / 2.0, base)
             if len(run) > 1 and thickness != run_width:
                 painter.setPen(QPen(ink, run_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.drawPolyline(run)
+                painter.drawPolyline(self._hairline_points(painter, run, run_width) if run_width <= 1 else run)
                 run = run[-1:]
             run_width = thickness
             run.append(QPoint(*to_display(b[0], b[1])))
         painter.setPen(QPen(ink, run_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.drawPolyline(run)
+        # (a 1 px pen on pixel centres too, see _hairline_points)
+        painter.drawPolyline(self._hairline_points(painter, run, run_width) if run_width <= 1 else run)
 
     def _draw_see_through_stroke(self, painter, mark, to_display, base, ink, smooth):
         """*mark* in see-through *ink*: solid on an image of its own (just
@@ -2770,12 +2874,18 @@ class RandomImageViewer(QMainWindow):
                 if min(x_of(mark['start']), x_of(mark['end'])) >= off:
                     copy = dict(mark)
                     copy['start'], copy['end'] = shifted(mark['start']), shifted(mark['end'])
+                    if mark.get('gradient'):
+                        g = mark['gradient']
+                        copy['gradient'] = dict(g, start=shifted(g['start']), end=shifted(g['end']))
                     yield kind, copy
             elif kind == 'fill' and mark.get('shape') == 'polyline':
                 points = mark.get('points') or []
                 if points and min(x_of(p) for p in points) >= off:
                     copy = dict(mark)
                     copy['points'] = [shifted(p) for p in points]
+                    if mark.get('gradient'):
+                        g = mark['gradient']
+                        copy['gradient'] = dict(g, start=shifted(g['start']), end=shifted(g['end']))
                     yield kind, copy
 
     @staticmethod
@@ -2810,8 +2920,27 @@ class RandomImageViewer(QMainWindow):
             painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)
             painter.drawImage(0, 0, cut)
             painter.restore()
+            # ... added, not laid over: the pushed paint carries the mask in
+            # it already. Laid over, that took the layer's paint away a second
+            # time wherever the mask is partly in (its resampled edge, a brush
+            # under 100 %) - outlines round every hair, see-through to below.
+            painter.setCompositionMode(QPainter.CompositionMode_Plus)
         painter.drawImage(0, 0, image)
         painter.restore()
+
+    def _push_paint(self, size):
+        """The active layer's own paint in the view, for a push on it alone
+        to keep. What that push reads and shows is the layer as seen - faded
+        by its opacity, lit, guides on - and kept like that it went through
+        all of it a second time. None where the two are the same."""
+        layer = self.active_layer
+        if not layer.visible or not layer.has_content():
+            return None
+        if (layer.opacity == 100 and not layer.impasto
+                and not any(self._is_guide(k, m) for k, m in self._ordered_marks(layer))):
+            return None
+        view = (size.width(), size.height(), *self._fx_view_params())
+        return self._layer_image(layer, QImage(size, QImage.Format_ARGB32_Premultiplied), view, raw=True)
 
     def _backdrop_view(self, size):
         """The view without the active layer and those above it - the
@@ -2848,8 +2977,12 @@ class RandomImageViewer(QMainWindow):
         alpha = fill.get('alpha')
         if alpha is not None:
             color.setAlpha(int(alpha))
-        if fill.get('stars') and len(points) >= 3:
+        if fill.get('stars') and (len(points) >= 3 or fill['stars'].get('band')):
             self._paint_star_fill(painter, fill, to_display, color)
+            return
+        if fill.get('gradient') and fill.get('shape') == 'polyline':
+            self._paint_gradient_line(painter, dict(fill, color=color), to_display,
+                                      self._line_pen_width(fill, painter), antialias)
             return
         if fill.get('gradient') and len(points) >= 3:
             self._paint_gradient_fill(painter, fill, to_display, color, antialias)
@@ -2858,7 +2991,7 @@ class RandomImageViewer(QMainWindow):
             # 🎲 a colour per stamp / streak / speck (_mark_jitter): the shape
             # drawn solid, coloured by its pattern.
             plain = {k: v for k, v in fill.items() if k not in ('jitter', 'alpha')}
-            reach = (self._line_pen_width(fill)
+            reach = (self._line_pen_width(fill, painter)
                      if fill.get('shape') == 'polyline' else 1.0)
             self._paint_jittered(painter, fill, to_display, color, points, reach,
                                  lambda p, c: self._paint_one_fill(p, dict(plain, color=c), to_display, antialias))
@@ -2868,9 +3001,10 @@ class RandomImageViewer(QMainWindow):
                 return
             painter.setRenderHint(QPainter.Antialiasing, antialias)
             painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(color, self._line_pen_width(fill),
-                                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            corners = [QPoint(*to_display(x, y)) for x, y in points]
+            width = self._line_pen_width(fill, painter)
+            painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            corners = QPolygonF(self._hairline_points(
+                painter, [to_display(x, y) for x, y in points], width))
             if fill.get('closed'):
                 painter.drawPolygon(corners)
             else:
@@ -2899,6 +3033,9 @@ class RandomImageViewer(QMainWindow):
             if not (self.has_marks()):
                 return
             if not self.lines_visible:
+                return
+            if self.__dict__.get('_gpu_display'):
+                self.display_image(self.current_image)      # 🎮 the label's frame is not what shows
                 return
             # Semi-transparent lines cannot use the incremental overlay path:
             #   • the GPU kernel overwrites pixels (ignoring alpha), and
@@ -4023,7 +4160,8 @@ class RandomImageViewer(QMainWindow):
         self.cross_grid_btn = QToolButton()
         self.cross_grid_btn.setIcon(self._create_overlay_icon('crossgrid'))
         self.cross_grid_btn.setToolTip("✛ Cross grid: small thin crosses all over the canvas, a guide "
-                                       "(not painted, not saved).\nRight-click: density, cross size, colour")
+                                       "(not painted; saved and copied pictures have it while it shows).\n"
+                                       "Right-click: density, cross size, colour")
         self.cross_grid_btn.setCheckable(True)
         self.cross_grid_btn.setFixedSize(24, 24)
         self.cross_grid_btn.setChecked(self.cross_grid)
@@ -4115,7 +4253,7 @@ class RandomImageViewer(QMainWindow):
         add_section_divider()
 
         # ── SECTION: Visibility ──
-        self.clear_lines_btn = clear_lines_btn = QToolButton(); clear_lines_btn.setText("🗑"); clear_lines_btn.setToolTip("Clear All Lines"); clear_lines_btn.setFixedSize(24,24); clear_lines_btn.clicked.connect(self.clear_lines); toolbar.addWidget(clear_lines_btn)
+        self.clear_lines_btn = clear_lines_btn = QToolButton(); clear_lines_btn.setText("🗑"); clear_lines_btn.setToolTip("Clear All Lines"); clear_lines_btn.setFixedSize(24,24); clear_lines_btn.clicked.connect(lambda: self.clear_lines(keep=False)); toolbar.addWidget(clear_lines_btn)
         add_spacer(2)
         self.toggle_lines_btn = QToolButton(); self.toggle_lines_btn.setText("👁"); self.toggle_lines_btn.setToolTip("Hide guides (ruler lines, free lines, polylines) - what is painted stays"); self.toggle_lines_btn.setCheckable(True); self.toggle_lines_btn.setChecked(True); self.toggle_lines_btn.setFixedSize(24,24); self.toggle_lines_btn.toggled.connect(self.toggle_line_visibility); toolbar.addWidget(self.toggle_lines_btn)
         add_spacer(2)
@@ -6130,6 +6268,9 @@ class RandomImageViewer(QMainWindow):
             # centred again (◧ Studio keeps its pan, the sheet stays).
             label.pan_offset_x = label.pan_offset_y = 0
         self._pan_shown_path = img_path
+        if (img_path in self.__dict__.get('_kept_paintings', {})
+                and not any(layer.has_content() for layer in self.layers)):
+            self._give_back_painting(img_path)      # its painting, kept when it was left
         busy = getattr(self, '_busy_line', None)
         shown = False
         # What this redraw costs depends on which effects are on: keep a
@@ -9768,11 +9909,12 @@ class RandomImageViewer(QMainWindow):
         self._update_cursor_and_status()
 
     def toggle_free_line_drawing(self, checked):
+        self._drop_grad_edit()          # 🌈 handles belong to the line just drawn
         self.free_line_drawing_mode = checked
         if checked:
             self._deactivate_tools(keep='free_line')
             self._show_guides_for_tool()
-            self._recall_tool_size('free_line')
+            self._recall_line_size('free_line')
         if not checked:
             # Reset current line start when mode is deactivated
             had_pending = self.current_line_start is not None
@@ -9782,6 +9924,8 @@ class RandomImageViewer(QMainWindow):
             if had_pending and self.current_image:
                 self.display_image(self.current_image)
         self._update_cursor_and_status()
+        if checked:
+            self._mode_tool_hint()
 
     # -- layers ---------------------------------------------------------------
 
@@ -9831,8 +9975,12 @@ class RandomImageViewer(QMainWindow):
                         + ". Click for 📚 Layers")
         color = "#d6dade" if layer.visible else "#6f757b"
         strike = "" if layer.visible else "text-decoration: line-through;"
+        # min-height: the app's 24 px for buttons plus this 1 px border made
+        # it 2 px taller than the bar - shown at the 2nd layer, it grew the
+        # status bar, the canvas shrank and the docked panels jumped (once,
+        # at the first added layer). 20 + border fits the bar as it is.
         chip.setStyleSheet(
-            f"QToolButton {{ color: {color}; font-size: 10px; padding: 0 6px; {strike}"
+            f"QToolButton {{ color: {color}; font-size: 10px; padding: 0 6px; min-height: 20px; {strike}"
             f" border: 1px solid #4a4f55; border-radius: 8px; }}"
             f" QToolButton:hover {{ border-color: #8a9096; }}")
         chip.show()
@@ -10177,7 +10325,7 @@ class RandomImageViewer(QMainWindow):
             start = self._settings.value("layer_import_dir", "") or ""
             path, _ = QFileDialog.getOpenFileName(
                 self, "Import a picture onto the layer", start,
-                "Pictures (*.png *.webp *.jpg *.jpeg *.bmp *.tif *.tiff *.gif)")
+                "Pictures (*.png *.webp *.jpg *.jpeg *.bmp *.tif *.tiff *.gif *.jxl)")
             if not path:
                 return False
             self._settings.setValue("layer_import_dir", os.path.dirname(path))
@@ -10624,13 +10772,22 @@ class RandomImageViewer(QMainWindow):
             settings[f"mix_{settings['mode']}"] = value
         size = None
         if key == 'mode' and value != settings['mode']:
-            # ... and its own brush size: Erase big, Blend small, as left.
-            settings[f"size_{settings['mode']}"] = int(self.line_thickness)
-            size = settings.get(f"size_{value}")
+            # ... and its own brush size: Erase big, Blend small, as left. The
+            # brush's, not what is in hand: with a line tool out, the mode
+            # took the line's 1 px for its size, and the line the mode's 81.
+            brush = int(self.line_thickness)
+            sizes = getattr(self, '_tool_sizes', None)
+            if sizes is not None and self._size_tool() != 'brush':
+                brush = int(sizes.get('brush', brush))
+            settings[f"size_{settings['mode']}"] = brush
+            size = int(settings.get(f"size_{value}") or brush)
+            if sizes is not None:
+                sizes['brush'] = size
+                self._settings.setValue("tool_sizes", json.dumps(sizes))
         settings[key] = value
         self._save_brush_settings()
-        if size and int(size) != self.line_thickness:
-            self.set_brush_size(size)
+        if key in ('mode', 'line_stars'):
+            self._recall_size_in_hand(size)     # whose size the slider is now
         if key == 'gradient_mid':
             self._regrade_last_gradient()
         if key == 'mode':
@@ -10835,8 +10992,10 @@ class RandomImageViewer(QMainWindow):
             s = self.brush_settings
             backdrop = (self._backdrop_view(image.size()) if s.get('sample', 'below') == 'layer'
                         else None)
+            paint = self._push_paint(image.size()) if backdrop is not None else None
             self._flat_live = brushes.PushStroke(image.rect(), self._blend_under, s['mix'] / 100.0,
-                                                 ice=s.get('push_ice', 40) / 100.0, backdrop=backdrop)
+                                                 ice=s.get('push_ice', 40) / 100.0, backdrop=backdrop,
+                                                 paint=paint)
         elif mode == 'smear' and self._blend_under is not None and image is not None:
             # 🌊 Smear: drags the pixels under it into streaks (see DragStroke).
             s = self.brush_settings
@@ -11524,7 +11683,9 @@ class RandomImageViewer(QMainWindow):
             self._deactivate_tools(keep='fill')
             if mode == 'polyline':
                 self._show_guides_for_tool()
-                self._recall_tool_size('polyline')
+                self._recall_line_size('polyline')
+            elif mode != 'gradient' and self._brush_mode_for_marks() is not None:
+                self._recall_mode_size()        # the brush runs over it
             if mode in self._CLICK_SHAPES:
                 self.status.showMessage(self._click_shape_hint(mode))
             elif mode == 'gradient':
@@ -11539,6 +11700,8 @@ class RandomImageViewer(QMainWindow):
             self.cancel_fill()
             self.fill_mode = None
         self._update_cursor_and_status()
+        if checked and mode != 'gradient':
+            self._mode_tool_hint()
 
     def _disable_fill_tools_silent(self):
         """Turn off any armed fill tool without emitting signals."""
@@ -11572,6 +11735,31 @@ class RandomImageViewer(QMainWindow):
     # mapping is worked out once per drag (free draw's drawing_cache), each
     # move does constant work, and the image label paces the repaints to the
     # frame rate and repaints only the pixels that changed.
+
+    _EXACT_WITHIN = 0.0015      # this near 1:1, a layer image is shown exactly 1:1
+
+    def _pixel_exact(self, to_window, width, height):
+        """*to_window* (a layer image -> the window), made exactly a pixel a
+        pixel of the screen where it is within rounding of that - a layer
+        image is made as fine as the screen at fit. The fitted view is a
+        whole number of window pixels, so it was off by a pixel over the
+        height: every row between two, a 1 px line two at half strength.
+        Its middle stays put: under a pixel moved at the edges."""
+        try:
+            ratio = float(self.image_label.devicePixelRatioF()) or 1.0
+        except Exception:
+            return to_window
+        t = to_window * QTransform.fromScale(ratio, ratio)
+        linear = (t.m11(), t.m12(), t.m21(), t.m22())
+        whole = [round(c) for c in linear]
+        if (any(abs(c - n) > self._EXACT_WITHIN for c, n in zip(linear, whole))
+                or abs(whole[0] * whole[3] - whole[1] * whole[2]) != 1):
+            return to_window
+        a, b, c, d = whole
+        x, y = width / 2.0, height / 2.0
+        at = t.map(QPointF(x, y))
+        exact = QTransform(a, b, c, d, round(at.x() - a * x - c * y), round(at.y() - b * x - d * y))
+        return exact * QTransform.fromScale(1.0 / ratio, 1.0 / ratio)
 
     def _pixmap_mark_mapper(self):
         """Map image coords to the displayed pixmap's coords, or None."""
@@ -11761,6 +11949,41 @@ class RandomImageViewer(QMainWindow):
         t += 0.5
         np.clip(t, 0, n - 1, out=t)
         idx = t.astype(np.int32)                        # (h, w): the step along it
+        table = self._gradient_table(g, color, n)
+        vals = np.take(table, idx, axis=0)              # (h, w, 4)
+        # dithered: a fraction of a step of noise (0..255/256) from a fixed
+        # tile, tied to the device pixel - the same for a redraw of the same
+        # place (no banding, no crawling) - then cut to whole steps
+        tile = self._gradient_dither()
+        T = tile.shape[0]
+        ox, oy = area.x() % T, area.y() % T
+        vals += np.tile(tile, ((h + oy) // T + 1, (w + ox) // T + 1, 1))[oy:oy + h, ox:ox + w]
+        vals >>= 8
+        q = vals.astype(np.uint8)
+        np.minimum(q[:, :, :3], q[:, :, 3:4], out=q[:, :, :3])     # premultiplied: colour <= alpha
+        image = QImage(q.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+        # cut to its shape (edges smoothed)
+        mask = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        mask.fill(Qt.transparent)
+        mp = QPainter(mask)
+        mp.setRenderHint(QPainter.Antialiasing, antialias)
+        mp.setPen(Qt.NoPen)
+        mp.setBrush(QColor(0, 0, 0))
+        mp.drawPolygon(outline.translated(-area.x(), -area.y()))
+        mp.end()
+        ip = QPainter(image)
+        ip.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        ip.drawImage(0, 0, mask)
+        ip.end()
+        painter.save()
+        painter.resetTransform()
+        painter.drawImage(area.topLeft(), image)
+        painter.restore()
+
+    def _gradient_table(self, g, color, n=1024):
+        """🌈 (n, 4) B G R A premultiplied, in 1/256ths of a step: the colours
+        of gradient *g* from its start to its end."""
+        import numpy as np
         # Everything else is a table of n steps: the Middle slider's bend,
         # the colours mixed in OKLab, the fade - premultiplied, B G R A as
         # the image keeps them, 0..255.
@@ -11787,38 +12010,306 @@ class RandomImageViewer(QMainWindow):
         table[:, 3] = a
         # in 1/256ths of an 8-bit step (integers: half the work of floats)
         table = np.clip(np.round(table * (255.0 * 256.0)), 0, 255 * 256).astype(np.uint16)
-        vals = np.take(table, idx, axis=0)              # (h, w, 4)
-        # dithered: a fraction of a step of noise (0..255/256) from a fixed
-        # tile, tied to the device pixel - the same for a redraw of the same
-        # place (no banding, no crawling) - then cut to whole steps
+        return table
+
+    def _gradient_dither(self):
+        import numpy as np
         tile = self.__dict__.get('_gradient_noise')
         if tile is None:
             tile = self._gradient_noise = np.random.default_rng(0x5EED).integers(
                 0, 256, (128, 128, 4), dtype=np.uint16)
-        T = tile.shape[0]
-        ox, oy = area.x() % T, area.y() % T
-        vals += np.tile(tile, ((h + oy) // T + 1, (w + ox) // T + 1, 1))[oy:oy + h, ox:ox + w]
-        vals >>= 8
-        q = vals.astype(np.uint8)
-        np.minimum(q[:, :, :3], q[:, :, 3:4], out=q[:, :, :3])     # premultiplied: colour <= alpha
-        image = QImage(q.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
-        # cut to its shape (edges smoothed)
-        mask = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
-        mask.fill(Qt.transparent)
-        mp = QPainter(mask)
-        mp.setRenderHint(QPainter.Antialiasing, antialias)
-        mp.setPen(Qt.NoPen)
-        mp.setBrush(QColor(0, 0, 0))
-        mp.drawPolygon(outline.translated(-area.x(), -area.y()))
-        mp.end()
-        ip = QPainter(image)
-        ip.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-        ip.drawImage(0, 0, mask)
-        ip.end()
+        return tile
+
+    # -- ✨ stars along a line ---------------------------------------------
+    #
+    # A free line or polyline with 'stars' holding a 'band' (its width, picture
+    # px) and a 'count': that many stars along the way, thrown off it as a
+    # cloud is - thick in the middle, thinning out, round at bends and ends.
+    # Kept as a count and offsets along / across each piece, so a move, turn
+    # or scale takes the very same stars with it.
+
+    _STAR_BAND = 160            # the band's width the first time (the size slider sets it)
+    _STAR_BAND_DENSE = 2.0      # stars in it per area, against a shape's
+    _STAR_BAND_THIN = 8.0       # a thinner band still gets the stars of one this many specks wide
+
+    def _line_gets_stars(self):
+        """True when a new line / polyline paints stars."""
+        return bool(self.brush_settings.get('line_stars')) and self._brush_mode_for_marks() is None
+
+    def _stars_for_line(self, record):
+        """*record*, a line or polyline just made, turned into a band of
+        stars as wide as the size: always paint, never a guide."""
+        colour = QColor(self.line_color)
+        colour.setAlpha(getattr(self, 'line_transparency', 255))
+        stars = self._stars_of(QColor(self.line_color))
+        band = record['thickness'] / self._view_scale()
+        length = self._path_lengths(self._line_points(record))[-1]
+        wide = max(band, self._STAR_BAND_THIN * stars['speck'])
+        count = stars['density'] * self._STAR_BAND_DENSE * length * wide / 1e6
+        stars.update(band=band, count=max(1, int(min(self._STARS_MAX, count))))
+        record.update(color=colour, stars=stars, guide=False, pic_width=band + 12.0 * stars['speck'])
+        record.pop('jitter', None)
+        record.pop('gradient', None)
+
+    @staticmethod
+    def _stars_along(rng, pts, band, n):
+        """(x, y, middle) of *n* stars along *pts*: *middle* 1 on the line,
+        0 at the band's rim."""
+        import numpy as np
+        corners = np.asarray(pts, np.float64)
+        steps = np.diff(corners, axis=0)
+        lengths = np.hypot(steps[:, 0], steps[:, 1])
+        kept = lengths > 1e-9
+        if not kept.any():
+            zero = np.zeros(n, np.float32)
+            return zero + float(corners[0, 0]), zero + float(corners[0, 1]), zero
+        starts, steps, lengths = corners[:-1][kept], steps[kept], lengths[kept]
+        ends = np.cumsum(lengths) / lengths.sum()
+        share = rng.random(n)
+        piece = np.minimum(np.searchsorted(ends, share, side='right'), len(lengths) - 1)
+        begun = np.concatenate(([0.0], ends[:-1]))[piece]
+        t = (share - begun) / np.maximum(ends[piece] - begun, 1e-12)
+        unit = steps[piece] / lengths[piece][:, None]
+        off = rng.standard_normal((n, 2)) * 0.43        # (half the band: 1)
+        far = np.hypot(off[:, 0], off[:, 1])
+        out = far > 1.0                     # past the rim: put somewhere back inside
+        off[out] *= (rng.random(int(out.sum())) / far[out])[:, None]
+        half = band / 2.0
+        x = starts[piece, 0] + steps[piece, 0] * t + (off[:, 0] * unit[:, 0] - off[:, 1] * unit[:, 1]) * half
+        y = starts[piece, 1] + steps[piece, 1] * t + (off[:, 0] * unit[:, 1] + off[:, 1] * unit[:, 0]) * half
+        middle = 1.0 - np.minimum(np.hypot(off[:, 0], off[:, 1]), 1.0)
+        return x.astype(np.float32), y.astype(np.float32), middle.astype(np.float32)
+
+    def _line_shows_band(self):
+        """A line being placed shows as a see-through band: where the stars
+        will go, or where the brush will run."""
+        return self._brush_mode_for_marks() is not None or self._line_gets_stars()
+
+    def _star_band_colour(self):
+        """The see-through band shown while a star or brush-mode line is placed."""
+        if self._brush_mode_for_marks() is not None:
+            return QColor(255, 255, 255, 38)    # (no colour is laid: not the pen's, and dashed)
+        colour = QColor(self.line_color)
+        colour.setAlpha(min(55, getattr(self, 'line_transparency', 255)))
+        return colour
+
+    # -- 🌈 gradients on lines --------------------------------------------
+    #
+    # A free line or polyline with a 'gradient'. Straight, or radial: as a
+    # fill's ('start', 'end' in picture coords). A bent polyline's is 'path':
+    # it runs along the line, from 'a' to 'b' (shares of its length; 'start'
+    # and 'end' are those points, where the handles show). Closed, it runs to
+    # 'b' both ways round, so there is no seam. Painted only where the line
+    # is, in tiles: a long thin diagonal costs its ink, not its whole box.
+
+    _GRADIENT_TILE = 384        # device px
+
+    @staticmethod
+    def _is_line_mark(mark):
+        return 'points' not in mark or mark.get('shape') == 'polyline'
+
+    @staticmethod
+    def _line_points(mark):
+        """A line's corners as (x, y), a closed one back to its first."""
+        points = mark['points'] if 'points' in mark else (mark['start'], mark['end'])
+        pts = [(float(p.x()), float(p.y())) if isinstance(p, QPointF)
+               else (float(p[0]), float(p[1])) for p in points]
+        if mark.get('closed') and len(pts) > 2:
+            pts.append(pts[0])
+        return pts
+
+    @staticmethod
+    def _path_lengths(pts):
+        """The length of the way to each of *pts*, the last the whole."""
+        out = [0.0]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            out.append(out[-1] + math.hypot(x1 - x0, y1 - y0))
+        return out
+
+    @staticmethod
+    def _path_span(g, closed):
+        """How far, and which way, a path gradient runs from 'a' (shares)."""
+        span = g['b'] - g['a']
+        if closed:
+            span %= 1.0
+            if span > 0.5:
+                span -= 1.0
+        return span
+
+    def _path_point(self, pts, share, closed=False):
+        """The point *share* (0..1) of the way along *pts*."""
+        at = self._path_lengths(pts)
+        share = share % 1.0 if closed else min(1.0, max(0.0, share))
+        want = share * at[-1]
+        for i in range(1, len(pts)):
+            if at[i] >= want and at[i] > at[i - 1]:
+                u = (want - at[i - 1]) / (at[i] - at[i - 1])
+                (x0, y0), (x1, y1) = pts[i - 1], pts[i]
+                return x0 + (x1 - x0) * u, y0 + (y1 - y0) * u
+        return pts[-1]
+
+    def _path_share(self, pts, x, y):
+        """How far along *pts* (0..1) the point of it nearest (x, y) is."""
+        at = self._path_lengths(pts)
+        best = (float('inf'), 0.0)
+        for i, ((x0, y0), (x1, y1)) in enumerate(zip(pts, pts[1:])):
+            dx, dy = x1 - x0, y1 - y0
+            length = math.hypot(dx, dy)
+            if length < 1e-9:
+                continue
+            u = min(1.0, max(0.0, ((x - x0) * dx + (y - y0) * dy) / (length * length)))
+            best = min(best, (math.hypot(x0 + u * dx - x, y0 + u * dy - y), at[i] + u * length))
+        return best[1] / max(1e-9, at[-1])
+
+    def _line_gets_gradient(self):
+        """True when a new line / polyline takes the gradient."""
+        return bool(self.brush_settings.get('line_gradient')) and self._brush_mode_for_marks() is None
+
+    def _line_gradient(self, points, closed=False):
+        """The 'gradient' a new line through *points* gets."""
+        pts = self._line_points({'points': points, 'closed': closed})
+        g = self._gradient_of('polyline', pts)
+        if g['type'] == 'radial':
+            return g                        # from its middle out, as a shape's
+        if len(pts) == 2:
+            g['start'], g['end'] = pts      # straight: just from end to end
+            return g
+        a, b = 0.0, 0.5 if closed else 1.0
+        g.update(type='path', a=a, b=b, start=self._path_point(pts, a, closed),
+                 end=self._path_point(pts, b, closed))
+        return g
+
+    def _paint_gradient_line(self, painter, mark, to_display, width, antialias=True):
+        """🌈 *mark* (a free line or polyline with a gradient), *width* wide."""
+        import numpy as np
+        g, color = mark['gradient'], QColor(mark.get('color') or self.line_color)
+        pts = self._line_points(mark)
+        if len(pts) < 2:
+            return
+        free = 'points' not in mark             # (square ends, as a plain one)
+        closed = bool(mark.get('closed')) and len(pts) > 3
+        # (whole-pixel mappers: far apart points pin the mapping down finely)
+        to_dev = self._picture_to_display(to_display, 100000.0, 100000.0)
+        ratio = self._pixel_ratio(painter)
+        world = painter.worldTransform() * QTransform.fromScale(ratio, ratio)      # -> real pixels
+        full = to_dev * world
+        inverse, ok = full.inverted()
+        if not ok:
+            return
+        half = width * math.sqrt(abs(world.determinant())) / 2.0
+        reach = half * (1.5 if free else 1.0) + 3.0
+        shown = self._hairline_points(painter, [to_display(x, y) for x, y in pts], width)
+        dev = [world.map(p) for p in shown]
+        boxes = [(min(p.x(), q.x()) - reach, min(p.y(), q.y()) - reach,
+                  max(p.x(), q.x()) + reach, max(p.y(), q.y()) + reach) for p, q in zip(dev, dev[1:])]
+        device = painter.device()
+        x0 = max(0, math.floor(min(b[0] for b in boxes)))
+        y0 = max(0, math.floor(min(b[1] for b in boxes)))
+        x1 = min(math.ceil(device.width() * ratio), math.ceil(max(b[2] for b in boxes)))
+        y1 = min(math.ceil(device.height() * ratio), math.ceil(max(b[3] for b in boxes)))
+        if x0 >= x1 or y0 >= y1:
+            return
+        n = 1024
+        table = self._gradient_table(g, color, n)
+        noise = self._gradient_dither()
+        N = noise.shape[0]
+        kind = g.get('type')
+        (sx, sy), (ex, ey) = g['start'][:2], g['end'][:2]
+        at = self._path_lengths(pts)
+        total = max(1e-9, at[-1])
+        if kind == 'path':
+            span = self._path_span(g, closed)
+            span = span if abs(span) > 1e-6 else 1e-6
+        near = reach / max(1e-9, math.sqrt(abs(full.determinant())))       # in picture px
+        pen = QPen(QColor(0, 0, 0), width, Qt.SolidLine,
+                   Qt.SquareCap if free else Qt.RoundCap, Qt.BevelJoin if free else Qt.RoundJoin)
+        step = self._GRADIENT_TILE
         painter.save()
         painter.resetTransform()
-        painter.drawImage(area.topLeft(), image)
+        for top in range(y0, y1, step):
+            for left in range(x0, x1, step):
+                w, h = min(step, x1 - left), min(step, y1 - top)
+                here = [i for i, b in enumerate(boxes)
+                        if b[0] < left + w and b[2] > left and b[1] < top + h and b[3] > top]
+                if not here:
+                    continue
+                tile = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+                tile.fill(Qt.transparent)
+                tp = QPainter(tile)
+                tp.setRenderHint(QPainter.Antialiasing, antialias)
+                tp.setWorldTransform(world * QTransform.fromTranslate(-left, -top))
+                tp.setPen(pen)
+                tp.setBrush(Qt.NoBrush)
+                if free:
+                    tp.drawLine(shown[0], shown[1])
+                elif closed:
+                    tp.drawPolygon(QPolygonF(shown[:-1]))
+                else:
+                    tp.drawPolyline(QPolygonF(shown))
+                tp.end()
+                data = np.frombuffer(tile.constBits(), np.uint8, count=w * h * 4).reshape(h, w, 4).copy()
+                ys, xs = np.nonzero(data[..., 3])
+                if not len(xs):
+                    continue
+                X, Y = xs + left + 0.5, ys + top + 0.5
+                px = (inverse.m11() * X + inverse.m21() * Y + inverse.dx()).astype(np.float32)
+                py = (inverse.m12() * X + inverse.m22() * Y + inverse.dy()).astype(np.float32)
+                if kind == 'radial':
+                    t = np.hypot(px - sx, py - sy) / max(1e-6, math.hypot(ex - sx, ey - sy))
+                elif kind == 'path':
+                    # Each piece of the line says how far along it a pixel is,
+                    # weighed by how near it runs: one piece on the straight,
+                    # shared at a bend (the nearest alone left a seam there).
+                    t = np.zeros(len(xs), np.float32)
+                    weight = np.full(len(xs), 1e-12, np.float32)
+                    for i in here:
+                        (ax, ay), (bx, by) = pts[i], pts[i + 1]
+                        dx, dy = bx - ax, by - ay
+                        length2 = dx * dx + dy * dy
+                        if length2 < 1e-12:
+                            continue
+                        u = np.clip(((px - ax) * dx + (py - ay) * dy) / length2, 0.0, 1.0)
+                        d = np.hypot(px - ax - u * dx, py - ay - u * dy)
+                        share = (at[i] + u * (at[i + 1] - at[i])) / total - g['a']
+                        if closed:
+                            share %= 1.0
+                            share = np.minimum(share, 1.0 - share) / abs(span)
+                        else:
+                            share /= span
+                        # (a hair over 0: a pixel just past the reach still gets a colour)
+                        w_i = np.maximum(1.0 - d / near, 1e-3) ** 4
+                        t += w_i * np.clip(share, 0.0, 1.0)
+                        weight += w_i
+                    t /= weight
+                else:
+                    dx, dy = ex - sx, ey - sy
+                    t = ((px - sx) * dx + (py - sy) * dy) / max(1e-9, dx * dx + dy * dy)
+                idx = (np.clip(t, 0.0, 1.0) * (n - 1) + 0.5).astype(np.intp)
+                vals = (table[idx] + noise[(ys + top) % N, (xs + left) % N]) >> 8
+                cover = data[ys, xs, 3].astype(np.uint16)[:, None]
+                ink = ((vals * cover + 127) // 255).astype(np.uint8)
+                np.minimum(ink[:, :3], ink[:, 3:4], out=ink[:, :3])
+                data[ys, xs] = ink
+                piece = QImage(data.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+                piece.setDevicePixelRatio(ratio)
+                painter.drawImage(QPointF(left / ratio, top / ratio), piece)
         painter.restore()
+
+    def _line_preview(self, colour, width, closed=False, free=False):
+        """🌈 f(painter, points): a gradient line being placed, as it will be
+        (points and width in the painter's own pixels; *free*: a straight
+        line, its ends square as it is laid)."""
+        def paint(painter, points):
+            pts = [(p.x(), p.y()) if hasattr(p, 'x') else tuple(p) for p in points]
+            if len(pts) < 2 or self._path_lengths(pts)[-1] < 1.0:
+                return
+            mark = {'points': pts, 'closed': closed, 'color': colour,
+                    'gradient': self._line_gradient(pts, closed)}
+            if free:
+                del mark['points']
+                mark['start'], mark['end'] = pts
+            self._paint_gradient_line(painter, mark, lambda x, y: (x, y), width)
+        return paint
 
     # -- ✨ starfield fills ------------------------------------------------
     #
@@ -11830,6 +12321,13 @@ class RandomImageViewer(QMainWindow):
 
     _STARS_MAX = 1_500_000      # stars in one shape, at most
     _STARS_BIG = 5.0            # the biggest star is this many times the smallest
+    # A field with depth ('look': 2; a fill without it keeps the old look, 3 %
+    # growing): nearly all the stars the smallest, a few medium, the big ones
+    # rare - the bigger the fewer - and each as far away as chance puts it:
+    # most far and faint, few near, bright and pin sharp.
+    _STARS_MEDIUM = 0.007       # share of the stars that are medium (2.6..3.4x) ...
+    _STARS_RARE = 0.0007        # ... and big (4..5.5x), about 1 in 1400
+    _STARS_NEAR = 0.85          # depth from which a small star sits on one pixel
 
     def _fill_gets_stars(self, shape):
         """True when a fill of *shape* is a starfield (✨ 'Shapes fill with
@@ -11850,18 +12348,25 @@ class RandomImageViewer(QMainWindow):
         palette = [colour.rgb() & 0xFFFFFF]
         if s.get('hue_jitter') or s.get('sat_jitter') or s.get('val_jitter'):
             palette = [brushes.jitter_color(colour, s).rgb() & 0xFFFFFF for _ in range(24)]
-        return {'seed': random.randrange(1 << 31), 'density': 20.0 * amount * amount,
+        return {'seed': random.randrange(1 << 31), 'density': 20.0 * amount * amount, 'look': 2,
                 'speck': size_px / max(1e-6, real), 'big': self._STARS_BIG, 'palette': palette}
 
     def _paint_star_fill(self, painter, fill, to_display, color):
         import numpy as np
         stars = fill['stars']
-        pts = [(p.x(), p.y()) if isinstance(p, QPointF) else tuple(p[:2]) for p in fill['points']]
+        band = float(stars.get('band') or 0.0)      # along a line, this wide (see _stars_along)
+        pts = (self._line_points(fill) if band else
+               [(p.x(), p.y()) if isinstance(p, QPointF) else tuple(p[:2]) for p in fill['points']])
         to_dev = self._picture_to_display(to_display, 1000.0, 1000.0)
         full = to_dev * painter.worldTransform()
         device = painter.device()
         outline = full.map(QPolygonF([QPointF(x, y) for x, y in pts]))
-        area = outline.boundingRect().toAlignedRect().adjusted(-6, -6, 6, 6).intersected(
+        margin, over = 6, 4
+        if band:
+            per = math.sqrt(abs(full.determinant()))
+            over = math.ceil(6.0 * stars['speck'] * per) + 4
+            margin = math.ceil(band / 2.0 * per) + over
+        area = outline.boundingRect().toAlignedRect().adjusted(-margin, -margin, margin, margin).intersected(
             QRect(0, 0, device.width(), device.height()))
         if area.isEmpty():
             return
@@ -11870,12 +12375,15 @@ class RandomImageViewer(QMainWindow):
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         x0, y0 = min(xs), min(ys)
         bw, bh = max(xs) - x0, max(ys) - y0
-        n = int(min(self._STARS_MAX, stars['density'] * bw * bh / 1e6))
+        n = int(min(self._STARS_MAX, stars['count'] if band else stars['density'] * bw * bh / 1e6))
         if n <= 0:
             return
         rng = np.random.default_rng(int(stars['seed']))
-        px = x0 + rng.random(n, dtype=np.float32) * bw
-        py = y0 + rng.random(n, dtype=np.float32) * bh
+        if band:
+            px, py, middle = self._stars_along(rng, pts, band, n)
+        else:
+            px = x0 + rng.random(n, dtype=np.float32) * bw
+            py = y0 + rng.random(n, dtype=np.float32) * bh
         u_size = rng.random(n, dtype=np.float32)
         u_lum = rng.random(n, dtype=np.float32)
         palette = np.array(stars.get('palette') or [color.rgb() & 0xFFFFFF], np.uint32)
@@ -11883,13 +12391,38 @@ class RandomImageViewer(QMainWindow):
         X = full.m11() * px + full.m21() * py + full.dx()
         Y = full.m12() * px + full.m22() * py + full.dy()
         scale = math.sqrt(abs(full.determinant())) or 1.0
-        # widths: almost all the smallest; ~3 % grow, up to `big` times it
-        grow = np.clip((u_size - 0.97) / 0.03, 0.0, 1.0) ** 2
-        width = stars['speck'] * scale * (1.0 + (stars.get('big', self._STARS_BIG) - 1.0) * grow)
-        # brightness: many faint, few bright - the bigger the brighter
-        lum = color.alphaF() * np.clip(0.18 + 0.82 * u_lum ** 2.2 + 0.5 * grow, 0.0, 1.0)
-        inside = ((X >= area.x() - 4) & (X < area.right() + 4) & (Y >= area.y() - 4) & (Y < area.bottom() + 4))
+        big = stars.get('big', self._STARS_BIG)
+        near = np.zeros(n, bool)
+        if stars.get('look', 1) >= 2:
+            rare_from = 1.0 - self._STARS_RARE
+            medium_from = rare_from - self._STARS_MEDIUM
+            medium = (u_size >= medium_from) & (u_size < rare_from)
+            rare = u_size >= rare_from
+            times = np.ones(n, np.float32)
+            v = (u_size[medium] - medium_from) / self._STARS_MEDIUM
+            times[medium] = 2.6 + 0.8 * v ** 3              # the bigger the fewer
+            v = (u_size[rare] - rare_from) / self._STARS_RARE
+            times[rare] = 0.8 * big + 0.3 * big * v ** 3
+            width = stars['speck'] * scale * times
+            # depth: most far and faint, few near and bright; a bigger one is
+            # seen, but may as well be a dimmer, farther one
+            bright = 0.16 + 0.84 * u_lum ** 2.6
+            bright[medium] = 0.35 + 0.65 * u_lum[medium] ** 1.5
+            bright[rare] = 0.65 + 0.35 * u_lum[rare]
+            lum = color.alphaF() * bright
+            near = (u_lum >= self._STARS_NEAR) & ~medium & ~rare
+        else:
+            # widths: almost all the smallest; ~3 % grow, up to `big` times it
+            grow = np.clip((u_size - 0.97) / 0.03, 0.0, 1.0) ** 2
+            width = stars['speck'] * scale * (1.0 + (big - 1.0) * grow)
+            # brightness: many faint, few bright - the bigger the brighter
+            lum = color.alphaF() * np.clip(0.18 + 0.82 * u_lum ** 2.2 + 0.5 * grow, 0.0, 1.0)
+        if band:
+            lum = lum * (0.6 + 0.4 * middle)        # brightest along the middle of the band
+        inside = ((X >= area.x() - over) & (X < area.right() + over)
+                  & (Y >= area.y() - over) & (Y < area.bottom() + over))
         X, Y, width, lum, pick = X[inside], Y[inside], width[inside], lum[inside], pick[inside]
+        near = near[inside]
         W, H = area.width(), area.height()
         rgb = palette[pick]
         cols = ((rgb & 0xFF).astype(np.float32) / 255.0,             # B G R
@@ -11904,6 +12437,8 @@ class RandomImageViewer(QMainWindow):
         if small.any():
             sel = np.flatnonzero(small)
             sx, sy = X[sel] - area.x() - 0.5, Y[sel] - area.y() - 0.5
+            pin = near[sel]                 # a near one whole on one pixel, sharp; far ones soft
+            sx[pin], sy[pin] = np.rint(sx[pin]), np.rint(sy[pin])
             ix, iy = np.floor(sx).astype(np.int64), np.floor(sy).astype(np.int64)
             fx, fy = sx - ix, sy - iy
             a = lum[sel] * np.minimum(1.0, width[sel] ** 2)     # a 1 px speck: full strength
@@ -11961,7 +12496,7 @@ class RandomImageViewer(QMainWindow):
         poly_area = abs(sum(outline[i].x() * outline[(i + 1) % len(outline)].y()
                             - outline[(i + 1) % len(outline)].x() * outline[i].y()
                             for i in range(len(outline)))) / 2.0
-        if len(outline) == 4 and poly_area >= 0.999 * b.width() * b.height():
+        if band or (len(outline) == 4 and poly_area >= 0.999 * b.width() * b.height()):
             painter.save()
             painter.resetTransform()
             painter.drawImage(area.topLeft(), image)
@@ -12026,12 +12561,10 @@ class RandomImageViewer(QMainWindow):
         """🌈 The Middle slider moved: the gradient just laid (still the last
         thing done on this layer) takes the new middle, so it can be tuned
         while looking at it. Anything drawn after it leaves it as it is."""
-        fills = getattr(self, 'drawn_fills', None)
-        stack = getattr(self, '_undo_stack', None)
-        if not fills or not stack or stack[-1] != 'fill' or not fills[-1].get('gradient'):
+        record = self._grad_last_mark()
+        if record is None:
             return
         mid = min(95, max(5, int(self.brush_settings.get('gradient_mid', 50)))) / 100.0
-        record = fills[-1]
         if abs(record['gradient'].get('mid', 0.5) - mid) < 1e-6:
             return
         grad = dict(record['gradient'])      # (a new one: an undo snapshot keeps the old)
@@ -12050,7 +12583,11 @@ class RandomImageViewer(QMainWindow):
             self.active_layer.raster = None
             if hasattr(self, '_lut_process_cache'):
                 self._lut_process_cache.clear()
-            self._refresh_marks()
+            # From the clean picture: painted over the frame on screen, the
+            # gradient as it was showed through wherever the new one is clear.
+            self.scaled_cache.clear()
+            if self.current_image:
+                self.display_image(self.current_image)
             return
         if self.__dict__.get('_grad_relay_due'):
             return
@@ -12081,13 +12618,24 @@ class RandomImageViewer(QMainWindow):
     def _grad_edit_record(self):
         """The gradient fill whose handles show, or None."""
         record = self.__dict__.get('_grad_edit')
-        if record is None or not self.fill_mode or self.__dict__.get('current_fill'):
+        if record is None or self.__dict__.get('current_fill'):
             return None
-        fills = getattr(self, 'drawn_fills', None)
+        if 'points' in record:
+            if not self.fill_mode:
+                return None
+        elif not self.free_line_drawing_mode or self.current_line_start is not None:
+            return None                     # ╱ not its tool, or the next line under way
+        return record if self._grad_last_mark() is record else None
+
+    def _grad_last_mark(self):
+        """The last thing done on this layer, when it is a gradient (fill,
+        line or polyline) - what can still be tuned - or None."""
         stack = getattr(self, '_undo_stack', None)
-        if not fills or fills[-1] is not record or not stack or stack[-1] != 'fill':
+        field = {'fill': 'drawn_fills', 'free_line': 'drawn_free_lines'}.get(stack[-1]) if stack else None
+        marks = getattr(self, field, None) if field else None
+        if not marks or not isinstance(marks[-1], dict) or not marks[-1].get('gradient'):
             return None
-        return record if record.get('gradient') else None
+        return marks[-1]
 
     def _grad_edit_guide(self):
         """Its guide (ImageLabel.set_fill_guide's form) on screen now, or None."""
@@ -12098,7 +12646,7 @@ class RandomImageViewer(QMainWindow):
         if to_screen is None:
             return None
         return self._gradient_guide(record['gradient'], to_screen, QColor(record['color']),
-                                    self._grad_picked_node(record))
+                                    self._grad_picked_node(record), record)
 
     def _grad_picked_node(self, record):
         """'start' / 'end': the end of *record*'s gradient last clicked - a
@@ -12141,9 +12689,11 @@ class RandomImageViewer(QMainWindow):
         guide = self._grad_edit_guide()
         if guide is None:
             return False
+        if self._is_line_mark(self._grad_edit) and QApplication.keyboardModifiers() & Qt.ControlModifier:
+            return False        # Ctrl: the next line starts on the node (joined to this one)
         q = self._fill_screen_mapper()(x, y)
         s, e, mid = guide[0], guide[1], guide[5]
-        m = QPointF(s.x() + (e.x() - s.x()) * mid, s.y() + (e.y() - s.y()) * mid)
+        m = guide[8] or QPointF(s.x() + (e.x() - s.x()) * mid, s.y() + (e.y() - s.y()) * mid)
         best = None
         for name, at in (('mid', m), ('start', s), ('end', e)):
             d = math.hypot(at.x() - q.x(), at.y() - q.y())
@@ -12172,12 +12722,39 @@ class RandomImageViewer(QMainWindow):
         if to_screen is None:
             return
         colour = QColor(record['color'])
+        if self._is_line_mark(record):
+            self._grad_preview_line(record, to_screen, colour)
+            return
         pts = [to_screen(px, py) for px, py in (
             (p.x(), p.y()) if isinstance(p, QPointF) else tuple(p[:2]) for p in record['points'])]
         label = self.image_label
         label.set_fill_guide(self._gradient_guide(record['gradient'], to_screen, colour,
                                                   self._grad_picked_node(record)))
         label.set_fill_overlay(pts, self._gradient_preview_brush(record['gradient'], to_screen, colour))
+
+    def _grad_preview_line(self, record, to_screen, colour):
+        """The held line's gradient drawn by the label, with its handles."""
+        def xy(p):
+            q = to_screen(*p[:2])
+            return (q.x(), q.y())
+        line = self._line_points(record)
+        g = record['gradient']
+        width = float(record.get('thickness') or self.line_thickness)
+        if not record.get('guide', True) and record.get('pic_width'):
+            width = record['pic_width'] * self._view_scale()        # paint: it zooms
+        shown = dict(record, color=colour, gradient=dict(g, start=xy(g['start']), end=xy(g['end'])))
+        if 'points' in record:
+            shown['points'] = [xy(p) for p in record['points']]
+        else:
+            shown['start'], shown['end'] = xy(record['start']), xy(record['end'])
+
+        def paint(painter, _points):
+            self._paint_gradient_line(painter, shown, lambda x, y: (x, y), width)
+        label = self.image_label
+        label.set_fill_guide(self._gradient_guide(g, to_screen, colour,
+                                                  self._grad_picked_node(record), record))
+        label.set_fill_overlay([QPoint(*map(int, xy(p))) for p in line], paint, open_path=True,
+                               stroke_width=max(1, math.ceil(width * 1.5) + 4))
 
     def _show_grad_node_colour(self, record, which):
         """The 🎨 picker (when open) shows the selected node's colour, so it
@@ -12212,7 +12789,22 @@ class RandomImageViewer(QMainWindow):
             return
         g = dict(record['gradient'])        # (a new one: an undo snapshot keeps the old)
         (sx, sy), (ex, ey) = g['start'][:2], g['end'][:2]
-        if which == 'mid':
+        if g.get('type') == 'path':
+            # along the line: a node slides on it
+            pts, closed = self._line_points(record), bool(record.get('closed'))
+            share = self._path_share(pts, x, y)
+            if which == 'mid':
+                span, off = self._path_span(g, closed), share - g['a']
+                if closed:
+                    off %= 1.0
+                    off, span = min(off, 1.0 - off), abs(span)
+                g['mid'] = min(0.95, max(0.05, off / (span or 1e-6)))
+            else:
+                g['a' if which == 'start' else 'b'] = share
+                if abs(self._path_span(g, closed)) < 0.01:
+                    return
+                g[which] = self._path_point(pts, share, closed)
+        elif which == 'mid':
             dx, dy = ex - sx, ey - sy
             length2 = dx * dx + dy * dy
             if length2 < 1e-9:
@@ -12268,16 +12860,29 @@ class RandomImageViewer(QMainWindow):
         return (shape not in ('polyline',) and bool(self.brush_settings.get('shape_gradient'))
                 and self._brush_mode_for_marks() is None)
 
-    def _gradient_guide(self, gradient, to_screen, colour, picked=None):
+    def _gradient_guide(self, gradient, to_screen, colour, picked=None, mark=None):
         """🌈 The guide shown while a gradient is dragged (see
         ImageLabel.set_fill_guide): its line on screen, the ends' colours,
         and which end is selected (*picked*: ringed)."""
         def at(p):
             q = to_screen(*p)
             return QPointF(q.x(), q.y()) if hasattr(q, 'x') else QPointF(q[0], q[1])
+        mid = gradient.get('mid', 0.5)
+        way = middle = None
+        if mark is not None and gradient.get('type') == 'path':
+            # along a polyline: the guide follows its bends
+            pts, closed = self._line_points(mark), bool(mark.get('closed'))
+            a, span = gradient['a'], self._path_span(gradient, closed)
+            lo, hi = sorted((a, a + span))
+            lengths = self._path_lengths(pts)
+            corners = {s / max(1e-9, lengths[-1]) + turn for s in lengths
+                       for turn in ((-1, 0, 1) if closed else (0,))}
+            stops = [lo, *sorted(c for c in corners if lo < c < hi), hi]
+            way = [at(self._path_point(pts, c, closed)) for c in stops]
+            middle = at(self._path_point(pts, a + span * mid, closed))
         return (at(gradient['start']), at(gradient['end']), gradient.get('type') == 'radial',
                 QColor(colour), QColor(gradient['to']) if gradient.get('to') else None,
-                gradient.get('mid', 0.5), picked)
+                mid, picked, way, middle)
 
     def _gradient_preview_brush(self, gradient, to_screen, colour):
         """A QBrush showing *gradient* on screen while it is dragged (Qt's
@@ -12444,6 +13049,9 @@ class RandomImageViewer(QMainWindow):
             self._rebuild_fill_screen()
         to_screen = self._fill_to_screen
         colour = self._fill_preview_color()
+        worked = fill['shape'] != 'gradient' and self._brush_mode_for_marks() is not None
+        if worked:
+            colour = self._star_band_colour()       # the brush will run over it: no colour laid
         if fill['shape'] == 'lasso':
             last = fill['points'][-1]
             # Skip sub-pixel jitter so the outline stays a manageable polygon.
@@ -12455,7 +13063,7 @@ class RandomImageViewer(QMainWindow):
                     self._fill_screen_pts.append(to_screen(x, y))
             if to_screen is not None and (moved or remapped):
                 self.image_label.set_fill_overlay(
-                    self._fill_screen_pts, colour, appended=moved and not remapped)
+                    self._fill_screen_pts, colour, appended=moved and not remapped, dashed=worked)
         else:
             if fill['shape'] == 'gradient' and QApplication.keyboardModifiers() & Qt.ShiftModifier:
                 # Shift: straight in 15° steps (as select's turn)
@@ -12481,7 +13089,7 @@ class RandomImageViewer(QMainWindow):
                     gradient = self._gradient_of(fill['shape'], fill['points'], fill['anchor'], (x, y))
                     self.image_label.set_fill_guide(self._gradient_guide(gradient, to_screen, colour))
                     colour = self._gradient_preview_brush(gradient, to_screen, colour)
-                self.image_label.set_fill_overlay(self._fill_screen_pts, colour)
+                self.image_label.set_fill_overlay(self._fill_screen_pts, colour, dashed=worked)
 
     def end_fill(self):
         """Commit the dragged shape, if it encloses anything."""
@@ -12519,7 +13127,7 @@ class RandomImageViewer(QMainWindow):
                 self._brush_along(path)
                 self.status.showMessage(
                     f"Polyline run with the brush in {mode.capitalize()} — set the brush to "
-                    "Paint (or untick 'Lines & shapes use this mode') for a coloured line", 5000)
+                    "Paint for a coloured line", 5000)
             else:
                 self._brush_over_shape(points)
             return
@@ -12530,6 +13138,11 @@ class RandomImageViewer(QMainWindow):
             record['color'] = QColor(self.line_color)
             record['color'].setAlpha(getattr(self, 'line_transparency', 255))
             record['stars'] = self._stars_of(QColor(self.line_color))
+        elif fill['shape'] == 'polyline' and self._line_gets_gradient():
+            # 🌈 along it, round its bends (see _paint_gradient_line)
+            record['gradient'] = self._line_gradient(points, bool(fill.get('closed')))
+            record['color'] = QColor(self.line_color)
+            record['color'].setAlpha(getattr(self, 'line_transparency', 255))
         elif self._fill_gets_gradient(fill['shape']):
             # 🌈 the pen colour fading out (or into the second colour)
             record['gradient'] = self._gradient_of(fill['shape'], points, fill.get('anchor'),
@@ -12547,12 +13160,18 @@ class RandomImageViewer(QMainWindow):
             record['thickness'] = max(1, int(self.line_thickness))
             record['closed'] = bool(fill.get('closed'))
             self._line_kind(record)     # paint or guide ('Lines are paint')
+            if self._line_gets_stars():
+                self._stars_for_line(record)        # ✨ a band of stars instead
         self.drawn_fills.append(record)
         self._undo_stack.append('fill')
         # A cached LUT composite can have the marks baked in; it is stale now.
         if hasattr(self, '_lut_process_cache'):
             self._lut_process_cache.clear()
-        if not self._commit_fill_to_view(record):
+        if fill['shape'] == 'polyline' and (record.get('gradient') or record.get('stars')):
+            # its edges as the layer has them, not as patched onto the frame
+            self.scaled_cache.clear()
+            self.display_image(self.current_image)
+        elif not self._commit_fill_to_view(record):
             self._refresh_marks()
         self.image_label.clear_fill_overlay()
         if record.get('gradient'):
@@ -12580,6 +13199,7 @@ class RandomImageViewer(QMainWindow):
         if not self.lines_visible:
             return True            # marks are hidden: nothing to show
         if (not self._layers_plain() or self.current_erase_stroke
+                or self.__dict__.get('_gpu_display')
                 or self.active_layer is not self.layers[-1]
                 or self.crosshair_overlay or self.grid_overlay
                 or getattr(self, '_video_playing', False)):
@@ -12721,9 +13341,17 @@ class RandomImageViewer(QMainWindow):
         if self._polygon_hover_pos is not None:
             hx, hy = self._polygon_hover_pos
             pts.append(QPoint(int(round(hx)), int(round(hy))))
-        width = max(1, int(self.line_thickness)) if self.current_fill.get('shape') == 'polyline' else 0
-        self.image_label.set_fill_overlay(pts, self._fill_preview_color(), open_path=True,
-                                          stroke_width=width)
+        width = (self._line_window_width(max(1, int(self.line_thickness)))
+                 if self.current_fill.get('shape') == 'polyline' else 0)
+        colour = self._fill_preview_color()
+        worked = self._brush_mode_for_marks() is not None
+        if worked or (width and self._line_shows_band()):
+            colour = self._star_band_colour()       # where the stars / the brush will go
+        elif width and self._line_gets_gradient():
+            base = QColor(self.line_color)
+            base.setAlpha(getattr(self, 'line_transparency', 255))
+            colour = self._line_preview(base, width)
+        self.image_label.set_fill_overlay(pts, colour, open_path=True, stroke_width=width, dashed=worked)
 
     def finish_polygon(self):
         """Fill the polygon / draw the polyline placed so far (double-click,
@@ -13643,6 +14271,7 @@ class RandomImageViewer(QMainWindow):
     def _update_cursor_and_status(self):
         """Update cursor and status message based on active drawing modes"""
         self.apply_tool_cursor()
+        self._gpu_recheck()             # the GPU canvas on or off to suit the tool now in hand
         if getattr(self, 'eraser_mode', False):
             self.status.showMessage("Eraser: drag over lines/drawings to erase them (the image stays intact)")
         elif getattr(self, 'color_snap_mode', False):
@@ -13793,18 +14422,61 @@ class RandomImageViewer(QMainWindow):
 
     def _size_tool(self):
         """Which tool the size slider sets now: 'line', 'hline' (ruler),
-        'free_line', 'polyline', 'brush' - or None."""
+        'free_line', 'polyline', 'brush' - or None. A line or shape
+        that runs the brush (any mode but Paint) has the brush's size,
+        that mode's own."""
+        if (self._brush_mode_for_marks() is not None
+                and (getattr(self, 'free_line_drawing_mode', False)
+                     or getattr(self, 'fill_mode', None) not in (None, 'gradient'))):
+            return 'brush'
         if getattr(self, 'free_line_drawing_mode', False):
-            return 'free_line'
+            return self._line_size_key('free_line')
         if getattr(self, 'line_drawing_mode', False):
             return 'line'
         if getattr(self, 'horizontal_line_drawing_mode', False):
             return 'hline'
         if getattr(self, 'fill_mode', None) == 'polyline':
-            return 'polyline'
+            return self._line_size_key('polyline')
         if getattr(self, 'free_draw_mode', False):
             return 'brush'
         return None
+
+    def _line_size_key(self, tool):
+        """Which remembered size *tool* (free_line / polyline) uses: ✨ star
+        bands keep a width of their own."""
+        return 'star_band' if self.brush_settings.get('line_stars') else tool
+
+    def _recall_mode_size(self):
+        """A line or shape about to run the brush: as big as that mode's brush."""
+        sizes = getattr(self, '_tool_sizes', None)
+        if sizes is not None and not sizes.get('brush'):
+            mode = self.brush_settings.get('mode', 'paint')
+            sizes['brush'] = int(self.brush_settings.get(f"size_{mode}") or self.line_thickness)
+        self._recall_tool_size('brush')
+
+    def _recall_size_in_hand(self, size=None):
+        """The mode or an option changed: the size of what is in hand now."""
+        if getattr(self, 'free_line_drawing_mode', False):
+            self._recall_line_size('free_line')
+        elif getattr(self, 'fill_mode', None) == 'polyline':
+            self._recall_line_size('polyline')
+        elif self._size_tool() == 'brush':
+            self._recall_mode_size()
+        elif size and self._size_tool() is None:
+            self.set_brush_size(size)           # (nothing with a size of its own)
+
+    def _recall_line_size(self, tool):
+        if self._brush_mode_for_marks() is not None:
+            self._recall_mode_size()            # the brush runs along it
+            return
+        key = self._line_size_key(tool)
+        sizes = getattr(self, '_tool_sizes', None)
+        if key == 'star_band' and sizes is not None:
+            # (a line never sized: thin when the stars go off, not a band wide)
+            sizes.setdefault(tool, min(8, int(self.line_thickness)))
+            if key not in sizes:
+                self.set_brush_size(self._STAR_BAND)    # (saved as the band's, its first time)
+        self._recall_tool_size(key)
 
     def _recall_tool_size(self, tool):
         """*tool* picked up: the size it was last used with comes back (one
@@ -14571,12 +15243,17 @@ class RandomImageViewer(QMainWindow):
         if self.current_line_start is None:
             # First click - set start point
             self.current_line_start = (x, y)
+            if self.__dict__.get('_grad_edit') is not None:
+                self._grad_edit = self._grad_pick = None        # 🌈 the last line's handles go
+                self.image_label.update()
             # ⚡ Prepare live-preview state: snapshot the currently displayed pixmap
             # (with all committed lines baked in) and precompute display geometry so
             # the rubber-band preview can be composited cheaply on each pen move.
             self._line_preview_geom = self._build_display_geometry_cache()
-            base = self._view_pixmap()
-            self._line_preview_base = base.copy() if base and not base.isNull() else None
+            self._line_preview_base = None
+            if not self.__dict__.get('_gpu_display'):       # (there it is drawn over the canvas)
+                base = self._view_pixmap()
+                self._line_preview_base = base.copy() if base and not base.isNull() else None
             self.status.showMessage(f"Line start set at ({x:.0f}, {y:.0f}) - drag and lift the pen, "
                                     "or click the end point")
         else:
@@ -14592,7 +15269,7 @@ class RandomImageViewer(QMainWindow):
                 self._brush_along([(start_x, start_y), (end_x, end_y)])
                 self.status.showMessage(
                     f"Line run with the brush in {mode.capitalize()} — set the brush to Paint "
-                    "(or untick 'Lines & shapes use this mode') for a coloured line", 5000)
+                    "for a coloured line", 5000)
                 return
 
             # Add the completed line to our list
@@ -14603,10 +15280,21 @@ class RandomImageViewer(QMainWindow):
             line['thickness'] = max(1, int(self.line_thickness))
             self._line_kind(line)       # paint or guide ('Lines are paint')
             line['color'] = self._mark_color()
-            jitter = self._mark_jitter(math.degrees(math.atan2(end_y - start_y, end_x - start_x)))
-            if jitter:
-                line['jitter'] = jitter
+            graded = (self._line_gets_gradient()
+                      and math.hypot(end_x - start_x, end_y - start_y) >= 2.0)
+            if graded:
+                line['gradient'] = self._line_gradient([line['start'], line['end']])
+                line['color'] = QColor(self.line_color)
+                line['color'].setAlpha(getattr(self, 'line_transparency', 255))
+            else:
+                jitter = self._mark_jitter(math.degrees(math.atan2(end_y - start_y, end_x - start_x)))
+                if jitter:
+                    line['jitter'] = jitter
+            if self._line_gets_stars() and math.hypot(end_x - start_x, end_y - start_y) >= 2.0:
+                self._stars_for_line(line)          # ✨ a band of stars instead
+                graded = False
             self._roll_mark_color()
+            self._grad_edit, self._grad_pick = (line if graded else None), None
             self.drawn_free_lines.append(line)
             self._undo_stack.append('free_line')
             
@@ -14626,7 +15314,12 @@ class RandomImageViewer(QMainWindow):
                 # Use display_image for proper line rendering with GPU acceleration
                 self.display_image(self.current_image)
             
-            self.status.showMessage(f"Line drawn from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f})")
+            if graded:
+                self.image_label.update()       # its handles
+                self.status.showMessage("🌈 Line drawn — drag its nodes, or click one and pick a colour · "
+                                        "Ctrl+click a node starts the next line there", 5000)
+            else:
+                self.status.showMessage(f"Line drawn from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f})")
 
     def _clear_line_preview(self):
         """Drop the free-line live-preview snapshot and geometry."""
@@ -14635,12 +15328,15 @@ class RandomImageViewer(QMainWindow):
         if hasattr(self, 'line_preview_timer'):
             self.line_preview_timer.stop()
         self._line_preview_pending_pos = None
+        if self.__dict__.get('_gpu_display'):
+            self._live_update(None)         # 🎮 the rubber band off the canvas
 
     def update_free_line_preview(self, label_pos):
         """Render a live rubber-band preview from the first click to the current
         pen position. Throttled to ~60 FPS so the tablet's high event rate can't
         saturate the UI thread."""
-        if self.current_line_start is None or self._line_preview_base is None:
+        if self.current_line_start is None or (self._line_preview_base is None
+                                               and not self.__dict__.get('_gpu_display')):
             return
         self._line_preview_pending_pos = (label_pos.x(), label_pos.y())
         if not self.line_preview_timer.isActive():
@@ -14648,8 +15344,12 @@ class RandomImageViewer(QMainWindow):
 
     def _flush_line_preview(self):
         """Composite the pending free-line preview onto the snapshot and show it."""
-        if (self.current_line_start is None or self._line_preview_base is None
-                or self._line_preview_pending_pos is None):
+        if self.current_line_start is None or self._line_preview_pending_pos is None:
+            return
+        if self.__dict__.get('_gpu_display'):
+            self._live_update(None)         # 🎮 drawn over the canvas (_gpu_tool_overlay)
+            return
+        if self._line_preview_base is None:
             return
         geom = self._line_preview_geom
         if not geom:
@@ -14668,8 +15368,20 @@ class RandomImageViewer(QMainWindow):
         painter.setRenderHint(QPainter.Antialiasing, True)
         pen_color = self._mark_color()
         pen_color.setAlpha(self.line_transparency)
-        painter.setPen(QPen(pen_color, self.line_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.drawLine(int(start_dx), int(start_dy), int(end_x), int(end_y))
+        if self._line_shows_band():
+            painter.setPen(QPen(self._star_band_colour(), self.line_thickness, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(int(start_dx), int(start_dy), int(end_x), int(end_y))
+            if self._brush_mode_for_marks() is not None:
+                self.image_label.paint_dashes(
+                    painter, [QPointF(start_dx, start_dy), QPointF(end_x, end_y)])
+        elif self._line_gets_gradient():
+            base = QColor(self.line_color)
+            base.setAlpha(self.line_transparency)
+            self._line_preview(base, self.line_thickness, free=True)(
+                painter, [(start_dx, start_dy), (end_x, end_y)])
+        else:
+            painter.setPen(QPen(pen_color, self.line_thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawLine(int(start_dx), int(start_dy), int(end_x), int(end_y))
         painter.end()
         self.image_label.setPixmap(preview)
 
@@ -15283,6 +15995,8 @@ class RandomImageViewer(QMainWindow):
         History, Spray, the plain canvas."""
         if (not self.__dict__.get('_gpu_display') or image is None or history or mode != 'paint'
                 or not self._stamp_trail.settings['flat'] or texture is None
+                # (speckled all along: the CPU's FlatStroke lays that)
+                or self._stamp_trail.speckled
                 or getattr(texture, 'procedural', False) or self.__dict__.get('_gpu_flat_failed')):
             return None
         try:
@@ -15805,14 +16519,37 @@ class RandomImageViewer(QMainWindow):
         # both or it is overwritten before it can be read.
         QTimer.singleShot(150, lambda: self.status.showMessage(
             "Wheel zooms while something is drawn (and in \u25e7 Studio) \u2014 "
-            "\u2190 \u2192 change image, but that clears the drawing: \U0001f4be save it first",
+            "\u2190 \u2192 change image - the drawing is kept and comes back with its picture",
             5000))
 
-    def clear_lines(self):
+    def clear_lines(self, keep=True):
+        """The drawing off the screen - when another picture (or page) comes.
+
+        *keep*: a picture's painting is not thrown away when going to the
+        next one - its layers are kept, as they are (undo, redo, ◧ Studio
+        canvas and all), and come back with the picture (see
+        _give_back_painting). An hour of painting went to one press of →
+        and ← did not bring it back. 🗑 (keep=False) really clears."""
         self._wheel_nav_hint_shown = False
         self.cancel_fill()
         self._drop_selection()          # its marks go with the rest
         self._transform_undo = {}
+        if not keep:
+            self.__dict__.get('_kept_paintings', {}).pop(self.current_image, None)
+        elif self._keep_painting():
+            # (the picture left is not drawn again without it: the next
+            # one is shown right after, and drawing this one would give
+            # its painting straight back)
+            self.current_erase_stroke = None
+            self.is_erasing = False
+            self.current_line_start = None
+            self.current_stroke = None
+            self.is_drawing = False
+            if hasattr(self, '_lut_process_cache'):
+                self._lut_process_cache.clear()
+            self.enhancement_cache.clear()
+            self.scaled_cache.clear()
+            return
         # Every layer's marks; the layers themselves stay for the next picture.
         for layer in self.layers:
             layer.clear()
@@ -15837,9 +16574,80 @@ class RandomImageViewer(QMainWindow):
         # Clear enhancement cache to force full redraw
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
-        if self.current_image:
+        # (a picture whose painting was just put aside is not drawn again:
+        # that would give it straight back - navigation clears twice)
+        if self.current_image and self.current_image not in self.__dict__.get('_kept_paintings', {}):
             # Force full display_image to ensure changes are visible
             self.display_image(self.current_image)
+
+    def _keep_painting(self):
+        """Going to another picture: the painting on this one put aside -
+        its layers whole, fresh empty ones (same names, blend, opacity ...)
+        in their place for the next. True when there was one to keep.
+        Not for PDF / book / comic pages (one path, many pages)."""
+        path = self.current_image
+        if (not path or any(getattr(self, a, None) for a in ('_pdf_doc', '_epub_doc', '_cbr_doc'))
+                or not any(layer.has_content() for layer in self.layers)):
+            return False
+        base = self.pixmap_cache.get(path)
+        kept = self.__dict__.setdefault('_kept_paintings', {})
+        kept[path] = {
+            'layers': self.layers,
+            'active': self.layers.index(self.active_layer),
+            'layer_count': self._layer_count,
+            'under': self.under_canvas, 'under_visible': self.under_canvas_visible,
+            'hid_picture': bool(getattr(self, '_sketch_hid_picture', False)),
+            'studio': bool(self.studio_mode),
+            'dx': self._studio_offset(base) if base is not None and not base.isNull() else 0,
+        }
+        fresh = []
+        for layer in self.layers:
+            new = Layer(layer.name)
+            new.tag, new.visible, new.opacity = layer.tag, layer.visible, layer.opacity
+            new.blend, new.effects, new.impasto = layer.blend, layer.effects, layer.impasto
+            fresh.append(new)
+        self.layers = fresh
+        self._bind_layer(fresh[kept[path]['active']])
+        # the canvas under the picture stays with its painting; a picture
+        # the sketch hid comes back
+        self.under_canvas = None
+        if getattr(self, '_sketch_hid_picture', False):
+            self._sketch_hid_picture = False
+            self.image_visible = True
+            btn = getattr(self, 'toggle_image_btn', None)
+            if btn is not None:
+                btn.blockSignals(True); btn.setChecked(True); btn.blockSignals(False)
+        self._refresh_layer_window()
+        return True
+
+    def _give_back_painting(self, path):
+        """Back on a picture whose painting was put aside: it is on again,
+        as it was left (see _keep_painting)."""
+        kept = self.__dict__.get('_kept_paintings', {}).pop(path, None)
+        if kept is None:
+            return False
+        self.layers = kept['layers']
+        self._layer_count = max(self._layer_count, kept['layer_count'])
+        self._bind_layer(self.layers[max(0, min(kept['active'], len(self.layers) - 1))])
+        self.under_canvas = kept['under']
+        self.under_canvas_visible = kept['under_visible']
+        if kept['hid_picture'] and self.image_visible:
+            self._sketch_hid_picture = True
+            self.image_visible = False
+            btn = getattr(self, 'toggle_image_btn', None)
+            if btn is not None:
+                btn.blockSignals(True); btn.setChecked(False); btn.blockSignals(False)
+        # left in ◧ Studio and back without it (or the other way): the marks
+        # move with the picture on the sheet, as switching Studio moves them
+        if kept['studio'] != bool(self.studio_mode) and kept['dx']:
+            self._shift_marks(kept['dx'] if self.studio_mode else -kept['dx'])
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        self._invalidate_line_caches()
+        self._refresh_layer_window()
+        QTimer.singleShot(0, lambda: self.status.showMessage(
+            "✎ Your painting on this picture is back (kept when you went to another)", 5000))
+        return True
 
     def undo_last_line(self):
         """Remove the most recently added annotation in chronological order."""
@@ -16054,12 +16862,14 @@ class RandomImageViewer(QMainWindow):
             self._paint_point_grid(painter, self.cross_grid_spacing(), self.cross_grid_colour(),
                                    self.cross_grid_size())
 
-    def _paint_point_grid(self, painter, spacing, colour, cross_px):
+    def _paint_point_grid(self, painter, spacing, colour, cross_px, pixel_ratio=None):
         """Points every *spacing* picture px over the sheet (so they stay on
         it as it zooms, pans and turns): a single screen pixel each, or a
         cross *cross_px* real screen pixels wide, 1 px thin. Every 2nd, 4th
         ... when they would come closer than _DOT_GRID_MIN_PX (crosses: their
-        size + a gap) - never a haze. Snapped to whole device pixels: crisp."""
+        size + a gap) - never a haze. Snapped to whole device pixels: crisp.
+        *pixel_ratio*: the painter's, when it is not the screen (the view as
+        saved): snapped to its pixels, the same points as on screen."""
         to_screen = self._fill_screen_mapper()
         if to_screen is None:
             return
@@ -16080,6 +16890,8 @@ class RandomImageViewer(QMainWindow):
         least = max(self._DOT_GRID_MIN_PX, (cross_px + 4) / dpr if cross_px else 0)
         while step * per < least and step < max(uw, uh):
             step *= 2
+        if pixel_ratio:
+            dpr = float(pixel_ratio)
         import numpy as np
         # ◧ In Studio each side its own grid from its own left edge - the
         # canvas's from 0, the picture's from where it starts - so the n-th
@@ -16116,15 +16928,10 @@ class RandomImageViewer(QMainWindow):
         cx = np.round(sx * dpr).astype(np.int64)       # the centre pixel, device px
         cy = np.round(sy * dpr).astype(np.int64)
         u = 1.0 / dpr
-        half = cross_px // 2
-        rects = []
-        for x, y in zip(cx.tolist(), cy.tolist()):
-            if cross_px:
-                rects.append(QRectF((x - half) * u, y * u, (2 * half + 1) * u, u))
-                rects.append(QRectF(x * u, (y - half) * u, u, half * u))           # arm above
-                rects.append(QRectF(x * u, (y + 1) * u, u, half * u))              # arm below
-            else:
-                rects.append(QRectF(x * u, y * u, u, u))
+        if cross_px:
+            rects = self._cross_rects(cx.tolist(), cy.tolist(), cross_px // 2, u)
+        else:
+            rects = [QRectF(x * u, y * u, u, u) for x, y in zip(cx.tolist(), cy.tolist())]
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.setPen(Qt.NoPen)
@@ -16132,13 +16939,78 @@ class RandomImageViewer(QMainWindow):
         painter.drawRects(rects)
         painter.restore()
 
+    @staticmethod
+    def _cross_rects(xs, ys, half, u=1.0, thick=1):
+        """Crosses with their centres' first pixel at (xs, ys), *thick* wide,
+        arms *half* times that: rectangles that do not overlap (a see-through
+        colour stays even), in pixels times *u*."""
+        arm = half * thick
+        rects = []
+        for x, y in zip(xs, ys):
+            rects.append(QRectF((x - arm) * u, y * u, (2 * arm + thick) * u, thick * u))
+            rects.append(QRectF(x * u, (y - arm) * u, thick * u, arm * u))          # arm above
+            rects.append(QRectF(x * u, (y + thick) * u, thick * u, arm * u))        # arm below
+        return rects
+
+    def _crosses_exported(self):
+        """✛ shows, so what is saved or copied has it too."""
+        return bool(self.current_image and self.cross_grid and getattr(self, 'lines_visible', True))
+
+    def _export_crosses(self, image, rect, k):
+        """The ✛ crosses onto *image* (*rect* of the sheet at *k* times, see
+        _render_sheet_part): the set spacing in picture px, each side of
+        ◧ Studio from its own corner as on screen, and - like the pens there
+        - size and thickness times *k*."""
+        if not self._crosses_exported():
+            return
+        import numpy as np
+        size = self.cross_grid_size()
+        step = float(self.cross_grid_spacing())
+        while step < size + 4:              # (never run into each other)
+            step *= 2
+        parts = self._export_parts()
+        regions = [parts['painting'], parts['picture']] if self.studio_mode else [parts['picture']]
+        thick = max(1, int(round(k)))
+        xs, ys = [], []
+        for r in regions:
+            if not r.intersects(rect):
+                continue
+            mx, my = np.meshgrid(r.x() + np.arange(0.0, r.width() + 0.5, step),
+                                 r.y() + np.arange(0.0, r.height() + 0.5, step))
+            xs += (np.round((mx.ravel() - rect.x()) * k).astype(np.int64) - thick // 2).tolist()
+            ys += (np.round((my.ravel() - rect.y()) * k).astype(np.int64) - thick // 2).tolist()
+        if not xs:
+            return
+        p = QPainter(image)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.cross_grid_colour())
+        p.drawRects(self._cross_rects(xs, ys, size // 2, 1.0, thick))
+        p.end()
+
+    def _view_with_crosses(self, pixmap):
+        """*pixmap* (the view's frame) with the ✛ crosses as they show."""
+        if not self._crosses_exported():
+            return pixmap
+        out = pixmap.copy()
+        ratio = out.devicePixelRatio() or 1.0
+        label = self.image_label
+        p = QPainter(out)
+        # (they are placed on the label; the frame lies centred in it)
+        p.translate(-max(0, (label.width() - out.width()) // 2),
+                    -max(0, (label.height() - out.height()) // 2))
+        self._paint_point_grid(p, self.cross_grid_spacing(), self.cross_grid_colour(),
+                               self.cross_grid_size(), pixel_ratio=ratio)
+        p.end()
+        return out
+
     # -- ✛ cross grid ------------------------------------------------------
     #
     # Small crosses at a fixed spacing in picture pixels (Density), each a
     # set size in real screen pixels (Cross size, 5 by default) and 1 px thin,
     # in a colour of your own: a guide over the view, as the dot grid - never
-    # part of the painting nor of what is saved. Its own button beside the
-    # grids; right-click it for density, size and colour.
+    # part of the painting. While it shows it does go into what is saved or
+    # copied (see _export_crosses, _view_with_crosses). Its own button beside
+    # the grids; right-click it for density, size and colour.
 
     _CROSS_GRID_SPACINGS = (16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
     _CROSS_GRID_SIZES = (3, 5, 7, 9, 13)
@@ -16500,6 +17372,10 @@ class RandomImageViewer(QMainWindow):
             # drawn_horizontal_lines: a y position, which does not move
             for line in marks['drawn_free_lines']:
                 line['start'], line['end'] = moved(line['start']), moved(line['end'])
+            for mark in (*marks['drawn_free_lines'], *marks['drawn_fills']):
+                if mark.get('gradient'):        # 🌈 it runs where it ran on the mark
+                    g = mark['gradient']
+                    mark['gradient'] = dict(g, start=moved(g['start']), end=moved(g['end']))
             for stroke in marks['drawn_free_strokes']:
                 stroke[:] = [moved(p) for p in stroke]
                 if getattr(stroke, 'stamps', None):
@@ -16547,8 +17423,9 @@ class RandomImageViewer(QMainWindow):
 
         It stays on from picture to picture. A drawing already on the picture
         keeps its place on it; switching Studio off hides what was painted
-        on the canvas (moving to another picture clears it, as always) and
-        switching it back on shows it again.
+        on the canvas and switching it back on shows it again. Moving to
+        another picture puts the painting aside; it comes back with its
+        picture (see _keep_painting).
         """
         on = bool(on)
         btn = getattr(self, 'studio_btn', None)
@@ -16981,6 +17858,7 @@ class RandomImageViewer(QMainWindow):
                     sheet=part != 'painting')
             finally:
                 self._export_tick = self._export_picture_done = None
+            self._export_crosses(image, rect, k)        # ✛ while they show
             stem = os.path.splitext(os.path.basename(self.current_image))[0]
             name = {'painting': 'painting', 'picture': 'sketch' if self._is_sketch() else 'picture',
                     'both': 'studio'}[part]
@@ -17039,7 +17917,9 @@ class RandomImageViewer(QMainWindow):
         busy = getattr(self, '_busy_line', None)
         size = f"{rect.width() * k} × {rect.height() * k}"
         with_picture = self.image_visible and not self._is_sketch()
-        jobs = (['picture'] if with_picture else []) + layers
+        # (✛ the crosses, while they show: a PNG of their own on top)
+        jobs = ((['picture'] if with_picture else []) + layers
+                + (['crosses'] if self._crosses_exported() else []))
         working = self._working(f"\U0001F4BE Saving {len(jobs)} layers, {size} px")
         card = working.__enter__()
 
@@ -17066,6 +17946,12 @@ class RandomImageViewer(QMainWindow):
                     finally:
                         for layer, was in zip(self.layers, shown):
                             layer.visible = was
+                elif job == 'crosses':
+                    what, name = "cross grid", "cross_grid"
+                    progress(share[0], what)
+                    image = QImage(rect.width() * k, rect.height() * k, QImage.Format_ARGB32_Premultiplied)
+                    image.fill(Qt.transparent)
+                    self._export_crosses(image, rect, k)
                 else:
                     what = name = job.name
                     for layer in self.layers:
@@ -17176,6 +18062,9 @@ class RandomImageViewer(QMainWindow):
             menu.addSeparator()
             note = menu.addAction("Parts are laid again at that size, upright, without effects")
             note.setEnabled(False)
+        if self._crosses_exported():
+            note = menu.addAction("✛ The crosses are saved too - switch ✛ off to save without them")
+            note.setEnabled(False)
         btn = getattr(self, 'save_btn', None)
         menu.exec(at if at is not None else btn.mapToGlobal(btn.rect().bottomLeft()))
 
@@ -17206,6 +18095,7 @@ class RandomImageViewer(QMainWindow):
                     return
                 final_pixmap = self.image_label.pixmap().copy()
 
+            final_pixmap = self._view_with_crosses(final_pixmap)    # ✛ while they show
             # Auto-save to the Downloads folder with a unique name (no dialog)
             if self.current_image:
                 base = os.path.splitext(os.path.basename(self.current_image))[0]
@@ -19770,7 +20660,8 @@ class RandomImageViewer(QMainWindow):
                                                                               k * self._HEIGHT_SCALE)}
                     else:
                         note.pop('impasto', None)
-                items.append((source, to_picture * to_view, layer.opacity / 100.0, mode, note))
+                shown = self._pixel_exact(to_picture * to_view, canvas.width(), canvas.height())
+                items.append((source, shown, layer.opacity / 100.0, mode, note))
         notes = (self.__dict__.get('_canvas_notes') or {}).get(target)
         if notes:
             for serial in [s_ for s_ in notes if s_ not in seen]:
@@ -19901,17 +20792,22 @@ class RandomImageViewer(QMainWindow):
                 or (os.environ.get('OVA_GPU_CANVAS') != '1'       # (tests: on without touching the settings)
                     and str(self._settings.value("gpu_canvas_experimental", "true")).lower() in ("false", "0"))):
             return False
-        if not (self.has_marks() or getattr(self, 'free_draw_mode', False)):
+        if not (self.has_marks() or getattr(self, 'free_draw_mode', False)
+                or getattr(self, 'fill_mode', None) or getattr(self, 'line_drawing_mode', False)
+                or getattr(self, 'horizontal_line_drawing_mode', False)
+                or getattr(self, 'free_line_drawing_mode', False)):
             return False
         path = self.current_image
         if (is_video_file(path) or is_audio_file(path) or getattr(self, '_video_playing', False)
                 or (is_animated_image(path) and not getattr(self, '_gif_static_fallback', False))
                 or self.image_label.is_animation_active()):
             return False        # (they play on the plain canvas)
+        # (Line and shape tools show their previews there too - see
+        # _gpu_tool_overlay. Sent to the plain canvas, the whole view went
+        # down to the window's resolution while one was in hand: at 150 %
+        # every fine line and star 1.5x stretched and soft.)
         if (self._fx_layers_on() or getattr(self, 'crop_mode', False) or getattr(self, 'select_mode', False)
-                or getattr(self, 'fill_mode', None) or getattr(self, 'line_drawing_mode', False)
-                or getattr(self, 'horizontal_line_drawing_mode', False)
-                or getattr(self, 'free_line_drawing_mode', False) or getattr(self, 'eraser_mode', False)
+                or getattr(self, 'eraser_mode', False)
                 or getattr(self, 'color_snap_mode', False) or self._sel is not None
                 or self.current_erase_stroke):
             return False
@@ -19920,6 +20816,35 @@ class RandomImageViewer(QMainWindow):
             return False        # 🧽 erasing the whole-redraw way: the label shows it as it goes
         gpu = self.__dict__.get('_gpu_canvas')
         return not (gpu is not None and gpu.failed)
+
+    def _gpu_tool_overlay(self, p, area=None):
+        """🎮 What a line or shape tool shows while it is used - the shape,
+        the rubber band, a gradient's handles - over the GPU canvas."""
+        label = self.image_label
+        p.save()
+        if area is not None:
+            p.setClipRect(area)     # (only that piece is redrawn: no piling up)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        start, to = self.current_line_start, self.__dict__.get('_line_preview_pending_pos')
+        if start is not None and to is not None:
+            to_screen = self._fill_screen_mapper()
+            if to_screen is not None:
+                ends = [QPointF(to_screen(*start)), QPointF(*to)]
+                colour = QColor(self.line_color) if self._line_gets_gradient() else self._mark_color()
+                colour.setAlpha(self.line_transparency)
+                width = self._line_window_width(self.line_thickness)
+                if self._line_shows_band():
+                    p.setPen(QPen(self._star_band_colour(), width, Qt.SolidLine, Qt.RoundCap))
+                    p.drawLine(*ends)
+                    if self._brush_mode_for_marks() is not None:
+                        label.paint_dashes(p, ends)
+                elif self._line_gets_gradient():
+                    self._line_preview(colour, width, free=True)(p, ends)
+                else:
+                    p.setPen(QPen(colour, width, Qt.SolidLine, Qt.SquareCap))
+                    p.drawLine(*self._hairline_points(p, ends, width))
+        label.paint_tool_overlay(p)
+        p.restore()
 
     def _gpu_display_frame(self, img_path):
         """Show the view on the graphics card (see above). True when shown."""
@@ -20144,12 +21069,7 @@ class RandomImageViewer(QMainWindow):
                                           tx['zoomed_width'], tx['zoomed_height'])
                 p.restore()
         self.paint_dot_grid(p)               # ∴ the dot grid, over it all
-        guide = self._grad_edit_guide()      # 🌈 the last gradient's handles
-        if guide:
-            p.save()
-            p.setRenderHint(QPainter.Antialiasing, True)
-            label._paint_fill_guide(p, guide)
-            p.restore()
+        self._gpu_tool_overlay(p, area)      # a line / shape being placed, 🌈 handles
 
     def _hide_gpu_view(self):
         """The plain canvas shows again: drawn now, on screen, and the GPU
@@ -20815,7 +21735,7 @@ class RandomImageViewer(QMainWindow):
             if current_pixmap and not current_pixmap.isNull():
                 # Copy to clipboard
                 clipboard = QApplication.clipboard()
-                clipboard.setPixmap(current_pixmap)
+                clipboard.setPixmap(self._view_with_crosses(current_pixmap))        # ✛ while they show
                 
                 # Show confirmation message
                 filename = os.path.basename(self.current_image)
@@ -21234,10 +22154,16 @@ class RandomImageViewer(QMainWindow):
             label = getattr(self, 'startup_label', None)
             if label is not None:
                 version = get_version()
-                label.setText(f"v{version} \u00b7 {seconds:.2f}s")
+                # The build's date and time, not the commit hash: which exe
+                # this is, at a glance (the full version is in the tooltip).
+                built = get_build_time()
+                when = (f"{built.day}.{built.month}.{built.year} {built:%H:%M}" if built
+                        else "source")
+                label.setText(f"v{short_version(version)} \u00b7 {when} \u00b7 {seconds:.2f}s")
                 label.setToolTip(
                     f"Ova Viewer {version}\n"
-                    f"Ready in {seconds:.2f} s (from {source} to interactive)\n"
+                    + (f"Built {built:%d.%m.%Y %H:%M:%S}\n" if built else "")
+                    + f"Ready in {seconds:.2f} s (from {source} to interactive)\n"
                     f"Python {sys.version.split()[0]} \u00b7 Qt {qVersion()}\n"
                     f"{'Frozen build' if getattr(sys, 'frozen', False) else 'Running from source'}")
             print(f"Startup: ready in {seconds:.2f}s (from {source})")

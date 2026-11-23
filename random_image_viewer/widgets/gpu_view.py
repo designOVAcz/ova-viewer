@@ -17,7 +17,7 @@ on the canvas are drawn over it as they look (grabbed once per zoom).
 
 import math
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QSize, QEvent, QPoint, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QRegion
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget
@@ -307,7 +307,10 @@ class GpuView(QOpenGLWidget):
                 x0, y0 = math.floor(area.x() * dpr), math.floor(area.y() * dpr)
                 x1 = math.ceil((area.x() + area.width()) * dpr)
                 y1 = math.ceil((area.y() + area.height()) * dpr)
-                self._area_dev = QRect(x0, y0, x1 - x0, y1 - y0)
+                # (the GL side inside the canvas: a blend copies what is under
+                # that rectangle, and one reaching past it copies nothing)
+                dw, dh = self._device_size(self.width(), self.height(), dpr)
+                self._area_dev = QRect(x0, y0, x1 - x0, y1 - y0).intersected(QRect(0, 0, dw, dh))
                 area = QRectF(x0 / dpr, y0 / dpr, (x1 - x0) / dpr, (y1 - y0) / dpr)
                 p.setClipRect(area)
             p.fillRect(self.rect(), self._background)
@@ -481,6 +484,26 @@ class GpuView(QOpenGLWidget):
             print(f"🎮 GPU stroke not drawn: {e}")
             return False
 
+    @staticmethod
+    def _device_size(W, H, dpr):
+        """The canvas in real pixels, as Qt sizes what is drawn into: half a
+        pixel rounds up. Never round() - it goes to the even number, so at
+        150 % every other odd height came out a row short (1011 high: 1516,
+        not 1517): the scissor a row off QPainter's clip, and each piece
+        redrawn while painting left one row of bare sheet - a line."""
+        size = QSize(W, H) * dpr
+        return size.width(), size.height()
+
+    @staticmethod
+    def _clip_space(W, H, dpr):
+        """Canvas coords -> clip space of the viewport, which is whole real
+        pixels: 1329 high at 150 % is 1994 of them, not 1993.5 - taken as
+        that, every texture was stretched half a pixel down the window, and
+        a layer shown 1:1 had its rows between two."""
+        from PySide6.QtGui import QTransform
+        dw, dh = GpuView._device_size(W, H, dpr)
+        return QTransform(2.0 * dpr / dw, 0, 0, -2.0 * dpr / dh, -1.0, 1.0)
+
     def _blit(self, texture_id, w, h, transform, opacity, area):
         """Texture *texture_id* (w x h, row 0 = top, premultiplied) through
         *transform* (texture px -> canvas coords) at *opacity*, clipped to
@@ -497,17 +520,18 @@ class GpuView(QOpenGLWidget):
                 f = self.context().functions()
                 dpr = self.devicePixelRatioF()
                 W, H = self.width(), self.height()
-                f.glViewport(0, 0, int(round(W * dpr)), int(round(H * dpr)))
+                dw, dh = self._device_size(W, H, dpr)
+                f.glViewport(0, 0, dw, dh)
                 if area is not None:
                     dev = getattr(self, '_area_dev', None)
                     if dev is None:
                         dev = QRect(math.floor(area.x() * dpr), math.floor(area.y() * dpr),
                                     math.ceil(area.width() * dpr), math.ceil(area.height() * dpr))
                     f.glEnable(GL_SCISSOR_TEST)
-                    f.glScissor(dev.x(), int(round(H * dpr)) - dev.y() - dev.height(), dev.width(), dev.height())
+                    f.glScissor(dev.x(), dh - dev.y() - dev.height(), dev.width(), dev.height())
                 # The blitter's quad (-1..1) -> image px -> canvas -> clip space.
                 quad = QTransform(w / 2.0, 0, 0, h / 2.0, w / 2.0, h / 2.0)
-                clip = QTransform(2.0 / W, 0, 0, -2.0 / H, -1.0, 1.0)
+                clip = self._clip_space(W, H, dpr)
                 matrix = QMatrix4x4(quad * transform * clip)
                 f.glEnable(GL_BLEND)
                 # Premultiplied, at the layer's opacity: colour * opacity
@@ -742,10 +766,10 @@ class GpuView(QOpenGLWidget):
                 f = self.context().functions()
                 dpr = self.devicePixelRatioF()
                 W, H = self.width(), self.height()
-                f.glViewport(0, 0, int(round(W * dpr)), int(round(H * dpr)))
+                dw, dh = self._device_size(W, H, dpr)
+                f.glViewport(0, 0, dw, dh)
                 dev = getattr(self, '_area_dev', None) if area is not None else None
                 if dev is not None:
-                    dh = int(round(H * dpr))
                     f.glEnable(GL_SCISSOR_TEST)
                     f.glScissor(dev.x(), dh - dev.y() - dev.height(), dev.width(), dev.height())
                 f.glEnable(GL_BLEND)
@@ -755,7 +779,7 @@ class GpuView(QOpenGLWidget):
                 f.glActiveTexture(GL_TEXTURE0)
                 f.glBindTexture(GL_TEXTURE_2D, tex.textureId())
                 quad = QTransform(image.width(), 0, 0, image.height(), 0, 0)
-                clip = QTransform(2.0 / W, 0, 0, -2.0 / H, -1.0, 1.0)
+                clip = self._clip_space(W, H, dpr)
                 prog.bind()
                 prog.setUniformValue("matrix", QMatrix4x4(quad * transform * clip))
                 prog.setUniformValue1i("colour", 0)
@@ -872,7 +896,7 @@ class GpuView(QOpenGLWidget):
                 f = self.context().functions()
                 dpr = self.devicePixelRatioF()
                 W, H = self.width(), self.height()
-                dw, dh = int(round(W * dpr)), int(round(H * dpr))
+                dw, dh = self._device_size(W, H, dpr)
                 # What is drawn so far, as a texture (the part being drawn).
                 dst = getattr(self, '_blend_dst', None)
                 if dst is None or (dst.width(), dst.height()) != (dw, dh):
@@ -900,7 +924,7 @@ class GpuView(QOpenGLWidget):
                 f.glDisable(GL_BLEND)           # the shader writes the result itself
                 # unit quad -> image px -> canvas -> clip space
                 quad = QTransform(image.width(), 0, 0, image.height(), 0, 0)
-                clip = QTransform(2.0 / W, 0, 0, -2.0 / H, -1.0, 1.0)
+                clip = self._clip_space(W, H, dpr)
                 prog.bind()
                 prog.setUniformValue("matrix", QMatrix4x4(quad * transform * clip))
                 prog.setUniformValue1i("src", 0)
@@ -1004,6 +1028,8 @@ class GpuCanvasWindow(QOpenGLWindow):
     _impasto_program = GpuView._impasto_program
     _draw_impasto = GpuView._draw_impasto
     _sharp_filter = GpuView._sharp_filter
+    _clip_space = staticmethod(GpuView._clip_space)
+    _device_size = staticmethod(GpuView._device_size)
     _MIP_BELOW = GpuView._MIP_BELOW
     _keep = GpuView._keep
     ready_for = GpuView.ready_for

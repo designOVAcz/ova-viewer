@@ -10,6 +10,13 @@ from random_image_viewer.constants import (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, M
                                            PLAYLIST_EXTENSIONS, ANIMATED_EXTENSIONS,
                                            AUDIO_EXTENSIONS)
 
+# JPEG XL through Pillow (see jxl_plugin): every Pillow fallback reads .jxl
+try:
+    from random_image_viewer import jxl_plugin as _jxl
+    _jxl.register()
+except Exception as _e:         # (no Pillow: the fallbacks say so themselves)
+    print(f"JPEG XL support off: {_e}")
+
 
 def is_animated_image(file_path):
     """Check if a file is an animation (a GIF or WebP with several frames)."""

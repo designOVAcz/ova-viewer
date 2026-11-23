@@ -39,7 +39,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('icon.png', '.'), ('icon.ico', '.'), ('ova_viewer.png', '.')],
-    hiddenimports=['random_image_viewer._version', 'PySide6.QtWebSockets'],
+    hiddenimports=['random_image_viewer._version', 'PySide6.QtWebSockets',
+                   # JPEG XL: imagecodecs loads its codec modules by name
+                   'imagecodecs._jpegxl', 'imagecodecs._shared'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

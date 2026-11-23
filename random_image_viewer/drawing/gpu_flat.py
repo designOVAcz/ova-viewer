@@ -67,7 +67,7 @@ GL_DRAW_FRAMEBUFFER = 0x8CA9
 ATLAS_SIZE = 4096       # the R8 atlas of tip / motion-frame masks and index maps
 PALETTE_W = 64          # colours a palette row holds (STREAKS is 32)
 PALETTE_ROWS = 1024
-STRIDE = 28             # floats an instance
+STRIDE = 32             # floats an instance
 
 _FLAT_VERT = """
 #version 330 core
@@ -78,8 +78,10 @@ layout(location = 3) in vec4 anchor;    // image u, v at device point (x, y)
 layout(location = 4) in vec4 src;       // the mask in the atlas: x, y, w, h
 layout(location = 5) in vec4 idx;       // index map in the atlas: x, y, w, h (w = 0: none)
 layout(location = 6) in vec4 params;    // grey alpha, colour alpha, palette row, weight bits
+layout(location = 7) in vec4 taper;     // body piece: width at its start, end (share of the widest)
 uniform vec2 target;
 uniform vec2 origin;
+flat out vec2 vTaper;
 flat out vec4 vInv;
 flat out vec4 vAnchor;
 flat out ivec4 vSrc;
@@ -89,6 +91,7 @@ void main() {
     vec2 p = gl_VertexID == 0 ? c01.xy : gl_VertexID == 1 ? c01.zw : gl_VertexID == 2 ? c23.xy : c23.zw;
     gl_Position = vec4((p - origin) / target * 2.0 - 1.0, 0.0, 1.0);
     vInv = inv;
+    vTaper = taper.xy;
     vAnchor = anchor;
     vSrc = ivec4(src + 0.5);
     vIdx = ivec4(idx + 0.5);
@@ -98,6 +101,7 @@ void main() {
 
 _FLAT_FRAG = """
 #version 330 core
+flat in vec2 vTaper;
 flat in vec4 vInv;
 flat in vec4 vAnchor;
 flat in ivec4 vSrc;
@@ -130,6 +134,15 @@ ivec4 texel(ivec2 t) {
 void main() {
     vec2 rel = gl_FragCoord.xy + origin - vAnchor.zw;
     vec2 uv = vAnchor.xy + vec2(vInv.x * rel.x + vInv.z * rel.y, vInv.y * rel.x + vInv.w * rel.y);
+    if (vTaper.x != 1.0 || vTaper.y != 1.0) {
+        // a body piece narrowing / widening along its way (a trapezoid, as
+        // FlatStroke's quadToQuad): the profile squeezed across to the width here
+        float r = mix(vTaper.x, vTaper.y, clamp(uv.x / float(vSrc.z), 0.0, 1.0));
+        if (r <= 0.0)
+            discard;
+        float mid = float(vSrc.w) * 0.5;
+        uv.y = (uv.y - mid) / r + mid;
+    }
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= float(vSrc.z) || uv.y >= float(vSrc.w))
         discard;
     int bits = vParams.w;
@@ -223,6 +236,7 @@ def _qt_alpha(opacity):
 BODY_ALPHA = _qt_alpha(0.35)    # brushes.FlatStroke.BODY_COLOUR_MIX
 _GREY_ALPHA = [255 if s >= OPACITY_STEPS else _qt_alpha(s / OPACITY_STEPS)
                for s in range(OPACITY_STEPS + 1)]
+BODY_STEPS = 255        # brushes.BODY_STEPS: the swept body's opacity, full 8-bit
 
 
 def _affine(m):
@@ -304,7 +318,7 @@ class _FlatKit:
         self._bytes = 256 * STRIDE * 4
         self.instances.allocate(self._bytes)
         p = self.program
-        for loc in range(7):
+        for loc in range(8):
             p.enableAttributeArray(loc)
             p.setAttributeBuffer(loc, GL_FLOAT, loc * 16, 4, STRIDE * 4)
             f.glVertexAttribDivisor(loc, 1)
@@ -806,7 +820,12 @@ class GpuFlatStroke:
         fwd = reach(end_cut) + px
         bx, by = sx - d[0] * back, sy - d[1] * back
         fx, fy = ex + d[0] * fwd, ey + d[1] * fwd
-        wd = piece['w1']
+        # a trapezoid from its start's width to its end's (FlatStroke.piece_widths):
+        # the strip at the widest, the shader squeezes the profile to each place's
+        from random_image_viewer.drawing.brushes import FlatStroke
+        wb, wf = FlatStroke.piece_widths(piece, back, fwd)
+        wd = max(wb, wf, 1e-6)
+        taper = (wb / wd, wf / wd)
         h = piece['fh']
         m = (fx - bx, fy - by, ax * wd / h, ay * wd / h, bx - ax * wd / 2, by - ay * wd / 2)
         side = half * 1.6 + px
@@ -830,7 +849,7 @@ class GpuFlatStroke:
         clip = [(v[0] * x + v[2] * y + v[4], v[1] * x + v[3] * y + v[5]) for x, y in (s0, e0, s1, e1)]
         level, turn, step, rgb, texture = piece['lay']
         sink.append((_mul(m, view), 1, h, texture, ('mf', level, turn, 'profile'),
-                     step, colour_alpha, ('frame', rgb), clip))
+                     step, colour_alpha, ('frame', rgb), clip, taper))
 
     def _lay_stamps(self, texture, stamps, view):
         v = _affine(view)
@@ -877,7 +896,10 @@ class GpuFlatStroke:
                     sink.append((_mul(m, v), frame['w'], frame['h'], texture, ('mf', level, tq, 'whole'),
                                  step, 255, ('frame-end', first[5]), None))
             for piece in pieces:
-                piece['lay'] = (level, int(round(piece['turn'] / fs) * fs) % 360, step, stamp[5], texture)
+                # the body at full 8-bit opacity (brushes.BODY_STEPS), as FlatStroke
+                fine = max(1, min(BODY_STEPS, round(stamp[4] * BODY_STEPS)))
+                piece['lay'] = (level, int(round(piece['turn'] / fs) * fs) % 360,
+                                ('alpha', _qt_alpha(fine / BODY_STEPS)), stamp[5], texture)
                 piece['view'] = (v, scale)
                 self._push_piece(piece, sink)
             if self._reach is not None:
@@ -981,7 +1003,8 @@ class GpuFlatStroke:
     def _instances(self, records):
         rows = []
         for rec in records:
-            m, w, h, texture, key, step, colour_alpha, spec, clip = rec
+            m, w, h, texture, key, step, colour_alpha, spec, clip = rec[:9]
+            taper = rec[9] if len(rec) > 9 else (1.0, 1.0)
             det = m[0] * m[3] - m[1] * m[2]
             if abs(det) < 1e-12:
                 continue
@@ -1006,7 +1029,9 @@ class GpuFlatStroke:
             ix, iy, iw, ih = ie if ie is not None else (0, 0, 0, 0)
             rows.append(c + (i11, i12, i21, i22, i11 * rx + i21 * ry, i12 * rx + i22 * ry, c0[0], c0[1],
                              sx, sy, w, h, ix, iy, iw, ih,
-                             _GREY_ALPHA[step], colour_alpha, row, bits))
+                             step[1] if isinstance(step, tuple) else _GREY_ALPHA[step],
+                             colour_alpha, row, bits,
+                             taper[0], taper[1], 0.0, 0.0))
         return np.array(rows, np.float32).reshape(-1, STRIDE)
 
     def _resolve(self, records):

@@ -324,7 +324,7 @@ def _save_raster(zf, viewer, layer, n):
     rect = raster['rect']
     out = _raw_image(zf, f"layers/{n:03d}.png", raster['image'])
     out.update({'rect': [float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height())],
-                'k': float(raster['k']),
+                'k': float(raster['k']), 'cut_exact': True,
                 'count': len(paint), 'patches': []})
     # the last few undos quick after opening (each is a piece of the image)
     for i, p in enumerate((getattr(layer, 'canvas_patches', None) or [])[-_PATCHES_SAVED:]):
@@ -393,7 +393,12 @@ def load_project(viewer, path, progress=None):
             layer.fill = QColor(entry['fill']) if entry.get('fill') else None
             for field in MARK_FIELDS:
                 layer.marks[field] = reader.dec(entry.get('marks', {}).get(field, []))
-            layer.saved_raster = _load_raster(zf, entry)      # taken by apply_project
+            # A layer image saved before pushes were composed exactly has
+            # their outlines baked in: such a layer is laid again instead.
+            stale = (not (entry.get('raster') or {}).get('cut_exact')
+                     and any(isinstance(m, dict) and m.get('cut') is not None
+                             for m in layer.marks['drawn_images']))
+            layer.saved_raster = None if stale else _load_raster(zf, entry)      # taken by apply_project
             layers.append(layer)
     progress(0.33, "painting the layers")
     viewer.apply_project(picture, manifest, layers, progress=progress)

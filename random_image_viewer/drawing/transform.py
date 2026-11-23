@@ -18,6 +18,14 @@ from PySide6.QtGui import QPolygonF, QTransform
 SELECTABLE = ('free_stroke', 'free_line', 'fill', 'image', 'erase')
 
 
+def _star_band(mark):
+    """How far to each side a line's ✨ stars reach (0: it has none)."""
+    stars = mark.get('stars') if isinstance(mark, dict) else None
+    if not stars or not stars.get('band'):
+        return 0.0
+    return stars['band'] / 2.0 + 6.0 * stars.get('speck', 1.0)
+
+
 def _xy(p):
     if isinstance(p, QPointF):
         return p.x(), p.y()
@@ -35,6 +43,10 @@ def mark_points(kind, mark):
             return [(s[0], s[1], s[2] * 0.75) for s in stamps]
         reach = (getattr(mark, 'thickness', None) or 1) / 2.0
         return [(*_xy(p), reach) for p in mark]
+    band = _star_band(mark) if kind in ('free_line', 'fill') else 0.0
+    if band:                        # ✨ stars along a line: as wide as they reach
+        ends = mark['points'] if 'points' in mark else (mark['start'], mark['end'])
+        return [(*_xy(p), band) for p in ends]
     if kind == 'free_line':
         reach = (mark.get('thickness') or 1) / 2.0
         return [(*_xy(mark['start']), reach), (*_xy(mark['end']), reach)]
@@ -157,13 +169,15 @@ def apply(marks, t):
             mark['points'] = [moved(p) for p in mark.get('points') or []]
             if mark.get('thickness'):
                 mark['thickness'] = max(1, mark['thickness'] * scale)
-        if kind == 'fill' and mark.get('gradient'):
+        if kind in ('free_line', 'fill') and mark.get('gradient'):
             grad = dict(mark['gradient'])       # (a new one: the undo snapshot keeps the old)
             grad['start'], grad['end'] = moved(grad['start'])[:2], moved(grad['end'])[:2]
             mark['gradient'] = grad
-        if kind == 'fill' and mark.get('stars'):
+        if kind in ('free_line', 'fill') and mark.get('stars'):
             stars = dict(mark['stars'])         # ✨ (a new one: the undo snapshot keeps the old)
             stars['speck'] = stars.get('speck', 1.0) * scale
+            if stars.get('band'):
+                stars['band'] = stars['band'] * scale
             mark['stars'] = stars
         if kind in ('free_line', 'fill') and mark.get('pic_width'):
             mark['pic_width'] = mark['pic_width'] * scale     # a painted line's width

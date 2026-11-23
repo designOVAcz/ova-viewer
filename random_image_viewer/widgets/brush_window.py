@@ -15,6 +15,7 @@ from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
 
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
+from random_image_viewer.widgets.title_drag import on_title_row
 
 SWATCH = 40
 
@@ -127,8 +128,9 @@ class BrushWindow(QWidget):
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("\U0001F58C Brush")
+        title = self._title_label = QLabel("\U0001F58C Brush")
         title.setCursor(Qt.SizeAllCursor)
+        title.setToolTip("Drag here to move the panel")
         header.addWidget(title, 1)
         reset_btn = QToolButton()
         reset_btn.setText("↺")
@@ -161,7 +163,10 @@ class BrushWindow(QWidget):
                               "with the colour under the pen where the stroke starts. Erase: the "
                               "brush rubs out what is drawn on this layer. Smear: drags the paint "
                               "under it into sharp streaks. Push: liquify - moves the paint "
-                              "under it along as a mass, Ice cracks it (keys 1-8)")
+                              "under it along as a mass, Ice cracks it (keys 1-8).\n"
+                              "Lines and shapes take the mode too: a line runs the brush along it, "
+                              "a shape is worked over inside its outline. For colour, gradient or "
+                              "star lines and shapes: Paint")
         self._mode.currentIndexChanged.connect(self._on_mode)
         mode_row.addWidget(self._mode, 1)
         inner.addLayout(mode_row)
@@ -347,15 +352,6 @@ class BrushWindow(QWidget):
         self._lines_paint.toggled.connect(lambda on: self._emit('lines_paint', on))
         inner.addWidget(self._lines_paint)
 
-        self._mode_marks = QCheckBox("Lines && shapes use this mode")
-        self._mode_marks.setToolTip(
-            "In a mode other than Paint (Blend, Smudge, Smear, Push, Erase ...): a straight line "
-            "or polyline runs this brush along it, and a lasso / polygon / rectangle / ellipse "
-            "runs it over the whole shape, kept inside it - e.g. a lasso in Blend softens just "
-            "that area, in Erase cuts it out")
-        self._mode_marks.toggled.connect(lambda on: self._emit('mode_marks', on))
-        inner.addWidget(self._mode_marks)
-
         # 🌈 the gradient tool (and shapes filled with a gradient)
         grad_row = QHBoxLayout()
         grad_row.setContentsMargins(0, 0, 0, 0)
@@ -409,16 +405,32 @@ class BrushWindow(QWidget):
             "radial from their middle out")
         self._shape_gradient.toggled.connect(lambda on: self._emit('shape_gradient', on))
         inner.addWidget(self._shape_gradient)
+        self._line_gradient = QCheckBox("Lines use the gradient")
+        self._line_gradient.setToolTip(
+            "Straight lines and polylines take the gradient above: linear runs along the line, "
+            "round its bends (a closed one there and back, no seam), radial from its middle out. "
+            "The nodes stay to drag, or click one and pick its colour. Ctrl+click on a node "
+            "starts the next line there instead. Not the ruler lines")
+        self._line_gradient.toggled.connect(lambda on: self._emit('line_gradient', on))
+        inner.addWidget(self._line_gradient)
 
         # ✨ starfield fills: shapes fill with tiny random specks
         self._shape_stars = QCheckBox("✨ Shapes fill with stars")
         self._shape_stars.setToolTip(
             "Lasso, polygon, rectangle, ellipse and triangle fill with a starfield: tiny random "
-            "specks of the pen colour - most the smallest size and faint, a few bigger and "
-            "brighter. Hue / Sat / Value ± above vary their colours. Drag a rectangle over "
+            "specks of the pen colour with depth - most the smallest, far and faint, some near "
+            "and bright, a few medium, big ones rare. Hue / Sat / Value ± above vary their colours. Drag a rectangle over "
             "the whole canvas to fill it in one go")
         self._shape_stars.toggled.connect(lambda on: self._emit('shape_stars', on))
         inner.addWidget(self._shape_stars)
+        self._line_stars = QCheckBox("✨ Lines paint stars")
+        self._line_stars.setToolTip(
+            "Straight lines and polylines lay a band of stars along their way, densest and "
+            "brightest in the middle (a Milky Way). Size is how wide the band is, kept apart "
+            "from the lines' own size. Stars, Star size and Hue / Sat / Value ± work as for "
+            "shapes. It wins over 'Lines use the gradient'")
+        self._line_stars.toggled.connect(lambda on: self._emit('line_stars', on))
+        inner.addWidget(self._line_stars)
         self._star_sliders = {}
         for key, label, (lo, hi), unit, tip in (
                 ('stars_amount', 'Stars', (1, 100), '',
@@ -566,7 +578,6 @@ class BrushWindow(QWidget):
         self._jitter_mode.setCurrentIndex(self._jitter_mode.findData(settings['jitter_per_stamp']))
         self._jitter_marks.setChecked(bool(settings.get('jitter_marks', False)))
         self._lines_paint.setChecked(bool(settings.get('lines_paint', True)))
-        self._mode_marks.setChecked(bool(settings.get('mode_marks', True)))
         self._gradient_kind.setCurrentIndex(max(0, self._gradient_kind.findData(settings.get('gradient', 'linear'))))
         to = settings.get('gradient_to') or ''
         if to:
@@ -575,7 +586,9 @@ class BrushWindow(QWidget):
         self._gradient_to.setCurrentIndex(1 if to else 0)
         self._gradient_swatch.setEnabled(bool(to))
         self._shape_gradient.setChecked(bool(settings.get('shape_gradient', False)))
+        self._line_gradient.setChecked(bool(settings.get('line_gradient', False)))
         self._shape_stars.setChecked(bool(settings.get('shape_stars', False)))
+        self._line_stars.setChecked(bool(settings.get('line_stars', False)))
         for key, (slider, value, unit) in self._star_sliders.items():
             v = int(settings.get(key, {'stars_amount': 40, 'stars_size': 1}[key]))
             slider.setValue(v)
@@ -587,6 +600,12 @@ class BrushWindow(QWidget):
         self._opacity_pressure.setChecked(settings['opacity_pressure'])
         self._quiet = False
         self._show_current(self._list.currentItem())
+
+    def _no_key_toggles(self):
+        """The tick boxes never take the keys: after a click on one, Space
+        flipped it again, unseen."""
+        for box in self.findChildren(QCheckBox):
+            box.setFocusPolicy(Qt.NoFocus)
 
     def _show_current(self, item):
         path = item.data(Qt.UserRole) if item is not None else ''
@@ -682,11 +701,17 @@ class BrushWindow(QWidget):
         else:
             self._emit_gradient_to()
 
+    def showEvent(self, event):
+        self._no_key_toggles()
+        super().showEvent(event)
+
     # ── drag by the header ────────────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # by the title row alone: a slider just missed moved the whole panel
+            self._drag_offset = (event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                                 if on_title_row(self, self._title_label, event) else None)
             self._dragged = False
             event.accept()
 

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
 from PySide6.QtCore import Qt, Signal
 
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
+from random_image_viewer.widgets.title_drag import on_title_row
 
 
 class CurvesWindow(QWidget):
@@ -253,7 +254,9 @@ class CurvesWindow(QWidget):
     # ───────────── dragging ─────────────
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # by the title row alone: a slider just missed moved the whole panel
+            self._drag_offset = (event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                                 if on_title_row(self, self._header, event) else None)
             event.accept()
         else:
             super().mousePressEvent(event)
