@@ -945,24 +945,107 @@ class RandomImageViewer(QMainWindow):
             painter.drawLine(cx, draw_y, cx, draw_y + zoomed_height)
             painter.drawLine(draw_x, cy, draw_x + zoomed_width, cy)
 
-        if self.grid_overlay:
-            painter.setPen(self._grid_pen or self._guide_pen())
-            # 3x3 grid: 2 vertical + 2 horizontal dividers
-            for i in (1, 2):
-                # Vertical line at i/3 of width
-                x = draw_x + (zoomed_width * i) // 3
-                painter.drawLine(x, draw_y, x, draw_y + zoomed_height)
-                # Horizontal line at i/3 of height
-                y = draw_y + (zoomed_height * i) // 3
-                painter.drawLine(draw_x, y, draw_x + zoomed_width, y)
+        if self._comp_grids:
+            from random_image_viewer.drawing import comp_grids
+            grids = list(self._comp_grids.items())
+            for rect in self._comp_grid_rects(draw_x, draw_y, zoomed_width, zoomed_height):
+                comp_grids.paint_grids(painter, rect, grids, opacity=self._comp_grid_opacity / 100.0)
+
+    def _comp_grid_rects(self, draw_x, draw_y, zoomed_width, zoomed_height):
+        """Where the ▦ grids go (display coords): the picture - in ◧ Studio
+        each half, the canvas and the picture, the same grid on both (the
+        study and its model measured alike)."""
+        from PySide6.QtCore import QRectF
+        whole = [QRectF(draw_x, draw_y, zoomed_width, zoomed_height)]
+        if not self.studio_mode or not self.current_image:
+            return whole
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return whole
+        offset = self._studio_offset(base)
+        sheet = offset + base.width()
+        if self.rotation_angle % 180 == 0:
+            k = zoomed_width / sheet
+            return [QRectF(draw_x, draw_y, base.width() * k, zoomed_height),
+                    QRectF(draw_x + offset * k, draw_y, base.width() * k, zoomed_height)]
+        k = zoomed_height / sheet           # turned a quarter: the halves one above the other
+        return [QRectF(draw_x, draw_y, zoomed_width, base.width() * k),
+                QRectF(draw_x, draw_y + offset * k, zoomed_width, base.width() * k)]
+
+    def _fixed_overlays_on(self):
+        """Something is laid over the finished view: crosshair, ▦ grids, or
+        ◧🔒 the clean reference."""
+        return bool(self.crosshair_overlay or self.grid_overlay or self._clean_reference_on())
+
+    def _clean_reference_on(self):
+        """◧🔒 Studio keeps the picture clean: effects, blends and anything
+        on a layer go to the canvas, the picture is shown as it is."""
+        path = self.current_image
+        return bool(self.studio_mode and getattr(self, 'studio_ref_clean', False) and path
+                    and self.image_visible and not is_video_file(path) and not is_animated_image(path)
+                    and getattr(self, '_pdf_doc', None) is None)
+
+    def _clean_reference_view(self):
+        """The plain Studio sheet fitted to the view exactly as the display
+        fits it (turned, scaled, placed - _scale_pixmap_now), no effects, no
+        marks. Kept while the view stays. (Laid through the marks' transform
+        instead, the picture came out ~2 px wider than the display's own.)"""
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return None, None
+        sheet = self._studio_sheet(base)
+        label = self.image_label
+        size = label.size()
+        key = (sheet.cacheKey(), size.width(), size.height(), label.zoom_factor,
+               label.pan_offset_x, label.pan_offset_y, self.rotation_angle, self.flipped_h,
+               self.flipped_v, self.canvas_color.rgba(), self._picture_look())
+        kept = self.__dict__.get('_clean_ref_kept')
+        if kept is None or kept[0] != key:
+            turned = self._apply_cached_transforms(sheet)
+            view = self._scale_pixmap_now(turned, size, label.zoom_factor,
+                                          label.pan_offset_x, label.pan_offset_y)
+            kept = self._clean_ref_kept = (key, view)
+        return base, kept[1]
+
+    def _draw_clean_reference(self, painter):
+        """◧🔒 The picture, untouched, laid over its half of the Studio sheet -
+        whatever the effects, a layer's blend or a mark did there is covered."""
+        if getattr(self, 'original_pixmap', None) is None:
+            return
+        base, view = self._clean_reference_view()
+        tx = self._compute_line_transform()
+        if view is None or not tx:
+            return
+        try:
+            original_size = self.original_pixmap.size()
+            if self.rotation_angle in (90, 270):
+                unrot_w, unrot_h = original_size.height(), original_size.width()
+            else:
+                unrot_w, unrot_h = original_size.width(), original_size.height()
+            to_view = self._picture_to_display(
+                self._mark_display_mapper(original_size, tx['scale_x'], tx['scale_y'],
+                                          tx['draw_x'], tx['draw_y']), unrot_w, unrot_h)
+            # where the picture's half is: its rect, a few px over into the
+            # gap (the clean view has the same gap there)
+            area = to_view.mapRect(QRectF(self._studio_offset(base), 0, base.width(),
+                                          base.height())).adjusted(-4, -4, 4, 4)
+        except Exception:
+            return
+        painter.save()
+        painter.setClipRect(area)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setOpacity(1.0)
+        painter.drawPixmap(0, 0, view)
+        painter.restore()
 
     def _apply_fixed_overlays_to_pixmap(self, pixmap):
         """Apply crosshair/grid overlay on top of pixmap (display space).
         Returns a copy with overlays painted, or the original if nothing to draw.
         """
-        if not (self.crosshair_overlay or self.grid_overlay):
+        clean = self._clean_reference_on()
+        if not (self.crosshair_overlay or self.grid_overlay or clean):
             return pixmap
-        if not getattr(self, 'lines_visible', True):
+        if not getattr(self, 'lines_visible', True) and not clean:
             return pixmap
         if not pixmap or pixmap.isNull():
             return pixmap
@@ -974,11 +1057,14 @@ class RandomImageViewer(QMainWindow):
         result = pixmap.copy()
         painter = QPainter(result)
         painter.setRenderHint(QPainter.Antialiasing, False)
-        self._draw_fixed_overlays(
-            painter,
-            tx['draw_x'], tx['draw_y'],
-            tx['zoomed_width'], tx['zoomed_height']
-        )
+        if clean:
+            self._draw_clean_reference(painter)
+        if getattr(self, 'lines_visible', True):
+            self._draw_fixed_overlays(
+                painter,
+                tx['draw_x'], tx['draw_y'],
+                tx['zoomed_width'], tx['zoomed_height']
+            )
         painter.end()
         return result
 
@@ -3365,7 +3451,12 @@ class RandomImageViewer(QMainWindow):
         self._flat_live = None      # its buffers, when it does not build up
         # Fixed overlay tools (non-interactive, passive overlays over the image)
         self.crosshair_overlay = False  # Draw cross lines at image center
-        self.grid_overlay = False       # Draw 3x3 grid over the image
+        # ▦ composition grids (drawing/comp_grids): {key: orient} of the ones on,
+        # any number at once; remembered. grid_overlay: any of them on.
+        self._comp_grids = self._load_comp_grids()
+        self._comp_grid_opacity = self._settings_int("comp_grid_opacity", 80, 10, 100)
+        self.grid_overlay = bool(self._comp_grids)
+        self._grids_window = None
         # Pen each guide was switched on with (see _guide_pen); None = off
         self._crosshair_pen = None
         self._grid_pen = None
@@ -4122,7 +4213,9 @@ class RandomImageViewer(QMainWindow):
         self.triangle_fill_btn = QToolButton(); self.triangle_fill_btn.setText("\u25b2"); self.triangle_fill_btn.setToolTip("Triangle Fill: drag out a filled triangle \u2014 drag down for one pointing up, drag up for one pointing down; hold Shift for an equilateral one"); self.triangle_fill_btn.setCheckable(True); self.triangle_fill_btn.setFixedSize(24,24); self.triangle_fill_btn.toggled.connect(lambda c: self.toggle_fill_tool('triangle', c)); toolbar.addWidget(self.triangle_fill_btn)
         add_spacer(2)
         self.layers_btn = QToolButton(); self.layers_btn.setText("📚"); self.layers_btn.setToolTip("Layers (L): opacity and blend mode for what you have already drawn"); self.layers_btn.setCheckable(True); self.layers_btn.setFixedSize(24,24); self.layers_btn.toggled.connect(self.toggle_layer_window); toolbar.addWidget(self.layers_btn)
-        self.snapshot_layer_btn = QToolButton(); self.snapshot_layer_btn.setText("📸"); self.snapshot_layer_btn.setToolTip("Snapshot to layer: what is on screen now (effects and marks too) onto a new layer, like 💾 saves it"); self.snapshot_layer_btn.setFixedSize(24,24); self.snapshot_layer_btn.clicked.connect(self.snapshot_to_layer); toolbar.addWidget(self.snapshot_layer_btn)
+        self.snapshot_layer_btn = QToolButton(); self.snapshot_layer_btn.setText("📸"); self.snapshot_layer_btn.setToolTip("Snapshot to layer: what is on screen now (effects and marks too) onto a new layer, like 💾 saves it.\nRight-click: ⌇ only the picture's edges, on transparency (in ◧ Studio over the canvas)"); self.snapshot_layer_btn.setFixedSize(24,24); self.snapshot_layer_btn.clicked.connect(self.snapshot_to_layer); toolbar.addWidget(self.snapshot_layer_btn)
+        self.snapshot_layer_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.snapshot_layer_btn.customContextMenuRequested.connect(self._snapshot_menu)
         self.free_draw_tool_btn = QToolButton(); self.free_draw_tool_btn.setText("✏"); self.free_draw_tool_btn.setToolTip("Free Draw Tool (drag to draw)"); self.free_draw_tool_btn.setCheckable(True); self.free_draw_tool_btn.setFixedSize(24,24); self.free_draw_tool_btn.toggled.connect(self.toggle_free_draw); toolbar.addWidget(self.free_draw_tool_btn)
         add_spacer(2)
         self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Erase with the brush (6): the brush rubs out what is drawn on the selected layer - with its tip, size, pressure and opacity, never the picture. Click again for the mode it was in"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_brush_erase); toolbar.addWidget(self.eraser_tool_btn)
@@ -4146,15 +4239,17 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.grid_tool_btn = QToolButton()
         self.grid_tool_btn.setIcon(self._create_overlay_icon('grid'))
-        self.grid_tool_btn.setToolTip("3×3 Grid: divide image into 9 equal parts.\n"
-                                      "Right-click: ∴ dot grid on the canvas and its spacing")
+        self.grid_tool_btn.setToolTip("▦ Grids: composition grids - thirds, golden section and spiral, "
+                                      "armature, dynamic symmetry ... any number at once.\n"
+                                      "Right-click: grids off, ∴ dot grid and its spacing")
         self.grid_tool_btn.setCheckable(True)
         self.grid_tool_btn.setFixedSize(24, 24)
-        self.grid_tool_btn.toggled.connect(self.toggle_grid_overlay)
+        self.grid_tool_btn.clicked.connect(self.toggle_grid_overlay)
         self.grid_tool_btn.setContextMenuPolicy(Qt.CustomContextMenu)
         self.grid_tool_btn.customContextMenuRequested.connect(
             lambda pos: self.show_grid_menu(self.grid_tool_btn.mapToGlobal(pos)))
         toolbar.addWidget(self.grid_tool_btn)
+        self._sync_grid_button()        # lit: grids left on last time
         add_spacer(2)
         # ✛ the cross grid: small crosses over the sheet (see _paint_point_grid)
         self.cross_grid_btn = QToolButton()
@@ -4280,6 +4375,16 @@ class RandomImageViewer(QMainWindow):
         self.studio_fx_bake_btn.setToolTip("📸✨ ◧ Studio: the picture through the effects now, full size, onto a new layer over the grey canvas - "
                                            "a reference to paint from (opacity, blend, hide in 📚; erase; Ctrl+Z)")
         self.studio_fx_bake_btn.setFixedSize(24,24); self.studio_fx_bake_btn.clicked.connect(self.bake_fx_to_canvas); toolbar.addWidget(self.studio_fx_bake_btn)
+        self.studio_ref_clean = (str(self._settings.value("studio_ref_clean", False)).lower() in ("true", "1")
+                                 and not self.studio_fx_canvas and not self.studio_fx_left)
+        self.studio_ref_clean_btn = QToolButton(); self.studio_ref_clean_btn.setText("◧🔒")
+        self.studio_ref_clean_btn.setToolTip(
+            "◧🔒 Studio: keep the reference clean - the effects (values, edges, colour groups, LUT ...) and every "
+            "layer's blend work on your canvas and painting only; the picture on the right is always shown as it is. "
+            "For checking your painting against the model")
+        self.studio_ref_clean_btn.setCheckable(True); self.studio_ref_clean_btn.setChecked(self.studio_ref_clean)
+        self.studio_ref_clean_btn.setFixedSize(32, 24)
+        self.studio_ref_clean_btn.toggled.connect(self.toggle_studio_ref_clean); toolbar.addWidget(self.studio_ref_clean_btn)
         self.studio_fx_btn = QToolButton(); self.studio_fx_btn.setIcon(self._studio_fx_icon()); self.studio_fx_btn.setIconSize(QSize(20, 20)); self.studio_fx_btn.setToolTip("◧ Studio: effects on the grey canvas too. Off (default): the effects change only the picture on the right; the canvas and what you paint on it stay as they are"); self.studio_fx_btn.setCheckable(True); self.studio_fx_btn.setChecked(self.studio_fx_canvas); self.studio_fx_btn.setFixedSize(24,24); self.studio_fx_btn.toggled.connect(self.toggle_studio_fx_canvas); toolbar.addWidget(self.studio_fx_btn)
         self.grayscale_toggle_btn = QToolButton(); self.grayscale_toggle_btn.setText("🌑"); self.grayscale_toggle_btn.setToolTip("Toggle Grayscale On/Off"); self.grayscale_toggle_btn.setCheckable(True); self.grayscale_toggle_btn.setFixedSize(24,24); self.grayscale_toggle_btn.toggled.connect(self.toggle_grayscale); toolbar.addWidget(self.grayscale_toggle_btn)
         add_spacer(2)
@@ -4544,7 +4649,8 @@ class RandomImageViewer(QMainWindow):
                 'lut_toggle_btn', 'value_filter_btn',
                 'color_groups_btn', 'object_groups_btn',
                 'edge_detection_btn', 'form_lines_btn',
-                'curves_btn', 'studio_fx_btn', 'studio_fx_left_btn', 'studio_fx_bake_btn',
+                'curves_btn', 'studio_fx_btn', 'studio_fx_left_btn', 'studio_ref_clean_btn',
+                'studio_fx_bake_btn',
                 'grayscale_slider', 'contrast_slider', 'gamma_slider',
                 'lut_btn', 'lut_combo', 'lut_strength_slider', 'enh_reset_btn',
             ]),
@@ -6743,6 +6849,7 @@ class RandomImageViewer(QMainWindow):
     def _studio_fx_picture_only(self):
         """True while Studio keeps the effects off its canvas (the default)."""
         return bool(self.studio_mode and not self.studio_fx_canvas and not self.studio_fx_left
+                    and not self.studio_ref_clean
                     and self.current_image
                     and not is_video_file(self.current_image)
                     and not is_animated_image(self.current_image))
@@ -6781,6 +6888,8 @@ class RandomImageViewer(QMainWindow):
         self.studio_fx_left = bool(on)
         if on and self.studio_fx_canvas:
             self.toggle_studio_fx_canvas(False)     # (one or the other)
+        if on and self.studio_ref_clean:
+            self.toggle_studio_ref_clean(False)
         try:
             self._settings.setValue("studio_fx_left", self.studio_fx_left)
         except Exception:
@@ -6892,12 +7001,48 @@ class RandomImageViewer(QMainWindow):
         p.end()
         return QIcon(pm)
 
+    # ◧🔒 the reference kept clean: the effects and every layer's blend work
+    # on the canvas (and the painting), the picture shown as it is over its
+    # half - checking a painting with a value filter, a blend of the edges
+    # or a 📸 layer without the model changing under it.
+    studio_ref_clean = False
+
+    def toggle_studio_ref_clean(self, on):
+        self.studio_ref_clean = bool(on)
+        if on:
+            # (the effects go onto the canvas: one mode at a time)
+            if self.studio_fx_canvas:
+                self.toggle_studio_fx_canvas(False)
+            if self.studio_fx_left:
+                self.toggle_studio_fx_left(False)
+        try:
+            self._settings.setValue("studio_ref_clean", self.studio_ref_clean)
+        except Exception:
+            pass
+        btn = getattr(self, 'studio_ref_clean_btn', None)
+        if btn is not None and btn.isChecked() != self.studio_ref_clean:
+            btn.blockSignals(True); btn.setChecked(self.studio_ref_clean); btn.blockSignals(False)
+        self._studio_kept = None
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        self._invalidate_line_caches()
+        if self.current_image:
+            self.display_image(self.current_image)
+        if self.studio_mode:
+            self.status.showMessage(
+                "◧🔒 Reference clean: effects and blends work on your canvas, the picture stays as it is"
+                if on else "◧ Effects back on the picture", 5000)
+        elif on:
+            self.status.showMessage("◧🔒 takes effect in ◧ Studio", 3000)
+
     def toggle_studio_fx_canvas(self, on):
         """✨◧: in Studio, the effects over the grey canvas too (off: only on
         the picture, the default)."""
         self.studio_fx_canvas = bool(on)
         if on and self.studio_fx_left:
             self.toggle_studio_fx_left(False)       # (one or the other)
+        if on and self.studio_ref_clean:
+            self.toggle_studio_ref_clean(False)
         try:
             self._settings.setValue("studio_fx_canvas", self.studio_fx_canvas)
         except Exception:
@@ -10210,6 +10355,7 @@ class RandomImageViewer(QMainWindow):
             win.add_requested.connect(self.add_layer)
             win.canvas_requested.connect(self.add_canvas_layer)
             win.import_requested.connect(self.import_image_to_layer)
+            win.edges_requested.connect(self.edges_to_layer)
             win.remove_requested.connect(self.remove_layer)
             win.move_requested.connect(self.move_layer)
             win.background_requested.connect(self.choose_canvas_color)
@@ -10306,6 +10452,66 @@ class RandomImageViewer(QMainWindow):
         self._refresh_layer_window()
         self._redraw_layers()
         self.status.showMessage(f"View copied to {self.active_layer.name}", 3000)
+
+    def _snapshot_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addAction("📸 The view onto a layer", self.snapshot_to_layer)
+        menu.addAction("⌇ The picture's edges onto a layer (transparent"
+                       + (", over the canvas)" if self.studio_mode else ")"), self.edges_to_layer)
+        menu.exec(self.snapshot_layer_btn.mapToGlobal(pos))
+
+    def edges_to_layer(self):
+        """⌇ The picture's edges (Canny, as the ✨ Edges effect: its
+        sensitivity, its colour) onto a new layer - only the lines, the rest
+        transparent. In ◧ Studio over the canvas on the left, pixel for pixel
+        where the picture's are on the right: the layer's blend and opacity
+        then act on the painting alone, a check of its precision against
+        the reference. (📸 took the whole view - both halves, the grey
+        canvas, opaque - so a blend on it changed the picture too.)"""
+        if not self.current_image or is_video_file(self.current_image):
+            self.status.showMessage("Open a picture first - its edges go onto the layer", 3000)
+            return False
+        base = self.pixmap_cache.get(self.current_image)
+        if base is None or base.isNull():
+            return False
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.status.showMessage("Edges need OpenCV (opencv-python)", 4000)
+            return False
+        img = base.toImage().convertToFormat(QImage.Format_RGBA8888)
+        w, h = img.width(), img.height()
+        arr = np.frombuffer(img.constBits(), np.uint8).reshape(h, img.bytesPerLine())[:, :w * 4]
+        rgb = np.ascontiguousarray(arr.reshape(h, w, 4)[..., :3])
+        gray = cv2.GaussianBlur(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), (3, 3), 0)
+        s = max(0, min(100, int(getattr(self, 'edge_sensitivity', 50))))
+        low = int(10 + (100 - s) * 1.4)             # as apply_edge_detection
+        edges = cv2.Canny(gray, low, min(255, low * 2))
+        colour = getattr(self, 'edge_color', None) or QColor(255, 255, 255)
+        out = np.zeros((h, w, 4), np.uint8)         # premultiplied: colour x alpha
+        on = edges > 0
+        out[on] = (colour.red(), colour.green(), colour.blue(), 255)
+        lines = QImage(np.ascontiguousarray(out).tobytes(), w, h, w * 4,
+                       QImage.Format_RGBA8888_Premultiplied).copy()
+        lines = lines.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        self.commit_selection()
+        self.add_layer()
+        layer = self.active_layer
+        layer.name = f"Edges {self._layer_count}"
+        # the canvas on the left in Studio (marks at 0..w there), else the picture
+        self.drawn_images.append({'image': lines, 'corners': [(0, 0), (w, 0), (0, h)]})
+        self._undo_stack.append('image')
+        layer.raster = None
+        self._invalidate_line_caches()
+        self._refresh_layer_window()
+        self._redraw_layers()
+        where = "over the canvas" if self.studio_mode else "over the picture"
+        self.status.showMessage(
+            f"⌇ Edges on {layer.name} {where} - set its blend (Screen, Difference) and "
+            "opacity in 📚 to check against your painting", 6000)
+        return True
 
     _IMPORT_MAX_SIDE = 4096     # px: an imported picture is kept at most this big
 
@@ -13201,7 +13407,7 @@ class RandomImageViewer(QMainWindow):
         if (not self._layers_plain() or self.current_erase_stroke
                 or self.__dict__.get('_gpu_display')
                 or self.active_layer is not self.layers[-1]
-                or self.crosshair_overlay or self.grid_overlay
+                or self._fixed_overlays_on()
                 or getattr(self, '_video_playing', False)):
             # Erase holes and guide overlays are composited around the marks,
             # and video repaints every frame regardless.
@@ -15838,7 +16044,7 @@ class RandomImageViewer(QMainWindow):
         pm = label.pixmap()
         if (rub is None or pm is None or pm.isNull() or not self.current_image
                 or self._fx_layers_on() or self._live_with_effects()
-                or self.crosshair_overlay or self.grid_overlay or not self.lines_visible
+                or self._fixed_overlays_on() or not self.lines_visible
                 or self._sel is not None):
             return False
         layer = self.active_layer
@@ -16396,12 +16602,14 @@ class RandomImageViewer(QMainWindow):
             painter.restore()
         painter.drawPixmap(0, 0, over)
         painter.end()
-        self.image_label.setPixmap(frame)
+        # (◧🔒 the clean picture, ▦ grids: kept on while painting too)
+        self.image_label.setPixmap(self._apply_fixed_overlays_to_pixmap(frame))
 
     def end_free_draw_stroke(self):
         """⚡ OPTIMIZED FINALIZATION: Clean finalization with single redraw"""
         print(f"Ending optimized free draw stroke")
-        
+        self._last_paint_t = time.monotonic()      # 🛟 the autosave waits for the pen to rest
+
         trail, self._stamp_trail = self._stamp_trail, None
         rubbing = self._brush_erasing()
         if rubbing and not self.active_layer.has_content():
@@ -17138,13 +17346,12 @@ class RandomImageViewer(QMainWindow):
         menu.exec(at)
 
     def show_grid_menu(self, at):
-        """Right-click on the grid button: the 3×3 grid, the dot grid, its spacing."""
+        """Right-click on the grid button: grids off, the dot grid, its spacing."""
         from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
-        a = menu.addAction("3×3 grid")
-        a.setCheckable(True)
-        a.setChecked(bool(self.grid_overlay))
-        a.toggled.connect(self.toggle_grid_overlay)
+        a = menu.addAction("▦ Composition grids off")
+        a.setEnabled(bool(self._comp_grids))
+        a.triggered.connect(self.clear_comp_grids)
         d = menu.addAction("∴ Dot grid")
         d.setCheckable(True)
         d.setChecked(self.dot_grid)
@@ -17158,18 +17365,114 @@ class RandomImageViewer(QMainWindow):
             act.triggered.connect(lambda _c=False, s=s: self.set_dot_grid(on=True, spacing=s))
         menu.exec(at)
 
-    def toggle_grid_overlay(self, checked):
-        """Toggle the 3x3 grid overlay."""
-        self.grid_overlay = bool(checked)
-        self._grid_pen = self._guide_pen() if self.grid_overlay else None
-        if hasattr(self, 'grid_tool_btn'):
-            self.grid_tool_btn.blockSignals(True)
-            self.grid_tool_btn.setChecked(self.grid_overlay)
-            self.grid_tool_btn.blockSignals(False)
+    # -- ▦ composition grids (drawing/comp_grids, widgets/grids_window) -------
+
+    def _settings_int(self, key, default, lo, hi):
+        try:
+            return max(lo, min(hi, int(self._settings.value(key, default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _load_comp_grids(self):
+        """{key: orient} of the grids left on, from the settings."""
+        from random_image_viewer.drawing import comp_grids
+        out = {}
+        raw = str(self._settings.value("comp_grids", "") or "")
+        for part in raw.split(','):
+            key, _, orient = part.partition(':')
+            if key in comp_grids.GRIDS:
+                try:
+                    out[key] = int(orient or 0) % 4
+                except ValueError:
+                    out[key] = 0
+        return out
+
+    def _comp_grids_changed(self):
+        """Saved, the palette and the button brought up to date, the view
+        drawn again."""
+        self._settings.setValue("comp_grids", ",".join(f"{k}:{o}" for k, o in self._comp_grids.items()))
+        self._settings.setValue("comp_grid_opacity", int(self._comp_grid_opacity))
+        self.grid_overlay = bool(self._comp_grids)
+        win = self.__dict__.get('_grids_window')
+        if win is not None:
+            win.set_state(self._comp_grids, self._comp_grid_opacity)
+        self._sync_grid_button()
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
         if self.current_image:
             self.display_image(self.current_image)
+
+    def _sync_grid_button(self):
+        """The ▦ button lit while the palette is open or a grid is on."""
+        btn = getattr(self, 'grid_tool_btn', None)
+        if btn is None:
+            return
+        win = self.__dict__.get('_grids_window')
+        on = bool(self._comp_grids) or (win is not None and win.isVisible())
+        if btn.isChecked() != on:
+            btn.blockSignals(True)
+            btn.setChecked(on)
+            btn.blockSignals(False)
+
+    def set_comp_grid(self, key, on, orient=None):
+        """Grid *key* on / off (others stay as they are); *orient* its turn."""
+        if on:
+            self._comp_grids[key] = (orient if orient is not None
+                                     else self._comp_grids.get(key, self._grid_palette_orient(key)))
+        else:
+            self._comp_grids.pop(key, None)
+        self._comp_grids_changed()
+
+    def _grid_palette_orient(self, key):
+        win = self.__dict__.get('_grids_window')
+        return win.orient(key) if win is not None else 0
+
+    def _turn_comp_grid(self, key, orient):
+        if key in self._comp_grids:
+            self._comp_grids[key] = orient
+            self._comp_grids_changed()
+
+    def set_comp_grid_opacity(self, pct):
+        self._comp_grid_opacity = max(10, min(100, int(pct)))
+        self._comp_grids_changed()
+
+    def clear_comp_grids(self):
+        self._comp_grids.clear()
+        self._comp_grids_changed()
+
+    def _ensure_grids_window(self):
+        win = self.__dict__.get('_grids_window')
+        if win is None:
+            from random_image_viewer.widgets.grids_window import GridsWindow
+            win = self._grids_window = GridsWindow(self)
+            win.grid_toggled.connect(self.set_comp_grid)
+            win.orient_changed.connect(self._turn_comp_grid)
+            win.opacity_changed.connect(self.set_comp_grid_opacity)
+            win.clear_requested.connect(self.clear_comp_grids)
+            win.closed.connect(self._sync_grid_button)
+            win.set_state(self._comp_grids, self._comp_grid_opacity)
+        return win
+
+    def toggle_grid_overlay(self, _checked=None):
+        """▦ clicked: the grids palette opens, or closes when open (the
+        grids chosen in it stay on when it closes; None in it or right-click
+        on ▦ turns them off). The first time ever, the rule of thirds is put
+        on - what the button used to show."""
+        win = self._ensure_grids_window()
+        if not win.isVisible():
+            btn = getattr(self, 'grid_tool_btn', None)
+            win.adjustSize()
+            if btn is not None and not getattr(self, '_grids_window_placed', False):
+                at = btn.mapToGlobal(btn.rect().bottomLeft())
+                win.move(at.x() - win.width() // 2, at.y() + 6)
+                self._grids_window_placed = True
+            win.show()
+            win.raise_()
+            if not self._comp_grids and not self._settings.contains("comp_grids"):
+                self.set_comp_grid('thirds', True)
+        else:
+            win.hide()
+        self._sync_grid_button()
 
     # Mid grey: dark and light strokes both read against it, which is why it
     # is the traditional ground for a sketch.
@@ -21061,6 +21364,8 @@ class RandomImageViewer(QMainWindow):
                         p.drawImage(QRectF(src.x() / k + x0, src.y() / k + y0,
                                            src.width() / k, src.height() / k), piece)
                 p.restore()
+        if self._clean_reference_on():
+            self._draw_clean_reference(p)       # ◧🔒 the picture as it is
         if (self.crosshair_overlay or self.grid_overlay) and self.lines_visible:
             tx = self._compute_line_transform()
             if tx:
@@ -22113,6 +22418,7 @@ class RandomImageViewer(QMainWindow):
         if not self._project_may_close():       # 💼 unsaved painting: saved, dropped or stay
             event.ignore()
             return
+        self._end_safety()                      # 🛟 closed properly: nothing to recover
         if getattr(self, '_touch_pan', None) is not None:
             self._touch_pan.stop()
         if getattr(self, '_colour_sync', None) is not None:
@@ -22131,6 +22437,112 @@ class RandomImageViewer(QMainWindow):
             grid.shutdown()
         super().closeEvent(event)
 
+    # -- 🛟 not losing a painting (services/safety) -------------------------
+    #
+    # A hang ended the app with an hour of painting in it, nothing saved and
+    # nothing in the log to say where it stuck. Now: the painting autosaved
+    # to the recovery folder when the pen rests, offered again at the next
+    # start when the app did not close properly; a hang writes every
+    # thread's stack (logs/hang_*.txt), a crash its own (logs/crash_*.txt).
+
+    _AUTOSAVE_QUIET_S = 2.0     # this long after the last stroke ...
+    _AUTOSAVE_GAP_S = 30.0      # ... and at most this often (longer when saving is slow)
+
+    def _start_safety(self):
+        if self.__dict__.get('_safety_started'):
+            return
+        self._safety_started = True
+        try:
+            from random_image_viewer.services import safety
+            safety.crash_log()
+            self._hang_watch = safety.HangWatch()
+            self._hang_watch.start()
+            beat = self._beat_timer = QTimer(self)
+            beat.setInterval(500)
+            beat.timeout.connect(self._hang_watch.beat)
+            beat.start()
+            ended = safety.start_session()
+            self._autosave_gap = self._AUTOSAVE_GAP_S
+            timer = self._autosave_timer = QTimer(self)
+            timer.setInterval(1500)
+            timer.timeout.connect(self._autosave_tick)
+            timer.start()
+            files = safety.recoverable(ended)
+            if files:
+                QTimer.singleShot(800, lambda: self._offer_recovery(files))
+        except Exception as e:
+            print(f"🛟 Safety off: {e}")
+
+    def _autosave_tick(self):
+        """The painting into the recovery folder, when there is something
+        new, the pen has rested a moment and nothing else is under way."""
+        try:
+            if (self.is_drawing_free_stroke or self.current_stroke or self.current_fill
+                    or not self.current_image or not os.path.isfile(self.current_image)
+                    or any(getattr(self, a, None) for a in ('_pdf_doc', '_epub_doc', '_cbr_doc'))):
+                return
+            card = self.__dict__.get('_progress_card')
+            if card is not None and card.isVisible():
+                return
+            if not any(layer.has_content() for layer in self.layers):
+                return
+            sig = (self.current_image, self._marks_signature())
+            if sig == self.__dict__.get('_autosaved_sig'):
+                return
+            now = time.monotonic()
+            if (now - self.__dict__.get('_last_paint_t', 0.0) < self._AUTOSAVE_QUIET_S
+                    or now - self.__dict__.get('_autosave_t', -1e9) < self._autosave_gap):
+                return
+            from random_image_viewer import project_file
+            from random_image_viewer.services import safety
+            path = safety.recovery_path(self.current_image)
+            t0 = time.perf_counter()
+            project_file.save_project(self, path, thumbnail=False)
+            took = time.perf_counter() - t0
+            self._autosaved_sig, self._autosave_t = sig, time.monotonic()
+            # never more than ~5 % of the time spent saving
+            self._autosave_gap = max(self._AUTOSAVE_GAP_S, 20.0 * took)
+            safety.prune_recovery()
+            print(f"🛟 Autosaved {os.path.basename(path)} in {took:.2f} s")
+        except Exception as e:
+            self._autosave_t = time.monotonic()
+            print(f"🛟 Autosave failed: {e}")
+
+    def _offer_recovery(self, files):
+        """The last session ended without closing: its newest painting
+        offered back (the others in the recovery folder)."""
+        from PySide6.QtWidgets import QMessageBox
+        newest = files[0]
+        when = time.strftime("%d.%m. %H:%M", time.localtime(os.path.getmtime(newest)))
+        more = f"\n\n{len(files) - 1} more in the recovery folder." if len(files) > 1 else ""
+        box = QMessageBox(self)
+        box.setWindowTitle("Recover painting")
+        box.setIcon(QMessageBox.Question)
+        box.setText("Ova Viewer did not close properly last time.\n\n"
+                    f"Open the painting saved at {when}?{more}\n\n"
+                    "(Use 💼 Save as afterwards to keep it where you want.)")
+        open_btn = box.addButton("Open it", QMessageBox.AcceptRole)
+        folder_btn = box.addButton("Show folder", QMessageBox.ActionRole)
+        box.addButton("Not now", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            self.open_project(newest)
+        elif box.clickedButton() is folder_btn:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(newest)))
+
+    def _end_safety(self):
+        """Closed properly: the session's lock goes, the watch stops."""
+        try:
+            from random_image_viewer.services import safety
+            safety.end_session()
+            watch = self.__dict__.get('_hang_watch')
+            if watch is not None:
+                watch.stop()
+        except Exception:
+            pass
+
     def report_startup_ready(self, launch_t0=None):
         """Record how long launch-to-interactive took and show it in the corner.
 
@@ -22141,6 +22553,7 @@ class RandomImageViewer(QMainWindow):
         """
         # The GPU view's OpenGL set up now, while idle, not on the first zoom.
         QTimer.singleShot(2500, self._gpu_warm_up)
+        self._start_safety()
         try:
             seconds = process_uptime_seconds()
             source = "process launch"

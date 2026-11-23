@@ -245,10 +245,11 @@ def _no_progress(_fraction, _what=None):
     pass
 
 
-def save_project(viewer, path, progress=None):
+def save_project(viewer, path, progress=None, thumbnail=True):
     """Write *viewer*'s painting to *path* (.ova). Written to a temporary
     file first and swapped in, so a failed save never spoils the last one.
-    *progress*(fraction, step): told how far it got."""
+    *progress*(fraction, step): told how far it got. *thumbnail* False:
+    none (an autosave - on the GPU canvas it lays the whole view again)."""
     progress = progress or _no_progress
     picture = viewer.current_image
     if not picture or not os.path.isfile(picture):
@@ -302,6 +303,8 @@ def save_project(viewer, path, progress=None):
         zf.writestr("manifest.json", json.dumps(manifest, separators=(',', ':')))
         progress(0.92, "the thumbnail")
         try:
+            if not thumbnail:
+                raise LookupError
             shown = viewer._view_pixmap() if hasattr(viewer, '_view_pixmap') else label.pixmap()
             if shown is not None and not shown.isNull():
                 thumb = shown.toImage().scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation)

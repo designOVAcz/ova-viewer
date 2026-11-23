@@ -30,6 +30,7 @@ class LayerWindow(QWidget):
     add_requested = Signal()
     canvas_requested = Signal()
     import_requested = Signal()             # 📥 a PNG / picture onto this layer
+    edges_requested = Signal()              # ⌇ the picture's edges, on transparency, onto a new layer
     remove_requested = Signal()
     move_requested = Signal(int)    # +1 up the stack, -1 down
     background_requested = Signal()
@@ -232,12 +233,19 @@ class LayerWindow(QWidget):
                   "in the middle, ⬚ selected: drag to move, a corner to scale, outside to turn, "
                   "Enter applies. Ctrl+Z takes it away",
             self.import_requested.emit)
+        self._edges_btn = self._tool_button(
+            "⌇", "Edges of the picture onto a new layer - just the lines, on transparency. In ◧ "
+                 "Studio it lies over the canvas on the left, matched to the picture: set its "
+                 "blend (Screen, Difference ...) and opacity to check your painting against the "
+                 "reference - the picture on the right stays as it is. Sensitivity and colour "
+                 "as the ✨ Edges effect's",
+            self.edges_requested.emit)
         self._remove_btn = self._tool_button(
             "−", "Delete this layer and its marks (no undo)", self.remove_requested.emit)
         self._up_btn = self._tool_button("▲", "Move up", lambda: self.move_requested.emit(1))
         self._down_btn = self._tool_button("▼", "Move down", lambda: self.move_requested.emit(-1))
-        for btn in (self._add_btn, self._canvas_btn, self._import_btn, self._remove_btn,
-                    self._up_btn, self._down_btn):
+        for btn in (self._add_btn, self._canvas_btn, self._import_btn, self._edges_btn,
+                    self._remove_btn, self._up_btn, self._down_btn):
             buttons.addWidget(btn)
         buttons.addStretch(1)
         inner.addLayout(buttons)
