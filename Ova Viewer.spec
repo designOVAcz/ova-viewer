@@ -41,7 +41,10 @@ a = Analysis(
     datas=[('icon.png', '.'), ('icon.ico', '.'), ('ova_viewer.png', '.')],
     hiddenimports=['random_image_viewer._version', 'PySide6.QtWebSockets',
                    # JPEG XL: imagecodecs loads its codec modules by name
-                   'imagecodecs._jpegxl', 'imagecodecs._shared'],
+                   # (and _jpegxl needs the Cython runtime they share - left
+                   # out, the exe said "could not import name 'jpegxl_decode'")
+                   'imagecodecs._jpegxl', 'imagecodecs._shared',
+                   'imagecodecs._shared_cython'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -51,11 +54,27 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# The launcher's own splash: shown by the exe the moment it starts, before
+# Python and Qt load - a cold start (the first after a rebuild, Defender
+# scanning the DLLs) spent 6-8 s with nothing on screen until the app's Qt
+# splash could appear, and a second copy got started. Closed by app.py as
+# soon as the Qt splash is up. Just a thin white line - no card, no text.
+# (splash_boot.png: tools/make_splash.py)
+splash = Splash(
+    'splash_boot.png',
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=None,
+    minify_script=True,
+    always_on_top=True,
+)
+
 # One-folder build (dist/Ova Viewer/): a one-file exe unpacks its whole
 # bundle to %TEMP% on every launch (~3.5 s of the old ~4.3 s startup).
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
     [],
     exclude_binaries=True,
     name='Ova Viewer',
@@ -76,6 +95,7 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
+    splash.binaries,
     strip=False,
     upx=False,
     upx_exclude=[],

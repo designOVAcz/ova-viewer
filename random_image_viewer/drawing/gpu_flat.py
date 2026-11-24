@@ -335,10 +335,12 @@ class _FlatKit:
         self._keep = {}         # id(texture) -> texture (so its id stays its own)
         self._shelf = [0, 0, 0]  # x, y, height of the shelf being filled
         self._rows = {}         # colours tuple -> palette row
+        self._slots = {}        # 0xRRGGBB -> (row, column): single colours, packed from the last row up
         self.buffers = None     # (mask, colour) over the layer
         self.overlay = None
         self.temp = None        # (mask, colour) for the tail
         self.last_bounds = None  # the last stroke's bounds (cleared before the next)
+        self.busy = None        # the stroke using the buffers now (a live one: lay others on the CPU)
 
     @staticmethod
     def _texture(fmt, w, h):
@@ -411,6 +413,7 @@ class _FlatKit:
         self._keep.clear()
         self._shelf = [0, 0, 0]
         self._rows.clear()
+        self._slots.clear()
 
     def entry(self, key, make):
         """(x, y, w, h) of *key* in the atlas; *make*() -> (h, w) uint8 array,
@@ -440,7 +443,7 @@ class _FlatKit:
         r = self._rows.get(colours)
         if r is not None:
             return r
-        if len(self._rows) >= PALETTE_ROWS:
+        if len(self._rows) >= PALETTE_ROWS - (len(self._slots) + PALETTE_W - 1) // PALETTE_W:
             raise MemoryError("palette full")
         r = len(self._rows)
         c = np.array(colours[:PALETTE_W], np.uint32)
@@ -454,11 +457,33 @@ class _FlatKit:
         self._rows[colours] = r
         return r
 
+    def slot(self, rgb):
+        """(row, column) of the single colour *rgb* in the palette: packed
+        PALETTE_W to a row from the last row up (🖌 bristles, each hair its
+        own colour - a row each ran out at 1024 colours)."""
+        s = self._slots.get(rgb)
+        if s is not None:
+            return s
+        n = len(self._slots)
+        row, col = PALETTE_ROWS - 1 - n // PALETTE_W, n % PALETTE_W
+        if row < len(self._rows):
+            raise MemoryError("palette full")
+        px = bytes(((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, 255))
+        f = self.gpu.f
+        f.glBindTexture(GL_TEXTURE_2D, self.palette.textureId())
+        f.glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        f.glTexSubImage2D(GL_TEXTURE_2D, 0, col, row, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px)
+        f.glPixelStorei(GL_UNPACK_ALIGNMENT, 4)
+        self._slots[rgb] = (row, col)
+        return row, col
+
     # -- drawing --------------------------------------------------------------
 
-    def draw(self, data, targets, size, origin):
+    def draw(self, data, targets, size, origin, passes=(0, 1)):
         """The (n, STRIDE) float32 instances into *targets* (mask fbo, colour
-        fbo), whose top-left is layer px *origin*, *size* their size."""
+        fbo), whose top-left is layer px *origin*, *size* their size.
+        *passes*: which of the two to draw (0 coverage, 1 colour) - the
+        targets given are those passes' buffers, in that order."""
         f = self.gpu.f
         raw = data.tobytes()
         p = self.program
@@ -483,7 +508,7 @@ class _FlatKit:
         f.glDisable(GL_SCISSOR_TEST)
         f.glEnable(GL_BLEND)
         n = len(data)
-        for i, fbo in enumerate(targets):
+        for i, fbo in zip(passes, targets):
             fbo.bind()
             f.glViewport(0, 0, size[0], size[1])
             if i == 0:
@@ -571,6 +596,7 @@ class GpuFlatStroke:
         self.gpu = layer.gpu
         self.gpu.current()
         self.kit = k = flat_kit(self.gpu)
+        k.busy = self           # (the buffers are this stroke's until it ends - see _end)
         k.layer_buffers(layer.width, layer.height)
         if k.last_bounds is not None:
             for fbo in k.buffers + (k.overlay,):
@@ -644,7 +670,12 @@ class GpuFlatStroke:
             return None
         k = self.kit
         k.compose(k.overlay, rect, tbox, False, self.overlay_size)
-        g.f.glFlush()
+        # Finished, not just sent: the canvas window draws this texture from
+        # its own (shared) context, and with glFlush alone it sampled it half
+        # written - the stroke torn by bare 1 px rows, a ladder of grey lines
+        # through it while the pen was down (any GPU brush; the bristles,
+        # dense and white, showed it plainly).
+        g.f.glFinish()
         return rect
 
     def commit(self):
@@ -673,6 +704,8 @@ class GpuFlatStroke:
             b = self._tbox if b is None else b.united(self._tbox)
         self.kit.last_bounds = b
         self.done = True
+        if self.kit.busy is self:
+            self.kit.busy = None
 
     def read_overlay(self, rect):
         """The preview inside *rect* as a premultiplied ARGB32 QImage."""
@@ -1084,3 +1117,150 @@ class GpuFlatStroke:
         k.draw(data, (tm, tc), (tm.width(), tm.height()), (box.x(), box.y()))
         self._bounds = box if self._bounds is None else self._bounds.united(box)
         return box
+
+
+# -- 🖌 bristles on the card ----------------------------------------------------
+
+BRISTLE_PH = 32         # a bristle's cross-section, texels across
+
+
+def _bristle_profile(soft):
+    """A hair's cross-section (BRISTLE_PH x 1): solid in the core, a faint
+    halo out to the edge for a soft hair - as BristleStroke's CPU drawing
+    lays a core line over a 35 % halo 1 + 2 soft as wide."""
+    core = 1.0 / (1.0 + 2.0 * soft)
+    t = np.abs((np.arange(BRISTLE_PH) + 0.5) / BRISTLE_PH - 0.5) * 2.0     # 0 middle .. 1 edge
+    edge = 1.5 / BRISTLE_PH                                               # (about a texel of softness)
+    inner = np.clip((core - t) / edge + 0.5, 0.0, 1.0)
+    outer = np.clip((1.0 - t) / edge + 0.5, 0.0, 1.0) * (0.35 if soft > 0 else 0.0)
+    a = np.maximum(inner, outer)
+    return (a * 255.0 + 0.5).astype(np.uint8).reshape(BRISTLE_PH, 1)
+
+
+class GpuBristleStroke(GpuFlatStroke):
+    """🖌 The Hair brush's bristles laid on the card: every hair's line a
+    one-texel strip (its cross-section) stretched along it - one instance a
+    segment, all of a pen event in one draw, as HeavyPaint lays its
+    bristles in WebGL. The bristles themselves (where each hair goes, how
+    wide, how strong, its colour) are brushes.BristleStroke.segments, the
+    same as on the CPU; only the drawing is here. Coverage under GL_MAX,
+    colour laid over itself in the order laid - as FlatStroke / its CPU
+    drawing. preview / bounds / read_overlay / commit / cancel: as
+    GpuFlatStroke (no tail: a bristle has no tip to show)."""
+
+    def __init__(self, layer, model):
+        super().__init__(layer)
+        self.model = model          # brushes.BristleStroke(rect, buffers=False)
+
+    def _tail_records(self):
+        return []
+
+    def add(self, texture, stamps, view=None):
+        from PySide6.QtGui import QTransform
+        self.gpu.current()
+        segs = self.model.segments(texture, stamps, view if view is not None else QTransform())
+        self.model.last_segments = segs
+        return self.add_segments(segs)
+
+    def add_segments(self, segs):
+        """*segs* (as BristleStroke.segments gives them) laid: the box touched."""
+        self.gpu.current()
+        if not segs:
+            return None
+        # Each strip end to end with the next, overlapping by a hair (3/4 px),
+        # coverage and colour alike. Reaching half its width past its ends,
+        # the overlap showed at every joint: a carried colour (Wet) laid twice
+        # there, hairs of different colours on one track (particles - the
+        # bundle's hairs trail each other) taking turns, a dashed ladder along
+        # the strands; with the colour drawn shorter than the coverage, the
+        # bare coverage composed dark. (The wedge a strip leaves outside a
+        # curve is a fraction of a pixel: the brush turns a few degrees a step.)
+        try:
+            data, box = self._bristle_instances(segs, reach=False)
+        except MemoryError:
+            self.kit.reset_atlas()          # (between draws: rebuilt from the keys)
+            data, box = self._bristle_instances(segs, reach=False)
+        if data is None:
+            return None
+        k = self.kit
+        k.draw(data, k.buffers, (k.buffers[0].width(), k.buffers[0].height()), (0, 0))
+        box = box.intersected(QRect(0, 0, self.layer.width, self.layer.height))
+        if box.isEmpty():
+            return None
+        self._bounds = box if self._bounds is None else self._bounds.united(box)
+        self._dirty = box if self._dirty is None else self._dirty.united(box)
+        return box
+
+    def _bristle_instances(self, segs, reach=True):
+        """The segments as instance rows (see _FLAT_VERT), built in numpy.
+        *reach*: each strip half its width past both ends (False: end to end)."""
+        k = self.kit
+        soft = float(self.model._hairs['soft'])
+        q = round(soft * 20) / 20
+        sx, sy, _w, ph = k.entry(('bristle-profile', q), lambda: _bristle_profile(q))
+        p0 = np.concatenate([s[0] for s in segs])
+        p1 = np.concatenate([s[1] for s in segs])
+        width = np.concatenate([s[2] for s in segs])
+        alpha = np.concatenate([s[3] for s in segs])
+        colours = np.concatenate([s[4] for s in segs])
+        keep = alpha > 0.01
+        if not keep.any():
+            return None, None
+        p0, p1, width, alpha, colours = p0[keep], p1[keep], width[keep], alpha[keep], colours[keep]
+        # the strip: the segment, reaching half its width past both ends (the
+        # next one overlaps it: one line), as wide as the hair with its halo
+        full = width * (1.0 + 2.0 * soft) if soft > 0 else width
+        d = p1 - p0
+        ln = np.hypot(d[:, 0], d[:, 1])
+        tiny = ln < 1e-6
+        ln[tiny] = 1.0
+        ux, uy = d[:, 0] / ln, d[:, 1] / ln
+        ux[tiny], uy[tiny] = 1.0, 0.0
+        # (end to end the joints left hairline gaps without colour under the
+        # coverage - dark dots along the hair: a hair's breadth over instead)
+        half = width * 0.5 if reach else np.minimum(width * 0.5, 0.75)
+        bx, by = p0[:, 0] - ux * half, p0[:, 1] - uy * half
+        fx, fy = p1[:, 0] + ux * half, p1[:, 1] + uy * half
+        ax, ay = -uy, ux                                        # across
+        m0, m1 = fx - bx, fy - by
+        m2, m3 = ax * full / ph, ay * full / ph
+        m4, m5 = bx - ax * full / 2, by - ay * full / 2
+        det = m0 * m3 - m1 * m2
+        ok = np.abs(det) > 1e-12
+        if not ok.all():
+            m0, m1, m2, m3, m4, m5, det = (a[ok] for a in (m0, m1, m2, m3, m4, m5, det))
+            alpha, colours = alpha[ok], colours[ok]
+            if not len(alpha):
+                return None, None
+        n = len(alpha)
+        rows = np.empty((n, STRIDE), np.float32)
+        rows[:, 0], rows[:, 1] = m4, m5
+        rows[:, 2], rows[:, 3] = m0 + m4, m1 + m5
+        rows[:, 4], rows[:, 5] = m2 * ph + m4, m3 * ph + m5
+        rows[:, 6], rows[:, 7] = m0 + m2 * ph + m4, m1 + m3 * ph + m5
+        rows[:, 8], rows[:, 9] = m3 / det, -m1 / det            # device -> image
+        rows[:, 10], rows[:, 11] = -m2 / det, m0 / det
+        rows[:, 12], rows[:, 13] = 0.0, 0.0                     # image (0, 0) at the corner ...
+        rows[:, 14], rows[:, 15] = m4, m5                       # ... here
+        rows[:, 16], rows[:, 17], rows[:, 18], rows[:, 19] = sx, sy, 1, ph
+        # each colour: its palette slot; the column through a 1 x 1 index map
+        slot_of = {}
+        for c in np.unique(colours):
+            row, col = k.slot(int(c))
+            ix, iy, _, _ = k.entry(('const', col), lambda col=col: np.full((1, 1), col, np.uint8))
+            slot_of[int(c)] = (row, ix, iy)
+        info = np.array([slot_of[int(c)] for c in colours], np.float32).reshape(-1, 3)
+        rows[:, 20], rows[:, 21] = info[:, 1], info[:, 2]
+        rows[:, 22], rows[:, 23] = 1, 1
+        rows[:, 24] = np.clip(np.rint(alpha * 255.0), 1, 255)   # coverage
+        # the colour laid whole - or, carried (Wet), partly over what the hair
+        # laid before it (brushes.BristleStroke.CARRY_MIX)
+        rows[:, 25] = round(255 * self.model.CARRY_MIX) if self.model.carries else 255
+        rows[:, 26] = info[:, 0]
+        rows[:, 27] = 8                                         # bilinear weight bits
+        rows[:, 28], rows[:, 29], rows[:, 30], rows[:, 31] = 1.0, 1.0, 0.0, 0.0
+        xs = np.concatenate([rows[:, 0], rows[:, 2], rows[:, 4], rows[:, 6]])
+        ys = np.concatenate([rows[:, 1], rows[:, 3], rows[:, 5], rows[:, 7]])
+        x0, y0 = math.floor(float(xs.min())) - 1, math.floor(float(ys.min())) - 1
+        box = QRect(x0, y0, math.ceil(float(xs.max())) + 2 - x0, math.ceil(float(ys.max())) + 2 - y0)
+        return rows, box

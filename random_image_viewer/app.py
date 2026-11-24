@@ -3,13 +3,71 @@ import sys
 import time
 
 
+def _boot_splash():
+    """The exe launcher's own splash (see the spec), or None when running
+    from source / built without it. Up from the first moment, before Qt."""
+    try:
+        import pyi_splash
+        return pyi_splash
+    except Exception:
+        return None
+
+
+def _boot_text(boot, text):
+    if boot is not None:
+        try:
+            boot.update_text(text)
+        except Exception:
+            pass
+
+
+def _boot_close(boot):
+    try:
+        boot.close()
+    except Exception:
+        pass
+
+
+def _boot_line_hide():
+    """The launcher's line window (Tk, this process), hidden: its handle, or
+    None (not Windows, not found)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        pid, found = os.getpid(), []
+
+        def each(hwnd, _):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid and user32.IsWindowVisible(hwnd):
+                name = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, name, 64)
+                if name.value.startswith("Tk"):
+                    found.append(hwnd)
+            return True
+
+        user32.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(each), 0)
+        if len(found) != 1:
+            return None
+        user32.ShowWindow(found[0], 0)                  # SW_HIDE
+        return found[0]
+    except Exception:
+        return None
+
+
 def main():
     launch_t0 = time.perf_counter()
+    boot = _boot_splash()
+    _boot_text(boot, "starting … the log")
     # Capture prints, tracebacks and Qt warnings before anything else runs:
     # the exe has no console, so this is the only place they end up.
     from random_image_viewer import log_capture
     log_capture.install()
     # ---- Stage 0: Minimal Qt to show splash ASAP ----
+    _boot_text(boot, "starting … loading Qt (slow the first time after an update)")
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt
     # MUST be set before the QApplication is fully initialised.
@@ -25,10 +83,23 @@ def main():
         QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     except Exception:
         pass
-    app = QApplication(sys.argv)
-
     from random_image_viewer.splash import show_splash, close_splash
+    # The launcher's line through the QApplication: Qt makes the process
+    # DPI-aware per monitor, and from then on the line's window (laid out by
+    # an unaware Tk, centred) is taken at its numbers in real pixels - it
+    # jumps up and left and shrinks to 2/3 at 150 %. So it is hidden for the
+    # QApplication (~0.1 s), and the splash takes over with the same line
+    # drawn by Qt - same place, same size at any scale - before the launcher's
+    # window goes. The globe then fades in around it (the line is its equator).
+    line = _boot_line_hide() if boot is not None else None
+    if boot is not None and line is None:
+        _boot_close(boot)
+        boot = None
+    app = QApplication(sys.argv)
     splash = show_splash(app)
+    if boot is not None:
+        _boot_close(boot)
+    splash.reveal()
 
     def status(msg):
         splash.set_status(msg)

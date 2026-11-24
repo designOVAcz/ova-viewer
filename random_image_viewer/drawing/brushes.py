@@ -23,8 +23,8 @@ import random
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QPointF, QRect, QRectF
-from PySide6.QtGui import QColor, QImage, QPainter, QTransform
+from PySide6.QtCore import Qt, QLineF, QPointF, QRect, QRectF
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QTransform
 
 from . import pigment
 
@@ -87,6 +87,10 @@ DEFAULT_SETTINGS = {
     'hair_ragged': 40,          # 🖌 ... % they differ in length and start (frayed ends)
     'hair_soft': 30,            # 🖌 ... % soft hair edges
     'hair_seed': 17,            # 🖌 ... which brush (another seed: other hairs)
+    'hair_width': 8,            # 🖌 ... each hair's thickness, ‰ of the brush size (BristleStroke)
+    'hair_flat': 35,            # 🖌 ... 0: a round bundle, 100: a flat row of hairs
+    'hair_shape': 40,           # 🖌 ... each hair's tip: 0 round, 100 a long flat dab (ribbons)
+    'hair_wet': 0,              # 🖌 ... % each hair picks up the paint it passes and smears it on
     'smear_grab': 70,           # Smear: % how firmly hairs grab paint that stands out
     'smear_edge': 25,           # Smear: % how much it must stand out to be grabbed
     'smear_blur': 20,           # Smear: % how much the hairs also blend what they pass
@@ -814,6 +818,8 @@ class BrushTexture:
         rotation, maybe a mirror). A light line with a dark rim, so it shows on
         any picture. The stamp's centre is the image's centre. None if the
         tip is too faint or small to outline."""
+        if getattr(self, 'bristle_engine', False):
+            return self._bristle_outline(size, turn, dpr)
         import numpy as np
         mask = self._levels[self.level(size * dpr)]
         w, h = mask.width(), mask.height()
@@ -884,6 +890,46 @@ class BrushTexture:
         cursor = QImage(out.tobytes(), W, H, W * 4, QImage.Format_ARGB32_Premultiplied).copy()
         cursor.setDevicePixelRatio(dpr)
         return cursor
+
+    def _bristle_outline(self, size, turn, dpr=1.0):
+        """🖌 The bristles as the cursor (as HeavyPaint shows its bristle
+        brushes): every hair a short stick where it sits in the bundle - the
+        same spread, Flatness, Bristle shape and random turn the strokes are
+        laid with (BristleStroke._make), at full pressure - turned with the
+        brush. A light stick over a dark one, so it shows on any picture."""
+        hairs = getattr(self, '_cursor_hairs', None)
+        if hairs is None:
+            hairs = self._cursor_hairs = BristleStroke._make(getattr(self, 'hair_params', None) or {})
+        k = size * dpr
+        u, v = hairs['u'], hairs['v']
+        # a stick as long as the hair's flat tip, never shorter than a few
+        # px (a hair under a pixel wide would not show at all)
+        half = np.maximum(2.0 * dpr, 0.5 * hairs['thick'] * hairs['long'] * k)
+        half = np.minimum(half, 0.12 * k + 2.0 * dpr)
+        m = QTransform(turn.m11(), turn.m12(), turn.m21(), turn.m22(), 0.0, 0.0)
+        cx = m.m11() * v * k + m.m21() * u * k              # in the tip's frame: along = x, across = y
+        cy = m.m12() * v * k + m.m22() * u * k
+        dx = m.m11() * np.cos(hairs['axis']) + m.m21() * np.sin(hairs['axis'])
+        dy = m.m12() * np.cos(hairs['axis']) + m.m22() * np.sin(hairs['axis'])
+        dl = np.hypot(dx, dy)
+        dl[dl < 1e-9] = 1.0
+        dx, dy = dx / dl * half, dy / dl * half
+        reach = float(np.max(np.hypot(cx, cy) + half)) + 4.0 * dpr
+        W = 2 * int(math.ceil(reach))
+        image = QImage(W, W, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        p = QPainter(image)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.translate(W / 2.0, W / 2.0)
+        lines = [QLineF(float(x - ex), float(y - ey), float(x + ex), float(y + ey))
+                 for x, y, ex, ey in zip(cx, cy, dx, dy)]
+        p.setPen(QPen(QColor(0, 0, 0, 170), 3.0 * dpr, Qt.SolidLine, Qt.RoundCap))
+        p.drawLines(lines)
+        p.setPen(QPen(QColor(255, 255, 255, 235), 1.0 * dpr, Qt.SolidLine, Qt.RoundCap))
+        p.drawLines(lines)
+        p.end()
+        image.setDevicePixelRatio(dpr)
+        return image
 
     def thumbnail(self, edge, color=QColor(230, 230, 230)):
         """The texture fitted into an *edge* px square, for the brush panel."""
@@ -1079,13 +1125,19 @@ def _hairs_image(hairs=48, vary=50, ragged=40, soft=30, seed=17):
 
 def hairs_path(settings):
     """The Hair brush with its settings, as a path a stroke keeps (the same
-    hairs at any zoom): ':hairs?n=<hairs>&v=<vary %>&r=<ragged %>&s=<soft %>&k=<seed>'."""
+    hairs at any zoom): ':hairs?n=<hairs>&v=<vary %>&r=<ragged %>&s=<soft %>&k=<seed>
+    &w=<hair width ‰>&e=2'. e=2: laid as bristles (BristleStroke); a path
+    without it is an older stroke, laid as the tip dragged, as it was made."""
     n = max(4, min(400, int(settings.get('hair_count', 48))))
     v = max(0, min(100, int(settings.get('hair_vary', 50))))
     r = max(0, min(100, int(settings.get('hair_ragged', 40))))
     s = max(0, min(100, int(settings.get('hair_soft', 30))))
     k = max(0, min(999, int(settings.get('hair_seed', 17))))
-    return f"{HAIRS}?n={n}&v={v}&r={r}&s={s}&k={k}"
+    w = max(1, min(200, int(settings.get('hair_width', 8))))
+    f = max(0, min(100, int(settings.get('hair_flat', 35))))
+    h = max(0, min(100, int(settings.get('hair_shape', 40))))
+    x = max(0, min(100, int(settings.get('hair_wet', 0))))
+    return f"{HAIRS}?n={n}&v={v}&r={r}&s={s}&k={k}&w={w}&f={f}&h={h}&x={x}&e=2"
 
 
 def _hairs_tip(path):
@@ -1100,8 +1152,11 @@ def _hairs_tip(path):
                 values[key] = int(value)
             except ValueError:
                 pass
-    return BrushTexture(path, _hairs_image(values['n'], values['v'], values['r'], values['s'],
-                                           seed=values['k']), "Hair brush (procedural)")
+    tip = BrushTexture(path, _hairs_image(values['n'], values['v'], values['r'], values['s'],
+                                          seed=values['k']), "Hair brush (procedural)")
+    tip.hair_params = dict(values)
+    tip.bristle_engine = int(values.get('e', 0)) >= 2      # see hairs_path
+    return tip
 
 
 def rake_path(settings):
@@ -1277,6 +1332,8 @@ class StampTrail:
         if texture is not None and (texture.path == DUST or getattr(texture, 'procedural', False)):
             # Specks pile up like spray; dragged flat they turned into streaks.
             self.settings['flat'] = False
+        if getattr(texture, 'bristle_engine', False):
+            self.settings['flat'] = True    # 🖌 bristles are laid as one stroke (BristleStroke)
         self._sampler = sampler if self.settings['mode'] == 'smudge' else None
         self._carried = None    # smudge: the colour picked up so far
         self._load = 1.0        # smudge: how much of it is left (empty spots use it up)
@@ -1325,9 +1382,13 @@ class StampTrail:
         if self.settings['jitter_per_stamp'] == 'particles' and len(set(self._palette)) > 1:
             # (a tip dragged flat: speckled all along, see FlatStroke._specks.
             # Not the soft round - each of its stamps is laid as it is.)
+            # (🖌 bristles: no specks - each hair takes a colour of its own
+            # from them, see BristleStroke._hair_colours; speckled sent the
+            # stroke to the CPU, ~30x slower)
             self.speckled = ((self.settings['flat'] or self.settings['mode'] == 'history')
                              and self.settings['mode'] in ('paint', 'history')
-                             and not getattr(texture, 'stamp_max', False))
+                             and not getattr(texture, 'stamp_max', False)
+                             and not getattr(texture, 'bristle_engine', False))
             number = SPECKLED if self.speckled else 0
             self._particles = [(-1 - number - i,) + tuple(self._rng.choice(self._palette)
                                                           for _ in range(PARTICLE_COLOURS))
@@ -1641,6 +1702,10 @@ class StampTrail:
         if s['mode'] == 'smudge' and self._load < 0.01:
             opacity = 0.0
         stamp = (x, y, size, angle, opacity, rgb)
+        if getattr(self.texture, 'bristle_engine', False):
+            # bristles splay and touch by the pen's pressure (BristleStroke),
+            # with or without Pressure: size / opacity
+            stamp += (round(float(pressure), 4),)
         self.stamps.append(stamp)
         return stamp
 
@@ -3038,6 +3103,433 @@ def _stamps_box(stamps, view, scale):
                  math.ceil(max(xs) - min(xs)) + 2, math.ceil(max(ys) - min(ys)) + 2)
 
 
+class BristleStroke(FlatStroke):
+    """🖌 The Hair brush as bristles: each hair its own thin line, not a
+    picture of hairs dragged (FlatStroke) - that made hairs as thick as the
+    tip's pixels (2-3 px), and turning the pen switched between cached turns
+    of the picture in blocks along the stroke.
+
+    As a real brush (HeavyPaint's / Rebelle's bristles, Krita's bristle
+    engine):
+    * pressure splays it - a light touch is narrow, and only the hairs in
+      the middle reach the paper; pressing brings the outer ones down too,
+      each fading in, not switched on;
+    * every hair follows the brush with its own lag, so a turn sweeps the
+      hairs round in curves instead of the whole row jumping;
+    * Vary: hairs of uneven thickness and strength; Ragged: frayed starts
+      and hairs that run dry at different lengths; Hair edge: soft hairs.
+
+    The same buffers and compose() as FlatStroke (coverage the max within a
+    stroke, the colour cut by it). Worked out from the stamps alone (their
+    7th value the pen's pressure): laid live, again from a project, or for
+    an export, the same hairs."""
+
+    LEVELS = 48         # coverage steps (lines drawn in batches of one strength)
+    PER_HAIR = 2        # a stamp's colour (2, c1 .. cn): each hair's own (picked up, see sample_from)
+    # Hairs carrying a colour that changes as they go (Wet): each segment's
+    # colour laid this much over what the hair laid just before, like wet
+    # paint - laid whole, every stamp's step showed as a block along the hair.
+    CARRY_MIX = 0.45
+    carries = False
+
+    def __init__(self, rect, source=None, buffers=True):
+        if buffers:
+            super().__init__(rect, source)
+        else:
+            self.rect, self.source = rect, source       # (the model alone: gpu_flat.GpuBristleStroke draws)
+        self._hairs = None
+        self._pos = None            # (n, 2) where each hair is
+        self._travel = 0.0
+        self._at = None             # the last stamp's place
+        self._under = None          # Wet: what is under the stroke (device px, BGRA), see sample_from
+        self._carry = None          # Wet: (n, 3) the colour each hair carries now
+        self.recorded = []          # Wet: per stamp, each hair's colour - kept in the stroke
+
+    def sample_from(self, image):
+        """Wet: *image* - what is under the stroke, in this stroke's device
+        pixels - is what the hairs pick colour up from."""
+        img = image.convertToFormat(QImage.Format_ARGB32)
+        h, w = img.height(), img.width()
+        a = np.frombuffer(img.constBits(), np.uint8, count=img.sizeInBytes())
+        self._under = a.reshape(h, img.bytesPerLine())[:, :w * 4].reshape(h, w, 4).copy()
+
+    def stamped(self, stamps):
+        """*stamps* with each hair's colour as it was laid (Wet): laid again
+        - undo, a project, an export - the stroke keeps the colours it
+        picked up, without the canvas under it."""
+        if not self.recorded or len(self.recorded) != len(stamps):
+            return stamps
+        return [s[:5] + ((self.PER_HAIR,) + c,) + tuple(s[6:]) for s, c in zip(stamps, self.recorded)]
+
+    @staticmethod
+    def _make(params, n_hint=None):
+        n = max(2, min(400, int(params.get('n', 48))))
+        vary = max(0, min(100, int(params.get('v', 50)))) / 100.0
+        ragged = max(0, min(100, int(params.get('r', 40)))) / 100.0
+        soft = max(0, min(100, int(params.get('s', 30)))) / 100.0
+        width = max(1, min(200, int(params.get('w', 8)))) / 1000.0     # ‰ of the brush size
+        flat = max(0, min(100, int(params.get('f', 35)))) / 100.0
+        shape = max(0, min(100, int(params.get('h', 0)))) / 100.0
+        wet = max(0, min(100, int(params.get('x', 0)))) / 100.0
+        rng = np.random.default_rng(7919 + int(params.get('k', 17)))
+        # A bundle, not a row: the hairs spread evenly over an ellipse
+        # (Vogel's sunflower spiral), Flatness squashing it into a row. A
+        # row alone, turned along the stroke by the pen's lean, closed up
+        # into a single line.
+        i = np.arange(n) + 0.5
+        rad = np.sqrt(i / n) * (1.0 + vary * 0.25 * (rng.random(n) - 0.5))
+        turn = i * math.pi * (3.0 - math.sqrt(5.0)) + vary * 0.6 * (rng.random(n) - 0.5)
+        u = 0.5 * rad * np.cos(turn)                                    # across the brush
+        v = 0.5 * rad * np.sin(turn) * (1.0 - flat)                     # along it
+        if flat >= 0.999:
+            u = (np.arange(n) + 0.5) / n - 0.5 + (rng.random(n) - 0.5) * vary / n
+        reach = np.clip(np.hypot(u, v / max(1e-3, 1.0 - flat)) * 2.0 if flat < 0.999
+                        else np.abs(u) * 2.0, 0.0, 1.0)                 # 0 middle .. 1 edge
+        return {
+            'u': u,
+            'v': v,
+            'thick': width * (1.0 + vary * 0.9 * (rng.random(n) - 0.5)),
+            'strength': 1.0 - vary * 0.5 * rng.random(n),
+            # the pressure a hair needs to touch: the middle ones first
+            'contact': np.clip(0.03 + 0.72 * reach ** 1.4 + ragged * 0.25 * (rng.random(n) - 0.4),
+                               0.0, 0.95),
+            'start': ragged * 0.6 * rng.random(n),                      # x size: frayed start
+            'dry': (10.0 + 45.0 * rng.random(n)) * (1.7 - ragged),      # x size: the ink it holds
+            'dry_floor': 1.0 - 0.85 * ragged,
+            'lag': 0.35 + 0.45 * rng.random(n),                         # share of the way per stamp
+            'soft': soft,
+            # Bristle shape: each hair's tip a flat dab, turned at random -
+            # a ribbon where it is dragged broadside, a thin line edgeways
+            'long': 1.0 + 5.0 * shape * (0.4 + 0.6 * rng.random(n)),
+            'axis': rng.random(n) * math.pi,
+            # Wet: how readily each hair takes up the paint it passes
+            'wet': wet * (0.45 + 0.55 * rng.random(n)),
+        }
+
+    @staticmethod
+    def _smooth(edge0, edge1, x):
+        t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    @staticmethod
+    def _colours(rgb, u):
+        """Each hair's colour: one for all, or across the hairs (streaks)."""
+        if isinstance(rgb, int):
+            return [rgb] * len(u)
+        bands = [c for c in rgb[1:] if isinstance(c, int)] if rgb and rgb[0] >= 0 else []
+        if not bands:
+            mean = particles_mean(rgb) if rgb and rgb[0] < 0 else 0xFFFFFF
+            return [mean] * len(u)
+        return [bands[min(len(bands) - 1, int((v + 0.5) * len(bands)))] for v in u]
+
+    def _hair_colours(self, rgb, u, pos, step, size, view):
+        """Each hair's colour for this stamp. Laid again: as the stamp keeps
+        it. Wet, live: the colour each hair carries - it takes up the paint
+        under it as it moves (by its wetness and how far it went), and is
+        topped up with the brush's own colour as far as it is not wet."""
+        n = len(u)
+        if isinstance(rgb, tuple) and rgb and rgb[0] == self.PER_HAIR and len(rgb) == n + 1:
+            return list(rgb[1:])
+        if isinstance(rgb, tuple) and rgb and rgb[0] < 0:
+            # Colour jitter 'every speck (particles)': every hair its own
+            # colour from them (HeavyPaint's per-point colour), the same hair
+            # the same colour all along - dealt once, from the first stamp
+            # (the stamps' sets change at random: each stamp anew flickered).
+            # Their average, as before, gave the bristles one colour.
+            dealt = self.__dict__.get('_dealt')
+            if dealt is None:
+                # Dealt across the brush, not at random: hairs side by side
+                # (by their place across it) in runs of 1-3 of one colour. The
+                # bundle's hairs trail one another on the same track - given
+                # different colours they took turns on top, step by step: a
+                # dashed ladder along the strands.
+                colours = [c for c in rgb[1:] if isinstance(c, int)] or [0xFFFFFF]
+                rng = np.random.default_rng(104729 + n)
+                dealt = [0] * n
+                order = np.argsort(np.round(np.asarray(u) * 4 * n))       # (across, a hair's breadth apart)
+                j = 0
+                while j < n:
+                    colour = colours[int(rng.integers(0, len(colours)))]
+                    run = int(rng.integers(1, 4))
+                    for idx in order[j:j + run]:
+                        dealt[int(idx)] = colour
+                    j += run
+                dealt = self._dealt = dealt
+            base = list(dealt)
+        else:
+            base = self._colours(rgb, u)
+        if self._under is None:
+            return base
+        hairs = self._hairs
+        fresh = np.array([((c >> 16) & 255, (c >> 8) & 255, c & 255) for c in base], np.float64)
+        if self._carry is None:
+            self._carry = fresh.copy()
+        if pos is not None and step > 0:
+            h, w = self._under.shape[:2]
+            dx = view.m11() * pos[:, 0] + view.m21() * pos[:, 1] + view.dx() - self.rect.x()
+            dy = view.m12() * pos[:, 0] + view.m22() * pos[:, 1] + view.dy() - self.rect.y()
+            xi = np.clip(np.rint(dx).astype(np.int64), 0, w - 1)
+            yi = np.clip(np.rint(dy).astype(np.int64), 0, h - 1)
+            px = self._under[yi, xi].astype(np.float64)              # B G R A
+            seen = px[:, 3] / 255.0
+            under = px[:, [2, 1, 0]]
+            k = (1.0 - np.exp(-hairs['wet'] * step / (0.5 * size))) * seen
+            self._carry += (under - self._carry) * k[:, None]
+            reload = (1.0 - hairs['wet']) * (1.0 - math.exp(-step / (0.8 * size)))
+            self._carry += (fresh - self._carry) * reload[:, None]
+        c = np.clip(np.rint(self._carry), 0, 255).astype(np.int64)
+        cols = [int((r << 16) | (g << 8) | b) for r, g, b in c]
+        self.recorded.append(tuple(cols))
+        return cols
+
+    def segments(self, texture, stamps, view):
+        """The bristles moved on over *stamps* (picture coords, *view* to
+        device px): per stamp laid, (p0, p1, width, alpha, colours) - where
+        each hair's line runs (n, 2 device px of this stroke's rect), its
+        width (device px), how strongly it lays (0..1) and its colour
+        (0xRRGGBB ints, n). All in arrays: no work hair by hair, so a brush
+        of a couple of hundred hairs costs about what one of a dozen does.
+        The CPU (add) and the graphics card (gpu_flat.GpuBristleStroke) draw
+        the same segments."""
+        params = getattr(texture, 'hair_params', None) or {}
+        if self._hairs is None:
+            self._hairs = self._make(params)
+        hairs = self._hairs
+        u, v, lag = hairs['u'], hairs['v'], hairs['lag']
+        scale = math.sqrt(abs(view.determinant())) or 1.0
+        m11, m12, m21, m22 = view.m11(), view.m12(), view.m21(), view.m22()
+        ox, oy = view.dx() - self.rect.x(), view.dy() - self.rect.y()
+        out = []
+        self.seg_stamps = index = []        # (which stamp each of *out* is)
+        for i_stamp, stamp in enumerate(stamps):
+            x, y, size, angle, opacity, rgb = stamp[:6]
+            pressure = stamp[6] if len(stamp) > 6 else 1.0
+            if size * scale < 0.4:
+                self._hair_colours(rgb, u, None, 0.0, size, view)      # (kept in step with the stamps)
+                continue
+            ax, ay = -math.sin(angle), math.cos(angle)                  # across the brush
+            fx, fy = ay, -ax                                            # along it
+            spread = size * (0.42 + 0.58 * max(0.0, min(1.0, pressure)))
+            tx = x + (ax * u + fx * v) * spread
+            ty = y + (ay * u + fy * v) * spread
+            if self._pos is None:
+                self._pos = np.stack([tx, ty], 1)
+                self._at = (x, y)
+                self._hair_colours(rgb, u, None, 0.0, size, view)
+                continue
+            step = math.hypot(x - self._at[0], y - self._at[1])
+            self._travel += step
+            self._at = (x, y)
+            prev = self._pos
+            new = np.stack([prev[:, 0] + (tx - prev[:, 0]) * lag, prev[:, 1] + (ty - prev[:, 1]) * lag], 1)
+            self._pos = new
+            colours = np.asarray(self._hair_colours(rgb, u, new, step, size, view), np.int64)
+            if self._under is not None or (isinstance(rgb, tuple) and rgb and rgb[0] == self.PER_HAIR):
+                self.carries = True         # each hair's own colour, changing as it goes
+            touch = self._smooth(hairs['contact'] - 0.12, hairs['contact'] + 0.05, pressure)
+            started = self._smooth(hairs['start'] * size, hairs['start'] * size + 0.15 * size, self._travel)
+            ink = np.maximum(hairs['dry_floor'],
+                             1.0 - np.clip((self._travel - hairs['dry'] * size) / (3.0 * size), 0.0, 1.0))
+            alpha = np.clip(opacity * hairs['strength'] * touch * started * ink, 0.0, 1.0)
+            # each hair's trace: its flat tip's width across the way it moves
+            mx, my = new[:, 0] - prev[:, 0], new[:, 1] - prev[:, 1]
+            ml = np.hypot(mx, my)
+            ml[ml < 1e-9] = 1.0
+            nx, ny = -my / ml, mx / ml
+            axis = hairs['axis'] + angle
+            along = np.abs(np.cos(axis) * nx + np.sin(axis) * ny)
+            across = np.sqrt(np.clip(1.0 - along * along, 0.0, 1.0))
+            width = hairs['thick'] * size * scale * np.hypot(hairs['long'] * along, across)
+            thin = width < 0.8                  # thinner than a pixel: fainter instead
+            alpha = np.where(thin, alpha * width / 0.8, alpha)
+            width = np.where(thin, 0.8, width)
+            p0 = np.stack([m11 * prev[:, 0] + m21 * prev[:, 1] + ox, m12 * prev[:, 0] + m22 * prev[:, 1] + oy], 1)
+            p1 = np.stack([m11 * new[:, 0] + m21 * new[:, 1] + ox, m12 * new[:, 0] + m22 * new[:, 1] + oy], 1)
+            out.append((p0, p1, width, alpha, colours))
+            index.append(i_stamp)
+        return out
+
+    def add(self, texture, stamps, view):
+        """Lay *stamps* (see segments) into the buffers with QPainter: lines
+        batched by strength, width and colour. While the stroke has one
+        colour every line goes in one batch (their order does not matter);
+        once colours differ - Wet, streaks, jitter - each stamp is a batch of
+        its own, so crossing hairs lie in the order they were laid however
+        the stamps come in (live a pen event at a time, again all at once)."""
+        segs = self.segments(texture, stamps, view)
+        if not segs:
+            return None
+        hairs = self._hairs
+        batches = []
+        buckets = {}
+        x0 = y0 = math.inf
+        x1 = y1 = -math.inf
+        for p0, p1, width, alpha, colours in segs:
+            if self.carries:
+                # (in 32 steps a channel: the hairs share batches - on the CPU
+                # one line a draw is what costs)
+                colours = (colours & 0xF8F8F8) | 0x040404
+            if not self.__dict__.get('_many'):
+                one = self.__dict__.setdefault('_one', int(colours[0]))
+                if (colours != one).any():
+                    self._many = True
+            if self.__dict__.get('_many') and buckets:
+                batches.append(buckets)
+                buckets = {}
+            live = np.flatnonzero(alpha > 0.01)
+            if not len(live):
+                continue
+            levels = np.maximum(1, np.rint(alpha[live] * self.LEVELS)).astype(np.int64)
+            steps = np.rint(width[live] * 4) / 4
+            for j, i in enumerate(live):
+                key = (int(levels[j]), float(steps[j]), int(colours[i]))
+                buckets.setdefault(key, []).append(
+                    QLineF(float(p0[i, 0]), float(p0[i, 1]), float(p1[i, 0]), float(p1[i, 1])))
+            x0 = min(x0, float(p0[live, 0].min()), float(p1[live, 0].min()))
+            x1 = max(x1, float(p0[live, 0].max()), float(p1[live, 0].max()))
+            y0 = min(y0, float(p0[live, 1].min()), float(p1[live, 1].min()))
+            y1 = max(y1, float(p0[live, 1].max()), float(p1[live, 1].max()))
+        if buckets:
+            batches.append(buckets)
+        if not batches:
+            return None
+        soft = hairs['soft']
+        mp, cp = QPainter(self.mask), QPainter(self.colour)
+        mp.setCompositionMode(QPainter.CompositionMode_Lighten)
+        for p in (mp, cp):
+            p.setRenderHint(QPainter.Antialiasing, True)
+        widest = 0.0
+        for (level, w, rgb), lines in (item for batch in batches for item in batch.items()):
+            grey = int(round(255 * level / self.LEVELS))
+            colour = QColor((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255)
+            if self.carries:
+                colour.setAlphaF(self.CARRY_MIX)
+            if soft > 0:
+                # a soft hair: a faint wider halo under the core
+                halo = w * (1.0 + 2.0 * soft)
+                widest = max(widest, halo)
+                g = int(grey * 0.35)
+                mp.setPen(QPen(QColor(g, g, g), halo, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                mp.drawLines(lines)
+                cp.setPen(QPen(colour, halo, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                cp.drawLines(lines)
+            widest = max(widest, w)
+            mp.setPen(QPen(QColor(grey, grey, grey), w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            mp.drawLines(lines)
+            cp.setPen(QPen(colour, w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            cp.drawLines(lines)
+        mp.end()
+        cp.end()
+        pad = int(math.ceil(widest)) + 2
+        box = QRect(int(math.floor(x0)) - pad, int(math.floor(y0)) - pad,
+                    int(math.ceil(x1 - x0)) + 2 * pad, int(math.ceil(y1 - y0)) + 2 * pad)
+        return box.translated(self.rect.x(), self.rect.y()).intersected(self.rect)
+
+
+_GPU_BRISTLES_OFF = False
+
+
+def _bristles_on_gpu(texture, stamps, view, box):
+    """🖌 A bristle stroke laid again (undo, a zoom, a project, an export)
+    on the graphics card - the same segments as the CPU's, a couple of
+    hundred hairs in ms, not seconds. The image of *box* (device px), or
+    None to lay it on the CPU: no card, too big, or a live stroke using its
+    buffers right now."""
+    global _GPU_BRISTLES_OFF
+    if _GPU_BRISTLES_OFF or box.width() > 8192 or box.height() > 8192:
+        return None
+    try:
+        from random_image_viewer.drawing import gpu_paint
+        from random_image_viewer.drawing.gpu_flat import GpuBristleStroke, flat_kit
+        gpu = gpu_paint.shared()
+        if getattr(flat_kit(gpu), 'busy', None) is not None:
+            return None
+        layer = gpu_paint.GpuLayer(box.width(), box.height(), precision='byte')
+    except Exception as e:
+        print(f"🖌 Bristles laid on the CPU: {e}")
+        _GPU_BRISTLES_OFF = True
+        return None
+    try:
+        model = BristleStroke(QRect(box.x(), box.y(), box.width(), box.height()), buffers=False)
+        g = GpuBristleStroke(layer, model)
+        try:
+            segs = _bristle_segments_again(model, texture, stamps, view)
+            if segs is None:
+                g.add(texture, stamps, view)
+                _bristle_segments_keep(model, texture, stamps, view)
+            else:
+                g.add_segments(segs)
+            g.preview()
+            return g.read_overlay(QRect(0, 0, box.width(), box.height()))
+        finally:
+            g.cancel()
+    except Exception as e:
+        print(f"🖌 Bristles laid on the CPU: {e}")
+        return None
+    finally:
+        layer.release()
+
+
+# ⛰ The last bristle stroke's segments laid again, kept: the thickness map
+# lays each stroke twice (the relief under it levelled, then its own) - the
+# same hairs going the same way, only stronger or weaker stamp by stamp.
+# Working out where the hairs go was most of each lay (~40 ms of ~45); the
+# second lay takes the first's, each hair's strength scaled by its stamp's
+# (linear: a hair's strength is its stamp's opacity times things of 1 or
+# less - never clipped).
+_BRISTLE_KEPT = None
+
+
+def _bristle_key(model, texture, stamps, view):
+    return (id(texture), getattr(texture, 'path', None),
+            (view.m11(), view.m12(), view.m21(), view.m22(), view.dx(), view.dy()),
+            (model.rect.x(), model.rect.y(), model.rect.width(), model.rect.height()),
+            tuple(tuple(st[:4]) + tuple(st[5:]) for st in stamps))
+
+
+def _bristle_segments_keep(model, texture, stamps, view):
+    global _BRISTLE_KEPT
+    segs = getattr(model, 'last_segments', None)
+    if not segs or model.carries:
+        _BRISTLE_KEPT = None
+        return
+    _BRISTLE_KEPT = (_bristle_key(model, texture, stamps, view), segs, list(model.seg_stamps),
+                     [float(st[4]) for st in stamps], model._hairs)
+
+
+def _bristle_segments_again(model, texture, stamps, view):
+    """The kept segments for *stamps* (those, at other opacities) scaled
+    to theirs - or None: not the same stroke."""
+    kept = _BRISTLE_KEPT
+    if kept is None:
+        return None
+    key, segs, index, was, hairs = kept
+    if len(stamps) != len(was) or key != _bristle_key(model, texture, stamps, view):
+        return None
+    now = [float(st[4]) for st in stamps]
+    out = []
+    for (p0, p1, width, alpha, colours), i in zip(segs, index):
+        if was[i] <= 0.0:
+            if now[i] > 0.0:
+                return None
+            out.append((p0, p1, width, alpha, colours))
+        else:
+            out.append((p0, p1, width, alpha * (now[i] / was[i]), colours))
+    model._hairs = hairs
+    return out
+
+
+def is_bristles(texture):
+    """The Hair brush laid as bristles (BristleStroke)."""
+    return bool(getattr(texture, 'bristle_engine', False))
+
+
+def flat_stroke(texture, rect, source=None):
+    """The flat stroke for *texture*: bristles for the Hair brush, else
+    the tip dragged (FlatStroke)."""
+    return BristleStroke(rect, source) if is_bristles(texture) else FlatStroke(rect, source)
+
+
 def paint_stamps(painter, texture, stamps, to_display, clip=None, flat=False, history=None):
     """Draw *stamps* (picture coords) through *to_display*, a QTransform from
     picture to the painter's device. *clip*: (w, h) of the device, to skip
@@ -3061,9 +3553,12 @@ def paint_stamps(painter, texture, stamps, to_display, clip=None, flat=False, hi
         if box.isEmpty():
             return None
         source = (history[0], view, history[1]) if history is not None else None
-        stroke = FlatStroke(box, source)
-        stroke.add(texture, stamps, view)
-        image = stroke.compose(box)
+        image = (_bristles_on_gpu(texture, stamps, view, box)
+                 if source is None and is_bristles(texture) else None)
+        if image is None:
+            stroke = flat_stroke(texture, box, source)
+            stroke.add(texture, stamps, view)
+            image = stroke.compose(box)
         painter.save()
         painter.resetTransform()
         painter.drawImage(box.topLeft(), image)
@@ -3095,7 +3590,7 @@ def paint_stamps(painter, texture, stamps, to_display, clip=None, flat=False, hi
             view = view * QTransform.fromTranslate(-box.x(), -box.y())
     painter.save()
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-    for x, y, size, angle, opacity, rgb in stamps:
+    for x, y, size, angle, opacity, rgb, *_pressure in stamps:
         on_screen = size * scale
         if on_screen < 0.4 or opacity <= 0:
             continue
@@ -3148,7 +3643,7 @@ def _paint_spray(painter, texture, stamps, to_display, clip=None):
     rel = float(getattr(texture, 'speck', 0.02))
     palette = {}
     parts = []
-    for x, y, size, angle, opacity, rgb in stamps:
+    for x, y, size, angle, opacity, rgb, *_pressure in stamps:
         if opacity <= 0:
             continue
         radius = size * 0.5 * scale

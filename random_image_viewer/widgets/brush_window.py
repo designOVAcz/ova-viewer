@@ -66,6 +66,18 @@ class BrushWindow(QWidget):
         ('hair_ragged', 'Ragged', (0, 100), '%', "Hair brush: how much the hairs differ in length - a "
                                                  "frayed start and end of each stroke"),
         ('hair_soft', 'Hair edge', (0, 100), '%', "Hair brush: hard (0) to soft hair edges"),
+        ('hair_width', 'Hair width', (1, 60), '‰', "Hair brush: each hair's thickness, in ‰ of the "
+                                                   "brush size (8 ‰ of 108 px: under a pixel - "
+                                                   "fine hairs). Thinner than a pixel, a hair shows fainter"),
+        ('hair_flat', 'Flatness', (0, 100), '%', "Hair brush: 0 a round bundle (the same width whichever "
+                                                 "way it turns), 100 a flat row of hairs (a thin line "
+                                                 "when dragged edgeways, like a flat brush)"),
+        ('hair_shape', 'Bristle', (0, 100), '%', "Hair brush: each hair's tip - 0 round, up to a long flat "
+                                                 "dab turned at random: a wide ribbon where it drags "
+                                                 "broadside, a thin line edgeways (HeavyPaint's bristles)"),
+        ('hair_wet', 'Wet', (0, 100), '%', "Hair brush: how much each hair picks up the paint under it and "
+                                           "smears it on - wet into wet. 0: clean paint. The colours it "
+                                           "picked up stay with the stroke (undo, projects, export)"),
         ('hair_seed', 'Brush #', (0, 99), '', "Hair brush: another number, another brush - the same "
                                               "settings with other hairs"),
         ('rake_tines', 'Tines', (2, 40), '', "Rake: how many tines in the row (the row is the brush size wide)"),

@@ -1638,9 +1638,12 @@ class RandomImageViewer(QMainWindow):
             return None
         old = QRectF(kept['rect'])
         need = QRectF(need).united(old)
-        # Whole pixels of offset, so the old image is copied, not resampled.
-        dx = max(0, math.ceil((old.x() - need.x()) * k - 1e-6))
-        dy = max(0, math.ceil((old.y() - need.y()) * k - 1e-6))
+        # Whole pixels of offset, so the old image is copied, not resampled -
+        # an even number: the thickness map (half the size) moves whole
+        # pixels too, and is copied the same way (see _update_height).
+        step = max(1, round(1.0 / self._HEIGHT_SCALE))
+        dx = step * max(0, math.ceil(((old.x() - need.x()) * k - 1e-6) / step))
+        dy = step * max(0, math.ceil(((old.y() - need.y()) * k - 1e-6) / step))
         x, y = old.x() - dx / k, old.y() - dy / k
         rect = QRectF(x, y, need.right() - x, need.bottom() - y)
         w, h = self._canvas_view(rect, k)[:2]
@@ -1896,7 +1899,7 @@ class RandomImageViewer(QMainWindow):
                     jobs.pop(0)
                     return
                 if mark.flat:
-                    work = brushes.FlatStroke(box, None)
+                    work = brushes.flat_stroke(texture, box, None)
                 else:
                     work = QImage(box.size(), QImage.Format_ARGB32_Premultiplied)
                     work.fill(Qt.transparent)
@@ -2146,6 +2149,17 @@ class RandomImageViewer(QMainWindow):
                                 'box': QRect(box), 'image': img.copy(box)})
                 patches = patches[-self._PATCHES_KEPT:]
             packed = hm.get('packed')
+        elif (grown := self._grown_height(hm, marks, rect, k, key, want)) is not None:
+            # the layer image grew (a stroke past its edge): the map moved
+            # into a bigger one, only the new marks laid - all of them laid
+            # again took seconds at every stroke past the edge
+            img, done, patches = grown
+            box = self._marks_canvas_box(marks[done:], rect, k, img)
+            dirty, packed = None, None
+            if not box.isEmpty():
+                patches.append({'count': done, 'last': marks[done - 1][1],
+                                'box': QRect(box), 'image': img.copy(box)})
+                patches = patches[-self._PATCHES_KEPT:]
         else:
             img = QImage(want, QImage.Format_RGBA64_Premultiplied)
             img.fill(Qt.transparent)
@@ -2160,8 +2174,32 @@ class RandomImageViewer(QMainWindow):
         layer.height_map = {'key': key, 'canvas': serial, 'image': img, 'count': n,
                             'last': marks[-1][1] if marks else None, 'dirty': dirty,
                             'serial': (hm['serial'] + 1) if hm is not None else 1,
-                            'patches': patches, 'packed': packed}
+                            'patches': patches, 'packed': packed, 'rect': QRectF(rect), 'k': k}
         self._pack_height(layer.height_map, [box] if (box is not None and not box.isEmpty()) else None)
+
+    def _grown_height(self, hm, marks, rect, k, key, want):
+        """The thickness map *hm* moved whole into one of size *want* for the
+        layer image's bigger *rect* (same marks before, same scale *k*, the
+        map's): (image, marks done, patches moved) or None."""
+        if (hm is None or hm.get('rect') is None or not hm['count'] or hm['count'] > len(marks)
+                or marks[hm['count'] - 1][1] is not hm['last'] or abs(hm['k'] - k) > 1e-9
+                or not isinstance(key, tuple) or not isinstance(hm['key'], tuple)
+                or len(key) != len(hm['key']) or key[:3] != hm['key'][:3] or key[7:] != hm['key'][7:]):
+            return None
+        old = hm['rect']
+        fx, fy = (old.x() - rect.x()) * k, (old.y() - rect.y()) * k
+        dx, dy = round(fx), round(fy)
+        if (abs(fx - dx) > 1e-3 or abs(fy - dy) > 1e-3 or dx < 0 or dy < 0
+                or dx + hm['image'].width() > want.width() + 1 or dy + hm['image'].height() > want.height() + 1):
+            return None             # (not a whole-pixel move into a bigger one: laid again)
+        img = QImage(want, QImage.Format_RGBA64_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.drawImage(dx, dy, hm['image'])
+        p.end()
+        patches = [dict(pt, box=pt['box'].translated(dx, dy)) for pt in (hm.get('patches') or [])]
+        return img, hm['count'], patches
 
     def _height_undo(self, layer, marks, key, canvas):
         """The thickness map back to fewer *marks* from its kept patches (as
@@ -11002,7 +11040,8 @@ class RandomImageViewer(QMainWindow):
             self._update_brush_button()
         if key in ('angle', 'angle_mode', 'mode', 'spray_spread', 'rake_tines', 'rake_tine',
                    'rake_wobble', 'soft_softness', 'hair_count', 'hair_vary', 'hair_ragged',
-                   'hair_soft', 'hair_seed') and self.free_draw_mode:
+                   'hair_soft', 'hair_seed', 'hair_width', 'hair_flat', 'hair_shape',
+                   'hair_wet') and self.free_draw_mode:
             self.apply_tool_cursor()
 
     def _add_brush_textures(self, paths):
@@ -11221,12 +11260,24 @@ class RandomImageViewer(QMainWindow):
                                                   self.brush_settings['spacing'],
                                                   self.brush_settings.get('pigment', True))
         else:
-            self._flat_live = (brushes.FlatStroke(image.rect(), source)
+            self._flat_live = (brushes.flat_stroke(texture, image.rect(), source)
                                if (self._stamp_trail.settings['flat'] or history) and image is not None
                                else None)
             self._gpu_flat = self._gpu_flat_stroke(image, mode, history, texture)
             if self._gpu_flat is not None:
                 self._flat_live = None      # laid on the graphics card instead (see _gpu_flat_stroke)
+            live_hairs = (self._flat_live if self._flat_live is not None
+                          else getattr(self._gpu_flat, 'model', None))     # (🖌 on the card: its bristles)
+            if (isinstance(live_hairs, brushes.BristleStroke) and mode == 'paint'
+                    and int(self.brush_settings.get('hair_wet', 0) or 0) > 0):
+                # 🖌 Wet: the hairs pick up what is under them (as Sample reads it)
+                under = self._sample_view()
+                if under is not None and not under.isNull():
+                    under_img = under.toImage()
+                    if under_img.size() != image.size():       # (the buffer in the screen's own px)
+                        under_img = under_img.scaled(image.size(), Qt.IgnoreAspectRatio,
+                                                     Qt.SmoothTransformation)
+                    live_hairs.sample_from(under_img)
         self._flat_live_box, self._flat_live_count = None, 0
         self._flat_pending = None
         self._live_stamp_count = 0
@@ -13761,7 +13812,10 @@ class RandomImageViewer(QMainWindow):
 
     def _texture_cursor_key(self):
         angle, turn = self._texture_cursor_turn()
-        return (self.brush_settings['texture'], int(self.line_thickness),
+        # (the tip's own path: a procedural tip's settings are in it - the
+        # 🖌 bristle cursor changes with Hairs, Flatness, Bristle ...)
+        tip = self._brush_texture()
+        return (getattr(tip, 'path', None) or self.brush_settings['texture'], int(self.line_thickness),
                 round(math.degrees(angle) / 4) % 90,     # 4° steps
                 round(turn.m11()), round(turn.m12()), round(turn.m21()), round(turn.m22()),
                 angle, turn)
@@ -16181,7 +16235,13 @@ class RandomImageViewer(QMainWindow):
         if self.__dict__.get('_gpu_display'):
             gpu = self.__dict__.get('_gpu_canvas')
             if gpu is not None and gpu.active:
-                if rect is None:
+                if rect is None or self.__dict__.get('_gpu_flat') is not None:
+                    # (a stroke laid on the card: the whole canvas each frame -
+                    # every layer is a texture there already, so it is cheap.
+                    # A piece redrawn left a bare 1 px row along its top: Qt's
+                    # own painting (the background, the clip) and the GL drawing
+                    # (layers, the stroke) a row apart at its edge - a ladder of
+                    # grey lines through the stroke while the pen was down.)
                     gpu._full = True
                     gpu.update()
                 else:
@@ -16207,6 +16267,7 @@ class RandomImageViewer(QMainWindow):
             return None
         try:
             from random_image_viewer.drawing.gpu_paint import GpuLayer, GpuFlatStroke
+            from random_image_viewer.drawing.gpu_flat import GpuBristleStroke
             w, h = image.width(), image.height()
             layer = self.__dict__.get('_gpu_flat_layer')
             if layer is None or (layer.width, layer.height) != (w, h):
@@ -16217,6 +16278,10 @@ class RandomImageViewer(QMainWindow):
                         pass
                 layer = self._gpu_flat_layer = GpuLayer(w, h, precision='byte')
             self._gpu_flat_dirty = False
+            if brushes.is_bristles(texture):
+                # 🖌 every hair a strip on the card, a pen event one draw: a
+                # couple of hundred hairs at ~0.5 ms (the CPU's lines: ~15 ms)
+                return GpuBristleStroke(layer, brushes.BristleStroke(QRect(0, 0, w, h), buffers=False))
             return GpuFlatStroke(layer)
         except Exception as e:
             print(f"🎮 GPU brush off, the CPU one paints: {e}")
@@ -16636,8 +16701,13 @@ class RandomImageViewer(QMainWindow):
                     stroke.flat = True
                 stroke.erase = trail.settings['mode'] == 'erase'
                 stroke.clip = self.__dict__.get('_pending_clip')    # a shape run over (_brush_along)
+                live_hairs = (self._flat_live if self._flat_live is not None
+                              else getattr(self.__dict__.get('_gpu_flat'), 'model', None))
                 stroke.render = (self._finished_render(trail, stamps)
                                  or self._live_stroke_render(trail, stamps))
+                if isinstance(live_hairs, brushes.BristleStroke) and live_hairs.recorded:
+                    # 🖌 Wet: the colours each hair picked up, kept with the stroke
+                    stroke.stamps = live_hairs.stamped(list(stroke.stamps))
                 self.drawn_free_strokes.append(stroke)
                 self._undo_stack.append('free_stroke')
             self.apply_tool_cursor()    # the outline turns back to the pen's lean

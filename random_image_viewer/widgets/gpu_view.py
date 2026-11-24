@@ -18,7 +18,7 @@ on the canvas are drawn over it as they look (grabbed once per zoom).
 import math
 
 from PySide6.QtCore import QSize, QEvent, QPoint, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QRegion
+from PySide6.QtGui import QColor, QPainter, QRegion, QTransform
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget
 
@@ -312,7 +312,14 @@ class GpuView(QOpenGLWidget):
                 dw, dh = self._device_size(self.width(), self.height(), dpr)
                 self._area_dev = QRect(x0, y0, x1 - x0, y1 - y0).intersected(QRect(0, 0, dw, dh))
                 area = QRectF(x0 / dpr, y0 / dpr, (x1 - x0) / dpr, (y1 - y0) / dpr)
-                p.setClipRect(area)
+                # QPainter's clip a hair inside those device pixels: x0 / 1.5
+                # * 1.5 came back as x0 - 1e-13 now and then, Qt took the row
+                # above for part of the clip and laid the background there -
+                # where the scissor (layer, stroke textures) does not reach: a
+                # bare 1 px row at the top of each piece redrawn while painting,
+                # a ladder of grey lines through a GPU stroke.
+                eps = 1e-3 / dpr
+                p.setClipRect(area.adjusted(eps, eps, -eps, -eps))
             p.fillRect(self.rect(), self._background)
             p.setRenderHint(QPainter.SmoothPixmapTransform, True)
             self._painted = {image.cacheKey() for image, *_r in self._items if image is not None}
@@ -741,19 +748,28 @@ class GpuView(QOpenGLWidget):
 
     def _draw_impasto(self, p, image, note, transform, opacity, area):
         """⛰ A layer (premultiplied *image*, its note) lit from its thickness
-        map (note['impasto']) on the graphics card. False when it cannot."""
+        map (note['impasto']) on the graphics card. False when it cannot.
+
+        The lit layer is kept as a picture of the screen (a framebuffer of
+        the window's size) and only blitted while nothing about it changes.
+        Lit again every frame - 18 lookups of the thickness map a pixel over
+        the whole window, every frame of a stroke (painting asks for whole
+        frames) - each pen event waited ~5 ms on it, 0.5 ms without
+        impasto. Lit straight onto the screen while it changes (painted
+        into, the view moving); kept once a frame finds it the same."""
         imp = note.get('impasto') if isinstance(note, dict) else None
         if imp is None or getattr(self, '_impasto_failed', False):
             return False
-        from PySide6.QtGui import QMatrix4x4, QTransform
         from PySide6.QtOpenGL import QOpenGLTexture
-        GL_TEXTURE_2D, GL_TEXTURE0, GL_BLEND, GL_SCISSOR_TEST = 0x0DE1, 0x84C0, 0x0BE2, 0x0C11
-        GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_TRIANGLE_STRIP = 1, 0x0303, 0x0005
+        hnote = imp['note']
+        # (anything still to send up to the card: it changed)
+        pending = any(n.get('all') or n.get('rects') or n.get('key') != img.cacheKey()
+                      for n, img in ((note, image), (hnote, imp['packed'])))
         try:
             p.beginNativePainting()
             try:
                 tex = self._layer_texture(image, note)
-                htex = self._layer_texture(imp['packed'], imp['note'])
+                htex = self._layer_texture(imp['packed'], hnote)
                 if tex is None or htex is None:
                     return False
                 if getattr(htex, '_mips_stale', True):
@@ -762,45 +778,52 @@ class GpuView(QOpenGLWidget):
                 if htex.minificationFilter() != QOpenGLTexture.LinearMipMapLinear:
                     htex.setMinificationFilter(QOpenGLTexture.LinearMipMapLinear)
                 self._sharp_filter(tex, transform)
-                prog = self._impasto_program()
-                f = self.context().functions()
                 dpr = self.devicePixelRatioF()
-                W, H = self.width(), self.height()
-                dw, dh = self._device_size(W, H, dpr)
-                f.glViewport(0, 0, dw, dh)
-                dev = getattr(self, '_area_dev', None) if area is not None else None
-                if dev is not None:
-                    f.glEnable(GL_SCISSOR_TEST)
-                    f.glScissor(dev.x(), dh - dev.y() - dev.height(), dev.width(), dev.height())
-                f.glEnable(GL_BLEND)
-                f.glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)          # premultiplied
-                f.glActiveTexture(GL_TEXTURE0 + 1)
-                f.glBindTexture(GL_TEXTURE_2D, htex.textureId())
-                f.glActiveTexture(GL_TEXTURE0)
-                f.glBindTexture(GL_TEXTURE_2D, tex.textureId())
-                quad = QTransform(image.width(), 0, 0, image.height(), 0, 0)
-                clip = self._clip_space(W, H, dpr)
-                prog.bind()
-                prog.setUniformValue("matrix", QMatrix4x4(quad * transform * clip))
-                prog.setUniformValue1i("colour", 0)
-                prog.setUniformValue1i("height", 1)
-                # (the slopes are taken a texel of the thickness map apart: it is smaller)
-                prog.setUniformValue("texel", 1.0 / imp['packed'].width(), 1.0 / imp['packed'].height())
-                for name, value in imp['uniforms'].items():
-                    if isinstance(value, tuple):
-                        prog.setUniformValue(name, *[float(v) for v in value])
-                    else:
-                        prog.setUniformValue1f(name, float(value))
-                prog.setUniformValue1f("opacity", float(opacity))
-                self._blend_vao.bind()
-                f.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
-                self._blend_vao.release()
-                prog.release()
-                if dev is not None:
-                    f.glDisable(GL_SCISSOR_TEST)
-                f.glActiveTexture(GL_TEXTURE0 + 1)
-                f.glBindTexture(GL_TEXTURE_2D, 0)
-                f.glActiveTexture(GL_TEXTURE0)
+                dw, dh = self._device_size(self.width(), self.height(), dpr)
+                serial = image.cacheKey() >> 32
+                key = (image.cacheKey(), imp['packed'].cacheKey(), dw, dh, round(dpr, 4),
+                       tuple(round(v, 9) for v in (transform.m11(), transform.m12(), transform.m13(),
+                                                   transform.m21(), transform.m22(), transform.m23(),
+                                                   transform.m31(), transform.m32(), transform.m33())),
+                       round(float(opacity), 5),
+                       tuple(sorted(imp['uniforms'].items())))
+                cache = self.__dict__.setdefault('_impasto_kept', {})
+                kept = cache.get(serial)
+                self.__dict__.setdefault('_impasto_used', set()).add(serial)
+                to_canvas = QTransform.fromScale(1.0 / dpr, 1.0 / dpr)
+                if kept is not None and kept[0] == key and kept[1] is not None and not pending:
+                    self._blit(kept[1].texture(), dw, dh, to_canvas, 1.0, area)
+                    return True
+                if (pending or kept is None or kept[0] != key
+                        or getattr(self, '_impasto_fbo_failed', False)):
+                    cache[serial] = (key, None)     # (a picture kept before: freed)
+                    self._impasto_lit(image, imp, tex, htex, transform, opacity, area, dw, dh, dpr)
+                    return True
+                # the same as the frame before: lit once more, into a picture kept
+                f = self.context().functions()
+                fbo = None
+                try:
+                    from PySide6.QtOpenGL import QOpenGLFramebufferObject
+                    fbo = QOpenGLFramebufferObject(dw, dh)
+                    if not fbo.isValid():
+                        raise RuntimeError("framebuffer not made")
+                    fbo.bind()
+                    f.glDisable(0x0C11)                     # GL_SCISSOR_TEST: all of it
+                    f.glClearColor(0.0, 0.0, 0.0, 0.0)
+                    f.glClear(0x4000)                       # GL_COLOR_BUFFER_BIT
+                    self._impasto_lit(image, imp, tex, htex, transform, opacity, None, dw, dh, dpr,
+                                      flip=True)
+                except Exception as e:
+                    print(f"⛰ Impasto lit every frame (no picture kept): {e}")
+                    self._impasto_fbo_failed = True
+                    fbo = None
+                finally:
+                    f.glBindFramebuffer(0x8D40, self.defaultFramebufferObject())   # GL_FRAMEBUFFER
+                cache[serial] = (key, fbo)
+                if fbo is None:
+                    self._impasto_lit(image, imp, tex, htex, transform, opacity, area, dw, dh, dpr)
+                else:
+                    self._blit(fbo.texture(), dw, dh, to_canvas, 1.0, area)
                 return True
             finally:
                 p.endNativePainting()
@@ -808,6 +831,52 @@ class GpuView(QOpenGLWidget):
             print(f"⛰ Impasto on the graphics card off (lit on the CPU): {e}")
             self._impasto_failed = True
             return False
+
+    def _impasto_lit(self, image, imp, tex, htex, transform, opacity, area, dw, dh, dpr, flip=False):
+        """The lit layer drawn into what is bound: the screen, or the picture
+        kept (*flip*: row 0 at the top, a texture as _blit takes it)."""
+        from PySide6.QtGui import QMatrix4x4
+        GL_TEXTURE_2D, GL_TEXTURE0, GL_BLEND, GL_SCISSOR_TEST = 0x0DE1, 0x84C0, 0x0BE2, 0x0C11
+        GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_TRIANGLE_STRIP = 1, 0x0303, 0x0005
+        prog = self._impasto_program()
+        f = self.context().functions()
+        W, H = self.width(), self.height()
+        f.glViewport(0, 0, dw, dh)
+        dev = getattr(self, '_area_dev', None) if area is not None else None
+        if dev is not None:
+            f.glEnable(GL_SCISSOR_TEST)
+            f.glScissor(dev.x(), dh - dev.y() - dev.height(), dev.width(), dev.height())
+        f.glEnable(GL_BLEND)
+        f.glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)          # premultiplied
+        f.glActiveTexture(GL_TEXTURE0 + 1)
+        f.glBindTexture(GL_TEXTURE_2D, htex.textureId())
+        f.glActiveTexture(GL_TEXTURE0)
+        f.glBindTexture(GL_TEXTURE_2D, tex.textureId())
+        quad = QTransform(image.width(), 0, 0, image.height(), 0, 0)
+        clip = self._clip_space(W, H, dpr)
+        if flip:
+            clip = clip * QTransform(1, 0, 0, -1, 0, 0)
+        prog.bind()
+        prog.setUniformValue("matrix", QMatrix4x4(quad * transform * clip))
+        prog.setUniformValue1i("colour", 0)
+        prog.setUniformValue1i("height", 1)
+        # (the slopes are taken a texel of the thickness map apart: it is smaller)
+        prog.setUniformValue("texel", 1.0 / imp['packed'].width(), 1.0 / imp['packed'].height())
+        for name, value in imp['uniforms'].items():
+            if isinstance(value, tuple):
+                prog.setUniformValue(name, *[float(v) for v in value])
+            else:
+                prog.setUniformValue1f(name, float(value))
+        prog.setUniformValue1f("opacity", float(opacity))
+        self._blend_vao.bind()
+        f.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        self._blend_vao.release()
+        prog.release()
+        if dev is not None:
+            f.glDisable(GL_SCISSOR_TEST)
+        f.glActiveTexture(GL_TEXTURE0 + 1)
+        f.glBindTexture(GL_TEXTURE_2D, 0)
+        f.glActiveTexture(GL_TEXTURE0)
 
     def _blend_program(self):
         """The blend shader for this context (made once), or None."""
@@ -986,6 +1055,21 @@ class GpuView(QOpenGLWidget):
                 if not ours:
                     self.doneCurrent()
         self._used_textures = set()
+        kept = self.__dict__.get('_impasto_kept')
+        if kept:
+            # lit pictures of layers no longer drawn: freed (this context current)
+            used_lit = self.__dict__.get('_impasto_used') or set()
+            gone = [s_ for s_ in kept if s_ not in used_lit]
+            if gone:
+                from PySide6.QtGui import QOpenGLContext
+                ours = QOpenGLContext.currentContext() is self.context()
+                if not ours:
+                    self.makeCurrent()
+                for s_ in gone:
+                    kept.pop(s_)
+                if not ours:
+                    self.doneCurrent()
+        self._impasto_used = set()
 
 
 # -- 🎮 the GPU canvas: a native OpenGL window inside the canvas ---------------
@@ -1027,6 +1111,7 @@ class GpuCanvasWindow(QOpenGLWindow):
     _IMPASTO_FRAG = GpuView._IMPASTO_FRAG
     _impasto_program = GpuView._impasto_program
     _draw_impasto = GpuView._draw_impasto
+    _impasto_lit = GpuView._impasto_lit
     _sharp_filter = GpuView._sharp_filter
     _clip_space = staticmethod(GpuView._clip_space)
     _device_size = staticmethod(GpuView._device_size)
