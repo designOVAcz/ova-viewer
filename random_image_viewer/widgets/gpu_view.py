@@ -277,6 +277,60 @@ class GpuView(QOpenGLWidget):
         self._full = True
         self.update()
 
+    busy_note = None        # (text, 0..1): a loader over the canvas (see paint_busy)
+
+    def _draw_busy(self, p):
+        """The loader: a dark rounded box in the middle, its text and a bar."""
+        text, share = self.busy_note
+        p.save()
+        p.resetTransform()
+        p.setClipping(False)
+        p.setOpacity(1.0)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        font = p.font()
+        font.setPointSizeF(max(font.pointSizeF(), 10.0) * 1.15)
+        p.setFont(font)
+        fm = p.fontMetrics()
+        w = max(260, fm.horizontalAdvance(text) + 48)
+        h = fm.height() + 46
+        box = QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(28, 28, 30, 225))
+        p.drawRoundedRect(box, 10, 10)
+        p.setPen(QColor(235, 235, 235))
+        p.drawText(QRectF(box.x(), box.y() + 12, w, fm.height()), Qt.AlignCenter, text)
+        track = QRectF(box.x() + 24, box.bottom() - 22, w - 48, 6)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 45))
+        p.drawRoundedRect(track, 3, 3)
+        p.setBrush(QColor(90, 170, 255))
+        p.drawRoundedRect(QRectF(track.x(), track.y(), track.width() * max(0.0, min(1.0, share)),
+                                 track.height()), 3, 3)
+        p.restore()
+
+    def paint_busy(self, note):
+        """Show *note* ((text, share done) or None) now, while the app works
+        on the main thread: one whole frame painted at once - the event
+        loop is not run (a redraw let in would start the same work again).
+        The OpenGL context current before (the brush engine's) is made
+        current again after."""
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from PySide6.QtGui import QOpenGLContext
+        self.busy_note = note
+        if not self.isExposed():
+            return False
+        ctx = QOpenGLContext.currentContext()
+        surface = ctx.surface() if ctx is not None else None
+        try:
+            self._full = True
+            self.update()
+            QCoreApplication.sendEvent(self, QEvent(QEvent.UpdateRequest))
+        finally:
+            if ctx is not None and QOpenGLContext.currentContext() is not ctx:
+                ctx.makeCurrent(surface)
+        return True
+
     def update_area(self, rect):
         """Only *rect* (canvas coords) changed: the next paint redraws
         just that, over the frame kept from before."""
@@ -360,6 +414,8 @@ class GpuView(QOpenGLWidget):
             if self.active:
                 for pixmap, at in self._panels:
                     p.drawPixmap(at, pixmap)
+            if getattr(self, 'busy_note', None) is not None:
+                self._draw_busy(p)
         except Exception as e:          # a driver that will not: the plain path from now on
             print(f"🎮 GPU view failed, drawing on the CPU: {e}")
             self.failed = True
@@ -1097,6 +1153,8 @@ class GpuCanvasWindow(QOpenGLWindow):
     # the scene drawing, shared with GpuView
     set_scene = GpuView.set_scene
     update_area = GpuView.update_area
+    _draw_busy = GpuView._draw_busy
+    paint_busy = GpuView.paint_busy
     paintGL = GpuView.paintGL
     _layer_texture = GpuView._layer_texture
     _draw_layer_texture = GpuView._draw_layer_texture

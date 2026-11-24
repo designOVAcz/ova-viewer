@@ -69,6 +69,8 @@ DEFAULT_SETTINGS = {
     'size_jitter': 0,           # %: stamps up to this much smaller, at random
     'flat': True,               # stamps don't build up within a stroke (see FlatStroke)
     'mode': 'paint',            # one of MODES
+    'brush_blend': 'Normal',    # paint / history: the stroke blended with what is under
+                                #   it (a layers.BLEND_MODES name), kept as those pixels
     'sample': 'below',          # blend / smudge read: 'below' (this layer and the
                                 #   ones under it), 'layer' (this one only), 'all'
     'mix': 50,                  # %: blend - share of the colour under the pen;
@@ -103,7 +105,7 @@ MODES = ('paint', 'blend', 'smudge', 'history', 'pick', 'erase', 'smear', 'push'
 # 'smear': drags the very pixels under it into streaks (see DragStroke)
 # 'push': liquify - moves the pixels under it along, crisp, cracking like ice (PushStroke)
 # Modes that work on the pixels under the pen and are kept as those pixels
-PIXEL_MODES = ('blend', 'pick', 'smear', 'push')
+PIXEL_MODES = ('blend', 'pick', 'smear', 'push', 'smudge')
 # 'erase': the stroke - tip, size, pressure, opacity - rubs paint out of the
 # layer it is drawn on instead of laying any (see main_window: Stroke.erase)
 # Modes that blend like Blend ('pick': Blend with the colour picked under the
@@ -1589,6 +1591,9 @@ class StampTrail:
                     # Streaks picking up colour change it stamp by stamp:
                     # close stamps, so it flows instead of stepping in bands.
                     step = min(step, self._stamp_size(p) * 0.06)
+                if self.settings['mode'] == 'smudge' and self._sampler is None:
+                    # 👆 the pixel smudge (SmudgeStroke): a patch laid every few %
+                    step = self._stamp_size(p) * smudge_spacing(self.settings) / 100.0
                 step = max(self._unit * 0.5, step)
                 if walked + (step - self._travel) > dist:
                     break
@@ -2351,6 +2356,8 @@ class SmearStroke:
     (as Sample reads it), device-sized; *rect*: the device area it covers.
     """
 
+    REPLACES = False    # the carried patch laid over what is there (Smudge: in place of it)
+
     def __init__(self, rect, work, mix, spacing, paint_like=False):
         self.rect = rect
         # Pigment: what is taken up and the brush colour mix into the carried
@@ -2421,6 +2428,12 @@ class SmearStroke:
             p.setRenderHint(QPainter.SmoothPixmapTransform, True)
             p.setTransform(m)
             p.setOpacity(stamp[4])
+            if self.REPLACES:
+                # 👆 in place of what is there, not over it: the patch's
+                # empty (see-through) parts take paint away too
+                p.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+                p.drawImage(0, 0, tip)
+                p.setCompositionMode(QPainter.CompositionMode_Plus)
             p.drawImage(0, 0, lay)
             p.end()
             mp = QPainter(self.mask)
@@ -2469,6 +2482,76 @@ class SmearStroke:
         p.drawImage(0, 0, alpha)
         p.end()
         return out
+
+
+def smudge_spacing(settings):
+    """👆 Smudge's real stamp distance, % of the tip: Spacing, kept within
+    3-10 % - a carried patch laid a fifth of the tip apart showed each
+    lay as a step."""
+    return max(3.0, min(10.0, float(settings.get('spacing', 20))))
+
+
+class SmudgeStroke(SmearStroke):
+    """👆 Smudge: a pixel smudge, as Photoshop's / Krita's. The brush carries
+    a patch of the pixels under it and lays it at each step *in place of*
+    what is there, then takes up some of what was there - so the paint
+    under the tip is pulled along with the brush: the shape's own pixels
+    are dragged out of it, and whatever the brush brought in (the empty
+    canvas, another colour) takes their place. No colour of its own.
+
+    It was one colour per stamp, picked up at the tip's middle and laid
+    over the canvas: the shape it smudged stayed whole underneath, and the
+    stamp's back half laid that colour before the shape too.
+
+    *carry* (0..1, Carry): how far the paint is dragged - at 100 % it
+    takes up a fifth of what is under it per tip length, at 0 nearly all
+    of it (hardly drags). *backdrop*: what is under this layer (device
+    px), when Sample is "this layer only": then the smudge takes paint
+    away from the layer (see cut) and shows what that uncovers."""
+
+    REPLACES = True
+
+    def __init__(self, rect, work, carry, spacing, backdrop=None):
+        super().__init__(rect, work, 1.0, spacing)
+        carry = max(0.0, min(1.0, carry))
+        frac = max(0.005, spacing / 100.0)
+        self.pickup = 1.0 - (1.0 - (0.95 - 0.75 * carry)) ** frac
+        self.tint = 0.0
+        self.backdrop = None
+        if backdrop is not None and backdrop.size() == self.work.size():
+            self.backdrop = _image_array(backdrop.convertToFormat(QImage.Format_ARGB32_Premultiplied))
+
+    def _reached(self, local):
+        grey = self.mask.copy(local).convertToFormat(QImage.Format_Grayscale8)
+        a = np.frombuffer(grey.constBits(), np.uint8, count=grey.bytesPerLine() * grey.height())
+        return a.reshape(grey.height(), grey.bytesPerLine())[:, :grey.width()]
+
+    def compose(self, rect):
+        """As seen while smudging: with a backdrop, the smudged layer over
+        it where the brush went (opaque there: what the smudge took away
+        shows what is under the layer); without, the smudged pixels."""
+        if self.backdrop is None:
+            return super().compose(rect)
+        local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        part = (slice(local.y(), local.y() + local.height()), slice(local.x(), local.x() + local.width()))
+        top = _image_array(self.work.copy(local)).astype(np.float32)
+        under = self.backdrop[part].astype(np.float32)
+        over = top + under * (1.0 - top[..., 3:4] / 255.0)
+        over *= self._reached(local).astype(np.float32)[..., None] / 255.0
+        return _array_image(np.clip(over + 0.5, 0, 255).astype(np.uint8))
+
+    def compose_layer(self, rect):
+        """The layer's own smudged paint in device *rect*, where the brush went."""
+        return SmearStroke.compose(self, rect)
+
+    def cut(self, rect):
+        """Where the smudge replaces the layer's paint, in device *rect*: an
+        alpha mask (premultiplied ARGB, black)."""
+        local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        a = self._reached(local)
+        out = np.zeros(a.shape + (4,), np.uint8)
+        out[..., 3] = a
+        return _array_image(out)
 
 
 class DragStroke:

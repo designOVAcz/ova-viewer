@@ -264,6 +264,20 @@ class BrushWindow(QWidget):
         files.addWidget(self._name, 1)
         inner.addLayout(files)
 
+        from random_image_viewer.drawing.layers import BLEND_MODES
+        self._brush_blend = QComboBox()
+        for name in BLEND_MODES:
+            self._brush_blend.addItem(f"Brush blend: {name}", name)
+        self._brush_blend.setToolTip(
+            "🖍 Paint / 🕘 History: how the stroke mixes with everything under it (the picture "
+            "and the layers up to this one) - Multiply darkens, Screen lightens, Overlay / Soft "
+            "Light add contrast, Difference inverts... History in a blend mode mixes the "
+            "original picture back into the painting. Kept as the pixels it made, like a "
+            "Blend stroke. Normal: an ordinary stroke")
+        self._brush_blend.currentIndexChanged.connect(
+            lambda i: self._emit('brush_blend', self._brush_blend.itemData(i)))
+        inner.addWidget(self._brush_blend)
+
         self._sample = QComboBox()
         self._sample.addItem("Sample: this layer and below", 'below')
         self._sample.addItem("Sample: this layer only", 'layer')
@@ -555,6 +569,7 @@ class BrushWindow(QWidget):
         if hasattr(self, '_sample'):
             self._sample.setEnabled(mode in ('blend', 'smudge', 'pick', 'smear', 'push'))
             self._pigment.setEnabled(mode in ('blend', 'smudge', 'pick'))
+            self._brush_blend.setEnabled(mode in ('paint', 'history'))
         self._mix_name.setText({'smudge': "Carry", 'history': "Tint", 'smear': "Drag",
                                 'push': "Strength"}.get(mode, "Mix"))
         self._mix.setToolTip({
@@ -585,6 +600,8 @@ class BrushWindow(QWidget):
             value.setText(f"{int(settings[key])}{unit}")
         self._paint_mode.setCurrentIndex(self._paint_mode.findData(settings['flat']))
         self._sample.setCurrentIndex(max(0, self._sample.findData(settings.get('sample', 'below'))))
+        self._brush_blend.setCurrentIndex(
+            max(0, self._brush_blend.findData(settings.get('brush_blend', 'Normal'))))
         self._pigment.setCurrentIndex(max(0, self._pigment.findData(bool(settings.get('pigment', True)))))
         self._angle_mode.setCurrentIndex(self._angle_mode.findData(settings['angle_mode']))
         self._jitter_mode.setCurrentIndex(self._jitter_mode.findData(settings['jitter_per_stamp']))

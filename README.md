@@ -21,6 +21,7 @@ A fast media viewer and painting companion for Windows, built with PySide6. Imag
 - ✏ Freehand brush (**B**) with pen pressure, tilt and the pen's eraser end
 - 🖌 Textured brush tips (load PNG packs), plus built-in Round, Soft (adjustable softness), Bristles, Rake, Dust and Spray
 - Brush modes: Paint, Blend, Smudge, History, Pick blend, Erase, 🌊 **Smear** (hair-style transport of paint) and 🧊 **Push** (liquify, with an "ice" crack option)
+- **Brush blend** for Paint and History: Multiply, Screen, Overlay, Soft / Hard Light, Darken, Lighten, Color Dodge / Burn, Difference, blending the stroke with everything under it (History in a blend mode mixes the original picture back into the painting)
 - Lines, polylines, lasso / polygon / shape fills, ⬚ select and transform, ✂ crop
 - Lines are paint (brushes smudge and blend them) or guides drawn over it. In a brush mode other than Paint, the line tools run the brush along the line, and the shape tools run it over the whole shape, kept inside it (a lasso in Blend softens just that area; in Erase it cuts it out)
 - 🌈 **Gradient**: linear or radial, the pen colour fading out or into a second colour, mixed in OKLab and dithered (no banding). A guide line shows where it runs while you drag (**Shift**: 15° steps). Shapes can fill with it too. On a Multiply / Overlay layer it shades or lights the painting

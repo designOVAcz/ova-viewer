@@ -7,6 +7,7 @@ import time
 import subprocess
 import gc
 import struct
+import contextlib
 
 try:
     import ctypes
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QSplitter, QSpinBox, QCheckBox,
     QStatusBar, QToolBar, QToolButton, QSizePolicy, QSlider, QHBoxLayout,
     QStyle, QStyleOptionSlider, QGridLayout, QMenu, QComboBox,
-    QGraphicsOpacityEffect, QFrame
+    QGraphicsOpacityEffect, QFrame, QProgressBar
 )
 from PySide6.QtGui import (
     QPixmap, QPainter, QColor, QPen, QFont, QIcon, QColorTransform,
@@ -2065,7 +2066,13 @@ class RandomImageViewer(QMainWindow):
         uw, uh = self._sheet_unrotated()
         tview = self._picture_to_display(to_display, uw, uh)
         from random_image_viewer.drawing import transform as mark_transform
-        for kind, mark in marks:
+        with self._busy_progress("⛰ Impasto: building the relief", len(marks)) as tick:
+            self._paint_height_each(painter, marks, view, tview, mark_transform, tick)
+
+    def _paint_height_each(self, painter, marks, view, tview, mark_transform, tick):
+        canvas_width, canvas_height = view[0], view[1]
+        for i, (kind, mark) in enumerate(marks):
+            tick(i)
             if self._is_guide(kind, mark):
                 continue
             if kind == 'erase' or (kind == 'free_stroke' and getattr(mark, 'erase', False)):
@@ -2116,6 +2123,78 @@ class RandomImageViewer(QMainWindow):
             painter.setOpacity(self._HEIGHT_COAT)
             painter.drawImage(box.topLeft(), scratch)
             painter.restore()
+
+    _BUSY_AFTER = 0.25          # s: work longer than this shows its progress
+    _BUSY_EVERY = 0.05          # s: the bar drawn at most this often
+
+    @contextlib.contextmanager
+    def _busy_progress(self, text, total):
+        """A loader for long work on the main thread, e.g. ⛰ impasto laying
+        every stroke again: in the middle of the GPU canvas (or, on the
+        plain canvas, a bar in the status bar), with the wait cursor.
+        Yields tick(i) to call per item; it shows only once the work has
+        taken _BUSY_AFTER. Painted at once (GpuCanvasWindow.paint_busy,
+        repaint()) - no event loop runs: a redraw coming in would lay the
+        same strokes again. (A new window of its own never showed: Windows
+        shows it only from the event loop.)"""
+        start = time.perf_counter()
+        state = {'shown': False, 'drawn': 0.0, 'gpu': None}
+        status = getattr(self, 'status', None)
+
+        def tick(i):
+            if total < 2:
+                return
+            now = time.perf_counter()
+            if now - start < self._BUSY_AFTER or now - state['drawn'] < self._BUSY_EVERY:
+                return
+            state['drawn'] = now
+            if not state['shown']:
+                state['shown'] = True
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+            gpu = self._gpu_target() if self.__dict__.get('_gpu_display') else None
+            if gpu is not None and hasattr(gpu, 'paint_busy') and gpu.isVisible():
+                try:
+                    if gpu.paint_busy((f"{text}   {i} / {total}", i / total)):
+                        state['gpu'] = gpu
+                        return
+                except Exception as e:
+                    print(f"⛰ loader on the canvas failed: {e}")
+            if status is None or not status.isVisible():
+                return
+            bar = self.__dict__.get('_busy_box')
+            if bar is None:
+                bar = QProgressBar()
+                bar.setTextVisible(True)
+                bar.setAlignment(Qt.AlignCenter)
+                status.insertPermanentWidget(0, bar)
+                self._busy_box = bar
+            if not bar.isVisible():
+                bar.setRange(0, total)
+                bar.setFormat(f"{text}  %v / %m")
+                # (wide enough for its text: the status bar's message
+                # beside it squeezed a label to nothing)
+                bar.setFixedWidth(bar.fontMetrics().horizontalAdvance(f"{text}  {total} / {total}") + 40)
+                bar.show()
+                # laid out now (a posted layout request waits for the event
+                # loop, which does not run until the work is done)
+                QApplication.sendEvent(status, QEvent(QEvent.LayoutRequest))
+                status.layout().activate()
+            bar.setValue(i)
+            status.repaint()
+
+        try:
+            yield tick
+        finally:
+            if state['shown']:
+                QApplication.restoreOverrideCursor()
+                bar = self.__dict__.get('_busy_box')
+                if bar is not None:
+                    bar.hide()
+                gpu = state['gpu']
+                if gpu is not None:
+                    gpu.busy_note = None        # (the frame after the work leaves it out)
+                    gpu._full = True
+                    gpu.update()
 
     _HEIGHT_SCALE = 0.5     # the thickness map at this share of the colour's resolution
                             # (a quarter of the pixels: laying it cost more than the pen-up)
@@ -10763,14 +10842,14 @@ class RandomImageViewer(QMainWindow):
                 self.set_brush_mode(back)
         self._sync_erase_button()
 
-    def _sample_view(self):
-        """What Blend and Smudge read from, by the brush's Sample setting: the
-        screen as it is ('all'), or the view made again from the picture -
-        with its effects - and only this layer and the ones under it
-        ('below'), or this layer alone on nothing ('layer'). Made once, when
-        the stroke starts."""
+    def _sample_view(self, source=None):
+        """What Blend and Smudge read from, by the brush's Sample setting (or
+        *source*): the screen as it is ('all'), or the view made again from
+        the picture - with its effects - and only this layer and the ones
+        under it ('below'), or this layer alone on nothing ('layer'). Made
+        once, when the stroke starts."""
         shown = self._view_pixmap()
-        source = self.brush_settings.get('sample', 'below')
+        source = source or self.brush_settings.get('sample', 'below')
         if (source == 'all' or shown is None or shown.isNull() or not self.current_image
                 or getattr(self, 'original_pixmap', None) is None):
             return shown
@@ -11185,8 +11264,7 @@ class RandomImageViewer(QMainWindow):
         under = (self._sample_view()
                  if self.brush_settings['mode'] in ('blend', 'smudge', 'pick', 'smear', 'push')
                  else None)
-        sampler = (self._screen_sampler(to_screen, under)
-                   if under is not None and self.brush_settings['mode'] == 'smudge' else None)
+        sampler = None      # (👆 Smudge moves the pixels themselves now: see SmudgeStroke)
         self._blend_under = (under.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
                              if under is not None
                              and self.brush_settings['mode'] in brushes.PIXEL_MODES else None)
@@ -11248,6 +11326,15 @@ class RandomImageViewer(QMainWindow):
                                                  grab=s.get('smear_grab', 70) / 100.0,
                                                  edge=s.get('smear_edge', 25) / 100.0,
                                                  blur=s.get('smear_blur', 20) / 100.0)
+        elif mode == 'smudge' and self._blend_under is not None and image is not None:
+            # 👆 Smudge: the pixels under the tip pulled along with it (see SmudgeStroke);
+            # on this layer alone it takes paint away too, showing what is under it
+            s = self.brush_settings
+            backdrop = None
+            if s.get('sample', 'below') == 'layer' and self._push_paint(image.size()) is None:
+                backdrop = self._backdrop_view(image.size())
+            self._flat_live = brushes.SmudgeStroke(image.rect(), self._blend_under, s['mix'] / 100.0,
+                                                   brushes.smudge_spacing(s), backdrop=backdrop)
         elif mode in brushes.BLENDING and self._blend_under is not None and image is not None:
             # Blend: a blender brush moving the pixels under it (see SmearStroke).
             if self.brush_settings.get('pigment', True):
@@ -13829,10 +13916,13 @@ class RandomImageViewer(QMainWindow):
             return self._spray_cursor()
         rim = QColor(self.line_color)
         rim.setAlpha(self._CURSOR_RIM_ALPHA)
+        if texture is not None and self._small_hair_cursor_wanted(texture):
+            self._cursor_key = self._texture_cursor_key()[:-2]
+            return self._small_brush_cursor()
         if texture is not None:
             key = self._texture_cursor_key()
             self._cursor_key = key[:-2]
-            dpr = self.image_label.devicePixelRatioF() if hasattr(self, 'image_label') else 1.0
+            dpr =self.image_label.devicePixelRatioF() if hasattr(self, 'image_label') else 1.0
             kept = getattr(self, '_cursor_outline', None)
             full = (key, dpr, int(self.line_thickness))
             if kept is not None and kept[0] == full:
@@ -13856,6 +13946,43 @@ class RandomImageViewer(QMainWindow):
         p.drawEllipse(4, 4, d - 2, d - 2)
         p.end()
         return QCursor(pix)          # hot spot in the centre: the stroke's centre
+
+    # Below this size (px) a hair tip's outline is a white blob that hides
+    # the paint; it gets a thin ring with a crosshair outside it instead.
+    _SMALL_HAIR_CURSOR = 20
+
+    def _small_hair_cursor_wanted(self, texture):
+        path = getattr(texture, 'path', '') or ''
+        hair = any(path == t or path.startswith(t + '?')
+                   for t in (brushes.HAIRS, brushes.BRISTLES, brushes.RAKE))
+        return hair and self.line_thickness < self._SMALL_HAIR_CURSOR
+
+    def _small_brush_cursor(self):
+        """A minimal cursor for a small brush: a thin ring the brush's size
+        and four short arms outside it, black under white, the middle left
+        clear so the paint under the pen stays visible."""
+        dpr = self.image_label.devicePixelRatioF() if hasattr(self, 'image_label') else 1.0
+        d = max(3.0, float(self.line_thickness))
+        gap, arm = 3.0, 6.0
+        edge = int(math.ceil(d + 2 * (gap + arm) + 4)) | 1     # odd: a centre pixel
+        pix = QPixmap(int(edge * dpr), int(edge * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        c = edge / 2.0
+        r = d / 2.0
+        for colour, width in ((QColor(0, 0, 0, 170), 2.6), (QColor(255, 255, 255, 235), 1.0)):
+            p.setPen(QPen(colour, width, Qt.SolidLine, Qt.RoundCap))
+            if d >= 6:
+                p.drawEllipse(QPointF(c, c), r, r)
+            a, b = r + gap, r + gap + arm
+            p.drawLine(QPointF(c, c - a), QPointF(c, c - b))
+            p.drawLine(QPointF(c, c + a), QPointF(c, c + b))
+            p.drawLine(QPointF(c - a, c), QPointF(c - b, c))
+            p.drawLine(QPointF(c + a, c), QPointF(c + b, c))
+        p.end()
+        return QCursor(pix)
 
     # The brush cursor's colour rim: light and steady (it blinked once, which
     # was distracting while painting).
@@ -15748,6 +15875,7 @@ class RandomImageViewer(QMainWindow):
             # drawn solid into the buffer). Textured stamps carry their own.
             self._live_ink_alpha = (1.0 if self._stamp_trail is not None
                                     else self.line_transparency / 255.0)
+            self._brush_blend_start()       # 🖍 / 🕘 in a blend mode: what is under it, kept
 
             print(f"Optimized drawing cache initialized - ready for true real-time performance")
             self.status.showMessage("Ultra-fast real-time free drawing active")
@@ -16170,7 +16298,8 @@ class RandomImageViewer(QMainWindow):
         except Exception:
             return 1.0
         if (dpr <= 1.01 or self._brush_texture() is None
-                or self.brush_settings.get('mode') != 'paint' or not self._live_direct_ok()):
+                or self.brush_settings.get('mode') != 'paint' or not self._live_direct_ok()
+                or self._brush_blend() is not None):        # (blends with the view, at its size)
             return 1.0
         return dpr
 
@@ -16182,6 +16311,130 @@ class RandomImageViewer(QMainWindow):
         # ⚡ PRE-ALLOCATE: Create QImage for direct pixel access
         self._stroke_image = QImage(w, h, QImage.Format.Format_ARGB32)
         self._stroke_image.fill(Qt.transparent)
+
+    def _brush_blend(self):
+        """🖍 / 🕘 Brush blend: the QPainter mode the stroke being drawn (or
+        about to be) blends with what is under it in, or None (Normal, or a
+        mode it does not apply to)."""
+        s = getattr(self, 'brush_settings', None) or {}
+        name = s.get('brush_blend', 'Normal')
+        if name == 'Normal' or name not in BLEND_MODES or s.get('mode') not in ('paint', 'history'):
+            return None
+        if self._brush_erasing() or getattr(self, 'eraser_mode', False):
+            return None
+        return BLEND_MODES[name]
+
+    def _brush_blend_start(self):
+        """The stroke starting blends (see _brush_blend): what is under it -
+        the picture and the layers up to this one, as Sample 'below' reads
+        them - kept at the stroke buffer's size, and the blended preview."""
+        self._bb_under = self._bb_preview = None
+        mode = self._brush_blend()
+        image = getattr(self, '_stroke_image', None)
+        if mode is None or image is None or image.isNull():
+            return
+        under = self._sample_view('below')
+        if under is None or under.isNull():
+            return
+        under = under.toImage()
+        if under.size() != image.size():
+            under = under.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._bb_mode = mode
+        self._bb_under = under.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        self._bb_preview = QImage(image.size(), QImage.Format_ARGB32_Premultiplied)
+        self._bb_preview.fill(Qt.transparent)
+
+    def _brush_blended(self, stroke, rect, ink=1.0):
+        """What the stroke makes of what is under it inside *rect* (stroke
+        buffer px): blended in the brush's mode, opaque where the stroke
+        touches, see-through elsewhere (premultiplied ARGB32)."""
+        import numpy as np
+        out = self._bb_under.copy(rect)
+        piece = stroke.copy(rect)
+        p = QPainter(out)
+        p.setOpacity(ink)
+        p.setCompositionMode(self._bb_mode)
+        p.drawImage(0, 0, piece)
+        p.end()
+        alpha = self._image_words(piece.convertToFormat(QImage.Format_ARGB32_Premultiplied)) >> 24
+        words = self._image_words(out)
+        words[alpha == 0] = 0
+        w, h = out.width(), out.height()
+        data = np.ascontiguousarray(words)
+        result = QImage(data.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+        return result
+
+    def _brush_blend_refresh(self, rect=None):
+        """The blended preview brought up to date inside *rect* (stroke px; None: all)."""
+        image = getattr(self, '_stroke_image', None)
+        preview = self.__dict__.get('_bb_preview')
+        if preview is None or image is None:
+            return
+        if rect is None:
+            rect = image.rect()
+        else:
+            rect = rect.toAlignedRect() if isinstance(rect, QRectF) else QRect(rect)
+            rect = rect.adjusted(-2, -2, 2, 2).intersected(image.rect())
+        if rect.isEmpty():
+            return
+        piece = self._brush_blended(image, rect, getattr(self, '_live_ink_alpha', 1.0))
+        p = QPainter(preview)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.drawImage(rect.topLeft(), piece)
+        p.end()
+
+    def _bake_brush_blend(self, trail, stamps):
+        """Pen up, a stroke in a brush blend mode: kept as what it made of what
+        was under it - an image mark, like a Blend stroke (laid again later it
+        would blend with whatever is there by then). True when kept."""
+        import numpy as np
+        if self.__dict__.get('_bb_under') is None:
+            return False
+        image = getattr(self, '_stroke_image', None)
+        if image is None:
+            return False
+        if trail is not None:
+            render = (self._finished_render(trail, stamps) if stamps else None) \
+                or (self._live_stroke_render(trail, stamps) if stamps else None)
+            if render is None:
+                return False
+            to_screen, piece, top_left = render
+            buffer = QImage(image.size(), QImage.Format_ARGB32_Premultiplied)
+            buffer.fill(Qt.transparent)
+            p = QPainter(buffer)
+            p.drawImage(top_left, piece)
+            p.end()
+            box = QRect(top_left, piece.size()).intersected(buffer.rect())
+            ink = 1.0
+        else:
+            cache = self.drawing_cache
+            if not cache or 'original_size' not in cache:
+                return False
+            size = cache['original_size']
+            to_screen = self._picture_to_display(
+                lambda px, py: self._stroke_cache_to_screen(cache, px, py), size.width(), size.height())
+            buffer = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            alpha = self._image_words(buffer) >> 24
+            rows, cols = np.flatnonzero(alpha.any(1)), np.flatnonzero(alpha.any(0))
+            if not len(rows):
+                return False
+            box = QRect(int(cols[0]), int(rows[0]), int(cols[-1] - cols[0]) + 1, int(rows[-1] - rows[0]) + 1)
+            ink = getattr(self, '_live_ink_alpha', 1.0)
+        if box.isEmpty():
+            return False
+        kept = self._brush_blended(buffer, box, ink)
+        to_picture, ok = to_screen.inverted()
+        if not ok:
+            return False
+        x, y, w, h = box.x(), box.y(), box.width(), box.height()
+        corners = [to_picture.map(QPointF(px, py)) for px, py in ((x, y), (x + w, y), (x, y + h))]
+        mark = {'image': kept, 'corners': [(p.x(), p.y()) for p in corners]}
+        clip = self.__dict__.get('_pending_clip')
+        if clip:
+            self._clip_image_mark(mark, clip)       # a shape run over: inside it only
+        self.drawn_images.append(mark)
+        self._undo_stack.append('image')
+        return True
 
     def _live_direct_ok(self):
         """The stroke being drawn can go straight over the view: it is not
@@ -16200,6 +16453,10 @@ class RandomImageViewer(QMainWindow):
         if image is None or image.isNull():
             return None
         layer = self.active_layer
+        preview = self.__dict__.get('_bb_preview')
+        if preview is not None:
+            # 🖍 / 🕘 brush blend: the stroke blended with what is under it (ink in it already)
+            return preview, (layer.opacity / 100 if layer.visible else 0.0), None
         mode = BLEND_MODES[layer.blend] if layer.blend != 'Normal' else None
         ink = getattr(self, '_live_ink_alpha', 1.0)
         return image, (layer.opacity / 100 * ink if layer.visible else 0.0), mode
@@ -16235,13 +16492,18 @@ class RandomImageViewer(QMainWindow):
         if self.__dict__.get('_gpu_display'):
             gpu = self.__dict__.get('_gpu_canvas')
             if gpu is not None and gpu.active:
-                if rect is None or self.__dict__.get('_gpu_flat') is not None:
+                if (rect is None or self.__dict__.get('_gpu_flat') is not None
+                        or self.__dict__.get('_flat_live') is not None
+                        or self.__dict__.get('_bb_preview') is not None):
                     # (a stroke laid on the card: the whole canvas each frame -
                     # every layer is a texture there already, so it is cheap.
                     # A piece redrawn left a bare 1 px row along its top: Qt's
                     # own painting (the background, the clip) and the GL drawing
                     # (layers, the stroke) a row apart at its edge - a ladder of
-                    # grey lines through the stroke while the pen was down.)
+                    # grey lines through the stroke while the pen was down.
+                    # The same for a flat stroke laid on the CPU - 👆 Smudge,
+                    # Blend, Smear, Push, and a brush blend's preview: a grey
+                    # line along the bottom of the stroke's box, following the pen.)
                     gpu._full = True
                     gpu.update()
                 else:
@@ -16260,6 +16522,7 @@ class RandomImageViewer(QMainWindow):
         and burnt in like the CPU's. None where it does not do: other modes,
         History, Spray, the plain canvas."""
         if (not self.__dict__.get('_gpu_display') or image is None or history or mode != 'paint'
+                or self._brush_blend() is not None      # (blended on the CPU, see _brush_blend_refresh)
                 or not self._stamp_trail.settings['flat'] or texture is None
                 # (speckled all along: the CPU's FlatStroke lays that)
                 or self._stamp_trail.speckled
@@ -16358,6 +16621,8 @@ class RandomImageViewer(QMainWindow):
             # and swapping it in cost ~8 ms a frame at 1.5x - for a 5 px dab.
             self._live_direct = True
             dirty, self._live_dirty = self._live_dirty, None
+            if self.__dict__.get('_bb_preview') is not None:
+                self._brush_blend_refresh(dirty)
             label = self.image_label
             if dirty is None:
                 self._live_update(None)
@@ -16687,8 +16952,11 @@ class RandomImageViewer(QMainWindow):
         elif trail is not None and self.current_stroke is not None:
             # A textured stroke: a tap leaves a stamp too.
             stamps = trail.finish(self._tablet_pressure if self.pen_pressure_enabled else 1.0)
-            baked = (self._bake_blend_stroke(trail, stamps)
-                     if stamps and trail.settings['mode'] in brushes.PIXEL_MODES else False)
+            if self.__dict__.get('_bb_under') is not None:
+                baked = bool(stamps) and self._bake_brush_blend(trail, stamps)    # 🖍 / 🕘 brush blend
+            else:
+                baked = (self._bake_blend_stroke(trail, stamps)
+                         if stamps and trail.settings['mode'] in brushes.PIXEL_MODES else False)
             if stamps and not baked:
                 stroke = Stroke(
                     self.current_stroke,
@@ -16711,6 +16979,9 @@ class RandomImageViewer(QMainWindow):
                 self.drawn_free_strokes.append(stroke)
                 self._undo_stack.append('free_stroke')
             self.apply_tool_cursor()    # the outline turns back to the pen's lean
+        elif (self.current_stroke is not None and len(self.current_stroke) > 1
+                and self.__dict__.get('_bb_under') is not None and self._bake_brush_blend(None, None)):
+            pass        # 🖍 the round pen in a brush blend mode: kept as the pixels it made
         elif self.current_stroke is not None and len(self.current_stroke) > 1:
             # Add completed stroke to the permanent list
             # Freeze the pen settings into the stroke so later changes to the
@@ -16736,6 +17007,7 @@ class RandomImageViewer(QMainWindow):
         self.is_drawing_free_stroke = False
         self._live_direct, self._live_dirty = False, None
         self._erase_live = None
+        self._bb_under = self._bb_preview = None
         self.stroke_update_timer.stop()
         self.drawing_cache = None
         self.temp_stroke_overlay = None
@@ -18105,7 +18377,9 @@ class RandomImageViewer(QMainWindow):
             whole = QRect(0, 0, base.width(), base.height())
             return {'picture': whole, 'painting': QRect(whole)}
         off = self._studio_offset(base)
-        return {'painting': QRect(0, 0, base.width(), base.height()),
+        # 'canvas': the painting on its canvas (grey and paper), not transparent
+        return {'canvas': QRect(0, 0, base.width(), base.height()),
+                'painting': QRect(0, 0, base.width(), base.height()),
                 'picture': QRect(off, 0, base.width(), base.height()),
                 'both': QRect(0, 0, off + base.width(), base.height())}
 
@@ -18184,7 +18458,7 @@ class RandomImageViewer(QMainWindow):
         return base.toImage().scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
     def save_sheet_part(self, part, k):
-        """💾 menu: save *part* ('painting', 'picture', 'both') at *k* times."""
+        """💾 menu: save *part* ('painting', 'canvas', 'picture', 'both') at *k* times."""
         self.commit_selection()         # a transform under way goes in as it is
         rect = self._export_parts().get(part)
         if rect is None:
@@ -18227,13 +18501,14 @@ class RandomImageViewer(QMainWindow):
             try:
                 image = self._render_sheet_part(
                     rect, k, paper=not (part == 'picture' and not self.image_visible),
-                    grey=part != 'painting', picture=part != 'painting',
+                    grey=part != 'painting', picture=part not in ('painting', 'canvas'),
                     sheet=part != 'painting')
             finally:
                 self._export_tick = self._export_picture_done = None
             self._export_crosses(image, rect, k)        # ✛ while they show
             stem = os.path.splitext(os.path.basename(self.current_image))[0]
-            name = {'painting': 'painting', 'picture': 'sketch' if self._is_sketch() else 'picture',
+            name = {'painting': 'painting', 'canvas': 'painting_canvas',
+                    'picture': 'sketch' if self._is_sketch() else 'picture',
                     'both': 'studio'}[part]
             file_path = self._unique_download_path(f"{stem}_{name}_{k}x", ".png")
             progress(0.85, "writing PNG")
@@ -18401,12 +18676,14 @@ class RandomImageViewer(QMainWindow):
         menu.addAction("💾 View as shown (effects included)", self.save_current_view)
         parts = self._export_parts()
         if self.studio_mode:
-            whole = "🖼 Picture only"
+            # (the picture alone is the file it came from: the painting on
+            # its canvas instead - the transparent one is below)
+            first = ('canvas', "🎨 Painting on its canvas")
         elif self._is_sketch():
-            whole = "📝 Sketch"
+            first = ('picture', "📝 Sketch")
         else:
-            whole = "🖼 Picture with its drawing"
-        labels = (('picture', whole), ('painting', "🎨 Painting only, transparent"),
+            first = ('picture', "🖼 Picture with its drawing")
+        labels = (first, ('painting', "🎨 Painting only, transparent"),
                   ('both', "◧ Both side by side"))
         for part, label in labels:
             rect = parts.get(part)
