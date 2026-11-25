@@ -57,6 +57,8 @@ DEFAULT_SETTINGS = {
     'gradient_to': '',          # 🌈 ... from the pen colour to this ('#rrggbb'), '' = transparent
     'line_gradient': False,     # 🌈 lines and polylines take the gradient, along their way
     'shape_gradient': False,    # 🌈 shapes fill with the gradient instead of one colour
+    'shape_texture': False,     # 🖌 shapes fill through the brush's tip: the tip stretched
+                                #   over the shape, its colour (or gradient) only where the tip is
     'shape_stars': False,       # ✨ shapes fill with a starfield (tiny random specks) instead
     'line_stars': False,        # ✨ lines and polylines paint a starfield along their way
     'stars_amount': 40,         # ✨ 1..100: how many (20·v² per megapixel of picture)

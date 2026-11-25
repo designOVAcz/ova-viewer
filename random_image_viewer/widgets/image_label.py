@@ -1198,6 +1198,12 @@ class ImageLabel(QLabel):
             or viewer.crop_mode or viewer.select_mode)
 
     def mousePressEvent(self, event):
+        # ▦ a perspective grid's vanishing point (the grids palette open):
+        # grabbed before anything else - no stroke, no shape starts there
+        if (self.parent_viewer is not None and event.button() in (Qt.LeftButton, Qt.RightButton)
+                and self.parent_viewer.grid_handle_press(event.position(), event.button())):
+            event.accept()
+            return
         # 🎮 A stroke or click while the GPU view still shows a zoom: the
         # plain canvas for this view first (see _finish_view_motion).
         if event.button() == Qt.LeftButton and self.parent_viewer is not None:
@@ -1434,6 +1440,10 @@ class ImageLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if (self.parent_viewer is not None and self.parent_viewer.__dict__.get('_grid_drag')
+                and self.parent_viewer.grid_handle_move(event.position())):
+            event.accept()
+            return      # ▦ a vanishing point being dragged
         if (self.parent_viewer is not None and not event.buttons()
                 and getattr(self.parent_viewer, 'free_draw_mode', False)):
             self.parent_viewer.note_hover_move(event.position())   # a stroke-turned tip's way
@@ -1757,6 +1767,15 @@ class ImageLabel(QLabel):
 
     def tabletEvent(self, event):
         """Handle tablet events ONLY for pen pressure during active drawing"""
+        viewer = self.parent_viewer
+        if viewer is not None and (
+                viewer.__dict__.get('_grid_drag')
+                or (event.type() == QTabletEvent.TabletPress
+                    and viewer.grid_handle_at(event.position()) is not None)):
+            # ▦ the pen on a vanishing point: left to the mouse events Qt
+            # makes of it (mousePressEvent grabs the handle), not a stroke
+            event.ignore()
+            return
         if self._pen_button_pan(event):
             return
         if event.type() == QTabletEvent.TabletPress and self.parent_viewer is not None:
@@ -1920,6 +1939,9 @@ class ImageLabel(QLabel):
     # ------------------------------------------------------------------
 
     def mouseReleaseEvent(self, event):
+        if self.parent_viewer is not None and self.parent_viewer.grid_handle_release():
+            event.accept()
+            return      # ▦ a vanishing point let go
         # End panning for either the right-button or the left-button/finger drag
         if event.button() in (Qt.RightButton, Qt.LeftButton) and self.is_panning:
             self.is_panning = False

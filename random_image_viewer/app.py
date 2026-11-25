@@ -50,9 +50,13 @@ def _boot_line_hide():
             return True
 
         user32.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(each), 0)
-        if len(found) != 1:
+        if not found:
             return None
-        user32.ShowWindow(found[0], 0)                  # SW_HIDE
+        # (all of them: with its transparent pixels the launcher's window may
+        # come as more than one - one left up kept the short start of the
+        # line on screen over the splash)
+        for hwnd in found:
+            user32.ShowWindow(hwnd, 0)                  # SW_HIDE
         return found[0]
     except Exception:
         return None
@@ -170,6 +174,13 @@ def main():
     if cloaked:
         set_window_cloaked(viewer, False)
     close_splash(splash)
+    # In front and active: it came up behind the window it was started from
+    # (Windows gives the foreground to the launcher's splash, then nobody).
+    # Again once the splash has faded and closed - it was on top meanwhile.
+    from random_image_viewer.platform_utils import bring_to_front
+    from random_image_viewer.splash import FADE_OUT_MS
+    bring_to_front(viewer)
+    QTimer.singleShot(FADE_OUT_MS + 120, lambda: bring_to_front(viewer))
 
     # Report once the event loop has drained the show/paint work, so the
     # number reflects a genuinely interactive window rather than just the

@@ -153,6 +153,9 @@ class _Writer:
                 if k == 'render':
                     continue        # a cache of how it last looked: made again
                 out[str(k)] = self.enc(v)
+                if k == 'fill_tip' and isinstance(v, str):
+                    # 🖌 a shape filled through a brush tip: the tip file kept too
+                    out['fill_tip_entry'] = self.tip(v)
             return out
         if o is None or isinstance(o, (bool, int, float, str)):
             return o
@@ -190,7 +193,11 @@ class _Reader:
         if isinstance(o, dict):
             kind = o.get('$')
             if kind is None:
-                return {k: self.dec(v) for k, v in o.items()}
+                out = {k: self.dec(v) for k, v in o.items() if k != 'fill_tip_entry'}
+                if 'fill_tip' in out:
+                    # 🖌 its tip: the file as saved, or the copy in the project
+                    out['fill_tip'] = self.tip(out['fill_tip'], o.get('fill_tip_entry'))
+                return out
             if kind == 'rows':
                 # (a list inside a row was a tuple: rows hold no lists)
                 return [tuple(tuple(x) if type(x) is list else x for x in r) for r in o['v']]

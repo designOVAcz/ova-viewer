@@ -11,8 +11,7 @@ import sys
 import time
 
 from PySide6.QtWidgets import QWidget, QApplication
-from PySide6.QtGui import (QPainter, QColor, QFont, QFontMetrics, QPixmap, QGuiApplication,
-                           QLinearGradient)
+from PySide6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPixmap, QGuiApplication
 from PySide6.QtCore import Qt, QRect, QRectF, QSize, QVariantAnimation
 
 # The globe's equator in ova_viewer.png, as fractions of the image (measured
@@ -30,6 +29,15 @@ EQUATOR_STOPS = (
 )
 FADE_IN_S = 0.22        # line -> globe
 FADE_OUT_MS = 260       # globe -> gone, over the main window
+
+# ⏳ The line is a loader: 1 px near white, growing along the globe's equator
+# from BOOT_START (where the launcher's boot image leaves it -
+# tools/make_splash.py draws the same) to its full width as startup goes;
+# nothing behind it. Light, so it shows on a dark screen. (Was the equator's
+# own dark greys, all of it at once: no sign of progress, and hard to see.)
+LOADER_FILL = (238, 240, 242)
+BOOT_START = 0.06       # share of the line already filled by the boot image
+GROW_S = 0.16           # each run of growth (see DynamicSplash._grow_to)
 
 
 def _find_splash_image():
@@ -99,13 +107,36 @@ class DynamicSplash(QWidget):
             ey = EQUATOR_Y * self.HEIGHT
             self.move(round(c.x() - ex), round(c.y() - ey))
         self._status = "Starting Ova Viewer…"
+        self._grown = BOOT_START    # ⏳ how far the loader line is filled
+
+    def progress(self):
+        """⏳ How far the loader line is filled, BOOT_START .. 1."""
+        return self._grown
+
+    def _grow_to(self, share, seconds=GROW_S):
+        """⏳ The loader line grown on to *share* of its width, drawn frame
+        by frame over *seconds* (eased) - visibly moving. The work between
+        these runs blocks the event loop, so no timer could animate it."""
+        start_share = self._grown
+        start = time.perf_counter()
+        while True:
+            t = min(1.0, (time.perf_counter() - start) / max(1e-3, seconds))
+            e = t * t * (3 - 2 * t)
+            self._grown = start_share + (share - start_share) * e
+            self.repaint()
+            QApplication.processEvents()
+            if t >= 1.0:
+                break
+            time.sleep(0.012)
 
     def reveal(self):
-        """Grow the globe around the line: load it, then cross-fade (about
-        0.2 s, drawn frame by frame - the startup that follows blocks the
-        event loop, so an animation would only advance in jumps)."""
+        """⏳ The loader line grows to its full width - on between the bits of
+        work done here (the globe loaded, the first font) - then the globe
+        fades in around it while the line fades away (the line is its
+        equator). About 0.6 s plus that work, drawn frame by frame."""
         if self._img_path is None or self._pixmap is not None:
             return
+        self._grow_to(0.35)
         src = QPixmap(self._img_path)
         if src.isNull():
             self._globe = 1.0
@@ -114,9 +145,11 @@ class DynamicSplash(QWidget):
             return
         self._pixmap = src.scaled(self.WIDTH, self.HEIGHT, Qt.KeepAspectRatio,
                                   Qt.SmoothTransformation)
+        self._grow_to(0.7)
         # The first text drawn loads the font database (~0.5 s): do it now,
         # while the line is up, not in the middle of the fade.
         QFontMetrics(self._status_font()).horizontalAdvance(self._status)
+        self._grow_to(1.0)
         start = time.perf_counter()
         while True:
             t = min(1.0, (time.perf_counter() - start) / FADE_IN_S)
@@ -160,13 +193,13 @@ class DynamicSplash(QWidget):
                 painter.drawPixmap(0, 0, self._pixmap)
             self.drawContents(painter)
         if self._img_path is not None and self._globe < 1.0:
-            # The boot line, carried on: the globe's equator in its own grays.
+            # ⏳ The boot line, carried on as the loader: 1 px near white,
+            # grown along the globe's equator; it fades as the globe comes in.
             painter.setOpacity((1.0 - self._globe) * self._opacity)
             x0, x1 = EQUATOR_X[0] * self.WIDTH, EQUATOR_X[1] * self.WIDTH
-            grad = QLinearGradient(x0, 0, x1, 0)
-            for t, (r, g, b) in EQUATOR_STOPS:
-                grad.setColorAt(t, QColor(r, g, b))
-            painter.fillRect(QRectF(x0, EQUATOR_Y * self.HEIGHT, x1 - x0, 1.0), grad)
+            y = EQUATOR_Y * self.HEIGHT
+            fill = (x1 - x0) * self.progress()       # (just the line: no track behind it)
+            painter.fillRect(QRectF(x0, y, fill, 1.0), QColor(*LOADER_FILL))
         painter.end()
 
     @staticmethod

@@ -11,12 +11,143 @@ widget through ``set_layers`` and listens to its signals.
 
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QToolButton,
                                QListWidget, QListWidgetItem, QComboBox, QAbstractItemView,
-                               QCheckBox)
-from PySide6.QtCore import Qt, Signal
+                               QCheckBox, QStyledItemDelegate, QStyle)
+from PySide6.QtCore import Qt, Signal, QEvent, QRectF, QPointF, QSize
+from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath
 
 from random_image_viewer.drawing.layers import BLEND_MODES
 from random_image_viewer.widgets.clickable_slider import ClickableSlider
 from random_image_viewer.widgets.title_drag import on_title_row
+
+# 👁 Visibility as an eye (as in Photoshop, Krita ...), not a tick box.
+EYE_ON = QColor(214, 219, 224)
+EYE_OFF = QColor(110, 115, 121)
+TEXT_ON = QColor(228, 231, 234)
+TEXT_OFF = QColor(125, 130, 136)
+ROW_SELECTED = QColor(58, 96, 150)
+ROW_HOVER = QColor(255, 255, 255, 16)
+
+
+def draw_eye(p, rect, shown):
+    """An eye in *rect* (QRectF): open when *shown*, else dimmed and struck through."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing, True)
+    colour = EYE_ON if shown else EYE_OFF
+    pen = QPen(colour, 1.4)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    c = rect.center()
+    w, h = min(rect.width(), 16.0), min(rect.height(), 16.0) * 0.62
+    left, right = QPointF(c.x() - w / 2, c.y()), QPointF(c.x() + w / 2, c.y())
+    lid = QPainterPath(left)
+    lid.quadTo(QPointF(c.x(), c.y() - h), right)
+    lid.quadTo(QPointF(c.x(), c.y() + h), left)
+    p.drawPath(lid)
+    if shown:
+        p.setPen(Qt.NoPen)
+        p.setBrush(colour)
+        p.drawEllipse(c, 2.4, 2.4)
+    else:
+        p.drawLine(QPointF(c.x() - w / 2 + 1, c.y() + h * 0.9), QPointF(c.x() + w / 2 - 1, c.y() - h * 0.9))
+    p.restore()
+
+
+class _LayerRowDelegate(QStyledItemDelegate):
+    """A layer row: 👁 eye (click it: show / hide), the layer's colour dot,
+    its name - taller than a plain list row, a rounded highlight when chosen."""
+
+    EYE_W = 26          # the eye's column (clicks there toggle, never select)
+
+    def __init__(self, row_h, parent=None):
+        super().__init__(parent)
+        self.row_h = row_h
+
+    def sizeHint(self, option, index):
+        return QSize(max(1, option.rect.width()), self.row_h)
+
+    @staticmethod
+    def _shown(index):
+        state = index.data(Qt.CheckStateRole)
+        try:
+            return Qt.CheckState(state) == Qt.Checked
+        except (TypeError, ValueError):
+            return state == Qt.Checked
+
+    def _eye_rect(self, rect):
+        return QRectF(rect.x() + 4, rect.y(), self.EYE_W - 4, rect.height())
+
+    def paint(self, p, option, index):
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = QRectF(option.rect).adjusted(2, 1.5, -2, -1.5)
+        if option.state & QStyle.State_Selected:
+            p.setPen(Qt.NoPen)
+            p.setBrush(ROW_SELECTED)
+            p.drawRoundedRect(r, 5, 5)
+        elif option.state & QStyle.State_MouseOver:
+            p.setPen(Qt.NoPen)
+            p.setBrush(ROW_HOVER)
+            p.drawRoundedRect(r, 5, 5)
+        shown = self._shown(index)
+        draw_eye(p, self._eye_rect(QRectF(option.rect)), shown)
+        x = option.rect.x() + self.EYE_W + 4
+        icon = index.data(Qt.DecorationRole)
+        if icon is not None and not icon.isNull():
+            d = 10
+            top = option.rect.y() + (option.rect.height() - d) // 2
+            if not shown:
+                p.setOpacity(0.45)
+            icon.paint(p, x, top, d, d)
+            p.setOpacity(1.0)
+            x += d + 8
+        p.setPen(TEXT_ON if shown else TEXT_OFF)
+        font = option.font
+        p.setFont(font)
+        text_rect = option.rect.adjusted(x - option.rect.x(), 0, -6, 0)
+        name = option.fontMetrics.elidedText(index.data(Qt.DisplayRole) or "", Qt.ElideRight,
+                                             text_rect.width())
+        p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, name)
+        p.restore()
+
+    def editorEvent(self, event, model, option, index):
+        # The eye: a click shows / hides the layer, without choosing it.
+        kind = event.type()
+        if kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick):
+            if (event.button() == Qt.LeftButton
+                    and self._eye_rect(QRectF(option.rect)).contains(event.position())):
+                if kind == QEvent.MouseButtonRelease:
+                    model.setData(index, Qt.Unchecked if self._shown(index) else Qt.Checked,
+                                  Qt.CheckStateRole)
+                return True
+        return super().editorEvent(event, model, option, index)
+
+    def updateEditorGeometry(self, editor, option, index):
+        # renaming: the name's own place, the eye and dot left as they are
+        editor.setGeometry(option.rect.adjusted(self.EYE_W + 20, 3, -4, -3))
+
+
+class EyeCheck(QCheckBox):
+    """A show / hide toggle drawn as the layer rows' 👁 eye and its label."""
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(26 + fm.horizontalAdvance(self.text()) + 4, max(24, fm.height() + 8))
+
+    def minimumSizeHint(self):
+        return QSize(26, 24)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        shown = self.isChecked()
+        draw_eye(p, QRectF(4, 0, 22, self.height()), shown)
+        p.setPen(TEXT_ON if shown else TEXT_OFF)
+        p.drawText(self.rect().adjusted(30, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text())
+        p.end()
 
 
 class LayerWindow(QWidget):
@@ -42,7 +173,7 @@ class LayerWindow(QWidget):
     drag_finished = Signal()                # moved by hand (it leaves / rejoins the dock)
 
     WIDTH = 220
-    ROW_H = 24
+    ROW_H = 30
     MAX_ROWS = 8
 
     def __init__(self, parent=None):
@@ -162,14 +293,22 @@ class LayerWindow(QWidget):
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._list.setEditTriggers(QAbstractItemView.DoubleClicked)
-        self._list.setToolTip("Tick to show or hide, click to draw on it, double-click to rename")
+        self._list.setToolTip("👁 Click the eye to show or hide, the row to draw on it, "
+                              "double-click to rename")
+        self._list.setItemDelegate(_LayerRowDelegate(self.ROW_H, self._list))
+        self._list.setUniformItemSizes(True)
+        self._list.setMouseTracking(True)
+        self._list.viewport().setAttribute(Qt.WA_Hover, True)
+        self._list.setStyleSheet(
+            "QListWidget { background: #232528; border: 1px solid #3a3d41; border-radius: 6px;"
+            " padding: 2px; outline: 0; }")
         self._list.currentRowChanged.connect(self._on_row)
         self._list.itemChanged.connect(self._on_item)
         inner.addWidget(self._list)
 
         # Under the layers, fixed: the picture, the canvas under it, and the
         # background at the very bottom - the stack reads top to bottom.
-        self._picture = QCheckBox("🖼 Picture")
+        self._picture = EyeCheck("🖼 Picture")
         self._picture.setToolTip(
             "The picture, under every layer: untick to hide it - the sketch's canvas "
             "under it, or the background, shows instead")
@@ -199,7 +338,7 @@ class LayerWindow(QWidget):
         self._picture_opacity_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         picture_opacity_row.addWidget(self._picture_opacity_label)
         inner.addLayout(picture_opacity_row)
-        self._under = QCheckBox("📄 Canvas")
+        self._under = EyeCheck("📄 Canvas")
         self._under.setToolTip(
             "The sketch's middle grey sheet under the picture, the size of it (made by "
             "New sketch): it shows where the picture is while the picture is hidden - "
@@ -297,7 +436,7 @@ class LayerWindow(QWidget):
         position = self._layers.index(active)
         self._list.setCurrentRow(len(self._layers) - 1 - position)
         self._list.setFixedHeight(
-            self.ROW_H * min(self.MAX_ROWS, max(3, len(self._layers))) + 6)
+            self.ROW_H * min(self.MAX_ROWS, max(3, len(self._layers))) + 8)
         self._blend.setCurrentText(active.blend)
         self._opacity.setValue(active.opacity)
         self._opacity_label.setText(f"{active.opacity}%")

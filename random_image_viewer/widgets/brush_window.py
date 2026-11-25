@@ -431,6 +431,15 @@ class BrushWindow(QWidget):
             "radial from their middle out")
         self._shape_gradient.toggled.connect(lambda on: self._emit('shape_gradient', on))
         inner.addWidget(self._shape_gradient)
+        # 🖌 shapes fill through the brush's tip
+        self._shape_texture = QCheckBox("🖌 Shapes fill with the brush texture")
+        self._shape_texture.setToolTip(
+            "Lasso, polygon, rectangle, ellipse and triangle fill through the tip of the brush in "
+            "use: the tip stretched to cover the shape, the colour - or the gradient, with the box "
+            "above - only where the tip is, cut to the shape. Each shape keeps the tip it was "
+            "made with. Not with stars")
+        self._shape_texture.toggled.connect(lambda on: self._emit('shape_texture', on))
+        inner.addWidget(self._shape_texture)
         self._line_gradient = QCheckBox("Lines use the gradient")
         self._line_gradient.setToolTip(
             "Straight lines and polylines take the gradient above: linear runs along the line, "
@@ -615,6 +624,7 @@ class BrushWindow(QWidget):
         self._gradient_to.setCurrentIndex(1 if to else 0)
         self._gradient_swatch.setEnabled(bool(to))
         self._shape_gradient.setChecked(bool(settings.get('shape_gradient', False)))
+        self._shape_texture.setChecked(bool(settings.get('shape_texture', False)))
         self._line_gradient.setChecked(bool(settings.get('line_gradient', False)))
         self._shape_stars.setChecked(bool(settings.get('shape_stars', False)))
         self._line_stars.setChecked(bool(settings.get('line_stars', False)))

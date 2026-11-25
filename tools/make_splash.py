@@ -48,9 +48,16 @@ line_w = round((x1 - x0) * scale)
 rgb = im[seam - 1:seam + 1, x0:x1, :3].mean(axis=0)
 k = np.ones(5) / 5
 smooth = np.stack([np.convolve(rgb[:, c], k, mode="same") for c in range(3)], axis=1)
-pos = np.linspace(0, len(smooth) - 1, line_w)
-line = np.stack([np.interp(pos, np.arange(len(smooth)), smooth[:, c]) for c in range(3)], axis=1)
-Image.fromarray(np.clip(line.round(), 0, 255).astype(np.uint8)[None, :, :], "RGB").save(out)
+# ⏳ The boot image is the loader as it starts (splash.py goes on from it):
+# a 1 px near-white line, just its first BOOT_START share - the rest of the
+# line's width transparent (no track): it keeps the image the line's width,
+# so the launcher, which centres it, puts that start where the line starts.
+# (The launcher's splash can only show a still image; on Windows its fully
+# transparent pixels show through.)
+FILL, START = (238, 240, 242), 0.06         # = splash.LOADER_FILL / BOOT_START
+line = np.zeros((line_w, 4), np.uint8)
+line[:int(round(line_w * START))] = FILL + (255,)
+Image.fromarray(line[None, :, :], "RGBA").save(out)
 
 stops = []
 for t in np.linspace(0, 1, STOPS):

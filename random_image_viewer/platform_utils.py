@@ -132,6 +132,49 @@ def set_window_cloaked(window, cloaked):
         return False
 
 
+def bring_to_front(window):
+    """Raise *window* and make it the active window, in front of the others.
+
+    Qt's raise_() / activateWindow() alone are often refused at startup:
+    Windows lets a process take the foreground only while it holds it (the
+    launcher's own splash had it, then went), so the app came up behind the
+    window it was started from. The usual way round: join the input of the
+    thread that has the foreground for a moment, then ask - Windows then
+    treats it as our own. Returns True when the window is in front."""
+    try:
+        window.raise_()
+        window.activateWindow()
+    except Exception:
+        pass
+    if not ctypes or os.name != 'nt':
+        return True
+    try:
+        from ctypes import wintypes
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        hwnd = wintypes.HWND(int(window.winId()))
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)                      # SW_RESTORE
+        fg = user32.GetForegroundWindow()
+        if fg and int(fg) == int(hwnd.value or 0):
+            return True
+        mine = kernel32.GetCurrentThreadId()
+        theirs = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        joined = bool(theirs and theirs != mine and user32.AttachThreadInput(theirs, mine, True))
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.SetFocus(hwnd)
+        finally:
+            if joined:
+                user32.AttachThreadInput(theirs, mine, False)
+        return int(user32.GetForegroundWindow() or 0) == int(hwnd.value or 0)
+    except Exception:
+        return False
+
+
 def pick_folders(window=None, title="", start_dir=""):
     """Windows' own folder picker, with several folders selectable at once.
 

@@ -332,10 +332,16 @@ class GpuView(QOpenGLWidget):
         return True
 
     def update_area(self, rect):
-        """Only *rect* (canvas coords) changed: the next paint redraws
-        just that, over the frame kept from before."""
-        if not self._full:
-            self._area = QRect(rect) if self._area is None else self._area.united(rect)
+        """*rect* (canvas coords) changed: the next paint redraws the whole
+        canvas. (Redrawing just that piece left bare 1 px rows of the canvas
+        grey along its edges at 150 %: QPainter's part (the sheet, the
+        picture) and the GL part (layer textures) a device row apart - a
+        ladder through the paint while a polygon's corners were placed, its
+        rubber band repainting a box round it at every move. The whole
+        canvas is cheap here - every layer is a texture already - and is how
+        a stroke being drawn repaints too, see RandomImageViewer._live_update.)"""
+        self._full = True
+        self._area = None
         self.update()
 
     def resizeGL(self, w, h):
@@ -934,9 +940,35 @@ class GpuView(QOpenGLWidget):
         f.glBindTexture(GL_TEXTURE_2D, 0)
         f.glActiveTexture(GL_TEXTURE0)
 
-    def _blend_program(self):
-        """The blend shader for this context (made once), or None."""
-        prog = getattr(self, '_blend_prog', None)
+    # 🖍 Brush blend, live: the stroke being drawn (the GPU brush's preview)
+    # blended in its mode with what was under it when the pen went down -
+    # the CPU's _brush_blended, per pixel here, so a hair brush in Multiply
+    # paints as fast as in Normal. Opaque where the stroke has any paint,
+    # nothing elsewhere; laid over the view at the layer's opacity.
+    _BRUSH_BLEND_MAIN = """
+        uniform sampler2D stroke;
+        uniform sampler2D under;
+        uniform vec2 strokeScale;   // the stroke's size / its texture's (it may be bigger)
+        uniform float ink;
+        void main() {
+            vec4 s = TEX(stroke, tc * strokeScale);
+            if (s.a < 0.5 / 255.0) discard;
+            s *= ink;
+            vec4 d = TEX(under, tc);
+            vec3 sc = s.a > 0.0 ? s.rgb / s.a : vec3(0.0);
+            vec3 dc = d.a > 0.0 ? d.rgb / d.a : vec3(0.0);
+            vec3 b = vec3(one(sc.r, dc.r), one(sc.g, dc.g), one(sc.b, dc.b));
+            vec4 o = vec4((1.0 - s.a) * d.rgb + (1.0 - d.a) * s.rgb + s.a * d.a * b,
+                          s.a + d.a - s.a * d.a);
+            OUT = clamp(o, 0.0, 1.0) * opacity;
+        }
+    """
+
+    def _blend_program(self, brush=False):
+        """The blend shader for this context (made once), or None. *brush*:
+        the brush-blend one (see _BRUSH_BLEND_MAIN)."""
+        attr = '_brush_blend_prog' if brush else '_blend_prog'
+        prog = getattr(self, attr, None)
         if prog is not None:
             return prog
         from PySide6.QtGui import QSurfaceFormat
@@ -957,8 +989,12 @@ class GpuView(QOpenGLWidget):
             decl = ""
         vert = (head_v + f"{vin} vec2 pos;\nuniform mat4 matrix;\n{vout} vec2 tc;\n"
                 "void main() { tc = pos; gl_Position = matrix * vec4(pos, 0.0, 1.0); }\n")
-        frag = (head_f + f"#define TEX {tex}\n{fin} vec2 tc;\n{decl}" + self._BLEND_FRAG
-                + f"void main() {{ {outv} = blended(tc, gl_FragCoord.xy); }}\n")
+        if brush:
+            frag = (head_f + f"#define TEX {tex}\n#define OUT {outv}\n{fin} vec2 tc;\n{decl}"
+                    + self._BLEND_FRAG + self._BRUSH_BLEND_MAIN)
+        else:
+            frag = (head_f + f"#define TEX {tex}\n{fin} vec2 tc;\n{decl}" + self._BLEND_FRAG
+                    + f"void main() {{ {outv} = blended(tc, gl_FragCoord.xy); }}\n")
         prog = QOpenGLShaderProgram()
         if not (prog.addShaderFromSourceCode(QOpenGLShader.Vertex, vert)
                 and prog.addShaderFromSourceCode(QOpenGLShader.Fragment, frag)
@@ -981,8 +1017,82 @@ class GpuView(QOpenGLWidget):
         prog.release()
         buf.release()
         vao.release()
-        self._blend_prog, self._blend_vao, self._blend_buf = prog, vao, buf
+        if brush:
+            self._brush_blend_prog, self._brush_blend_vao, self._brush_blend_buf = prog, vao, buf
+        else:
+            self._blend_prog, self._blend_vao, self._blend_buf = prog, vao, buf
         return prog
+
+    _brush_blend_failed = False
+
+    def draw_brush_blend(self, p, stroke_id, stroke_size, size, under, note, transform,
+                         opacity, ink, mode, area):
+        """🖍 The live stroke in brush blend *mode* (a QPainter CompositionMode):
+        texture *stroke_id* (*stroke_size*: the texture's w, h; the stroke
+        fills *size* of it from the top-left, row 0 = top, premultiplied)
+        blended with *under* (a premultiplied QImage of *size*, sent once -
+        *note* as for a layer) at *ink*, laid over what is drawn at *opacity*
+        through *transform* (stroke px -> canvas coords), clipped to *area*.
+        False when it cannot."""
+        code = self._blend_id(mode)
+        if code is None or self._brush_blend_failed:
+            return False
+        from PySide6.QtGui import QMatrix4x4, QTransform
+        GL_TEXTURE_2D, GL_TEXTURE0, GL_BLEND, GL_SCISSOR_TEST = 0x0DE1, 0x84C0, 0x0BE2, 0x0C11
+        GL_TRIANGLE_STRIP, GL_ONE, GL_ONE_MINUS_SRC_ALPHA = 0x0005, 1, 0x0303
+        try:
+            p.beginNativePainting()
+            try:
+                tex = self._layer_texture(under, note)
+                if tex is None:
+                    return False
+                prog = self._blend_program(brush=True)
+                f = self.context().functions()
+                dpr = self.devicePixelRatioF()
+                W, H = self.width(), self.height()
+                dw, dh = self._device_size(W, H, dpr)
+                f.glViewport(0, 0, dw, dh)
+                if area is not None:
+                    dev = getattr(self, '_area_dev', None)
+                    if dev is None:
+                        dev = QRect(math.floor(area.x() * dpr), math.floor(area.y() * dpr),
+                                    math.ceil(area.width() * dpr), math.ceil(area.height() * dpr))
+                    f.glEnable(GL_SCISSOR_TEST)
+                    f.glScissor(dev.x(), dh - dev.y() - dev.height(), dev.width(), dev.height())
+                f.glActiveTexture(GL_TEXTURE0 + 1)
+                f.glBindTexture(GL_TEXTURE_2D, tex.textureId())
+                f.glActiveTexture(GL_TEXTURE0)
+                f.glBindTexture(GL_TEXTURE_2D, int(stroke_id))
+                f.glEnable(GL_BLEND)
+                f.glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)      # premultiplied, over
+                w, h = size
+                quad = QTransform(float(w), 0, 0, float(h), 0, 0)
+                clip = self._clip_space(W, H, dpr)
+                prog.bind()
+                prog.setUniformValue("matrix", QMatrix4x4(quad * transform * clip))
+                prog.setUniformValue1i("stroke", 0)
+                prog.setUniformValue1i("under", 1)
+                prog.setUniformValue("strokeScale", float(w) / max(1, stroke_size[0]),
+                                     float(h) / max(1, stroke_size[1]))
+                prog.setUniformValue1f("ink", float(ink))
+                prog.setUniformValue1f("opacity", float(opacity))
+                prog.setUniformValue1i("mode", int(code))
+                self._brush_blend_vao.bind()
+                f.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+                self._brush_blend_vao.release()
+                prog.release()
+                if area is not None:
+                    f.glDisable(GL_SCISSOR_TEST)
+                f.glActiveTexture(GL_TEXTURE0 + 1)
+                f.glBindTexture(GL_TEXTURE_2D, 0)
+                f.glActiveTexture(GL_TEXTURE0)
+                return True
+            finally:
+                p.endNativePainting()
+        except Exception as e:
+            print(f"\U0001F3AE Brush blend off on the GPU (the CPU blends): {e}")
+            self._brush_blend_failed = True
+            return False
 
     def _blend_layer(self, p, image, note, transform, opacity, mode, area):
         """Draw a layer's image in blend mode *mode* (a QPainter
@@ -1166,6 +1276,9 @@ class GpuCanvasWindow(QOpenGLWindow):
     _blend_program = GpuView._blend_program
     _blend_layer = GpuView._blend_layer
     _blend_failed = False
+    _BRUSH_BLEND_MAIN = GpuView._BRUSH_BLEND_MAIN
+    draw_brush_blend = GpuView.draw_brush_blend
+    _brush_blend_failed = False
     _IMPASTO_FRAG = GpuView._IMPASTO_FRAG
     _impasto_program = GpuView._impasto_program
     _draw_impasto = GpuView._draw_impasto

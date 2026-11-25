@@ -83,11 +83,13 @@ class Stroke(list):
     """
 
     __slots__ = ('thickness', 'color', 'texture', 'stamps', 'flat', 'render', 'history', 'erase',
-                 'pic_width', 'clip')
+                 'pic_width', 'clip', 'gpu_render')
 
     def __init__(self, points=(), thickness=None, color=None, texture=None, stamps=None,
                  flat=False):
         super().__init__(points)
+        # 🎮 its render came from the GPU brush (an erase one burns in from it too)
+        self.gpu_render = False
         # A round-pen stroke's width in picture pixels as drawn (its layer's
         # image keeps it so); None for older ones and textured strokes.
         self.pic_width = None
@@ -949,8 +951,175 @@ class RandomImageViewer(QMainWindow):
         if self._comp_grids:
             from random_image_viewer.drawing import comp_grids
             grids = list(self._comp_grids.items())
+            points = self.__dict__.get('_grid_points') or {}
             for rect in self._comp_grid_rects(draw_x, draw_y, zoomed_width, zoomed_height):
-                comp_grids.paint_grids(painter, rect, grids, opacity=self._comp_grid_opacity / 100.0)
+                comp_grids.paint_grids(painter, rect, grids, opacity=self._comp_grid_opacity / 100.0,
+                                       params=points)
+            self._draw_grid_handles(painter, draw_x, draw_y, zoomed_width, zoomed_height)
+
+    # -- ▦ moving a perspective grid's vanishing points ---------------------
+    #
+    # While the ▦ grids palette is open, each perspective grid shows its
+    # points (vanishing points, the fisheye's centre) as handles to drag -
+    # pen or mouse; right-click one: back where it was. A point off the
+    # view sits at its edge, a short line pointing to where it really is,
+    # and is dragged from there. Closed palette: no handles, nothing in the
+    # way of painting. Kept per grid as fractions of the picture (see
+    # comp_grids.POINTS), saved with the settings.
+
+    _GRID_HANDLE_R = 7          # px: the handle's radius ...
+    _GRID_HANDLE_GRAB = 13      # ... and how near grabs it
+
+    def _grid_handles_on(self):
+        win = self.__dict__.get('_grids_window')
+        return bool(win is not None and win.isVisible() and self._comp_grids
+                    and getattr(self, 'lines_visible', True))
+
+    def _grid_handles(self):
+        """[(key, index, true point, shown point, rect, orient)] - label
+        coords; *shown* is the true point kept inside the view."""
+        if not self._grid_handles_on():
+            return []
+        from random_image_viewer.drawing import comp_grids
+        tx = self._compute_line_transform()
+        if not tx:
+            return []
+        label = self.image_label
+        m = self._GRID_HANDLE_R + 4
+        view = QRectF(m, m, max(1, label.width() - 2 * m), max(1, label.height() - 2 * m))
+        stored = self.__dict__.get('_grid_points') or {}
+        out = []
+        rects = self._comp_grid_rects(tx['draw_x'], tx['draw_y'], tx['zoomed_width'], tx['zoomed_height'])
+        for key, orient in self._comp_grids.items():
+            pts = comp_grids.points(key, stored.get(key))
+            if not pts:
+                continue
+            for rect in rects[:1]:          # (◧ Studio: on the canvas half)
+                for i, f in enumerate(pts):
+                    x, y = comp_grids.point_on(rect, orient, f)
+                    shown = QPointF(min(max(x, view.left()), view.right()),
+                                    min(max(y, view.top()), view.bottom()))
+                    out.append((key, i, QPointF(x, y), shown, rect, orient))
+        return out
+
+    def _draw_grid_handles(self, painter, draw_x, draw_y, zoomed_width, zoomed_height):
+        handles = self._grid_handles()
+        if not handles:
+            return
+        from random_image_viewer.drawing import comp_grids
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        r = self._GRID_HANDLE_R
+        held = self.__dict__.get('_grid_drag')
+        for key, i, true, shown, _rect, _o in handles:
+            colour = comp_grids.colour(key, 1.0)
+            off = (true - shown).manhattanLength() > 0.5
+            if off:
+                # off the view: a short line from the handle towards it
+                d = true - shown
+                n = math.hypot(d.x(), d.y()) or 1.0
+                tip = shown + QPointF(d.x() / n, d.y() / n) * (r + 9)
+                for pen in (QPen(QColor(0, 0, 0, 200), 3.2), QPen(colour, 1.6)):
+                    painter.setPen(pen)
+                    painter.drawLine(shown, tip)
+            grabbed = held is not None and held[0] == key and held[1] == i
+            painter.setPen(QPen(QColor(0, 0, 0, 210), 3.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(shown, r, r)
+            painter.setPen(QPen(QColor(255, 255, 255, 240), 1.4))
+            painter.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 230 if grabbed else 150))
+            painter.drawEllipse(shown, r, r)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255))
+            painter.drawEllipse(shown, 1.6, 1.6)
+        painter.restore()
+
+    def grid_handle_at(self, pos):
+        """The handle under *pos* (label coords): (key, index, ...), or None."""
+        best = None
+        for h in self._grid_handles():
+            d = math.hypot(h[3].x() - pos.x(), h[3].y() - pos.y())
+            if d <= self._GRID_HANDLE_GRAB and (best is None or d < best[0]):
+                best = (d, h)
+        return best[1] if best else None
+
+    def grid_handle_press(self, pos, button=Qt.LeftButton):
+        """A press on a handle: dragged from here on (right-click: that
+        grid's points back to their defaults). True when taken."""
+        h = self.grid_handle_at(pos)
+        if h is None:
+            return False
+        key, i, true, shown, rect, orient = h
+        if button == Qt.RightButton:
+            pts = self.__dict__.get('_grid_points') or {}
+            pts.pop(key, None)
+            self._grid_points = pts
+            self._save_grid_points()
+            self._refresh_grid_view()
+            self.status.showMessage("▦ Perspective points back to where they were", 2500)
+            return True
+        # (grabbed off the view: the point jumps to the pen, then follows it)
+        self._grid_drag = (key, i, rect, orient, true - shown if (true - shown).manhattanLength() < 0.5
+                           else QPointF(0, 0))
+        self.image_label.setCursor(Qt.ClosedHandCursor)
+        self._refresh_grid_view()
+        return True
+
+    def grid_handle_move(self, pos):
+        drag = self.__dict__.get('_grid_drag')
+        if drag is None:
+            return False
+        from random_image_viewer.drawing import comp_grids
+        key, i, rect, orient, _off = drag
+        stored = self.__dict__.get('_grid_points') or {}
+        pts = comp_grids.points(key, stored.get(key))
+        fx, fy = comp_grids.fraction_of(rect, orient, pos.x(), pos.y())
+        pts[i] = (fx, fy)
+        if key in comp_grids.HORIZON_PAIR and i in (0, 1):
+            pts[1 - i] = (pts[1 - i][0], fy)            # one horizon
+        stored[key] = [list(p) for p in pts]
+        self._grid_points = stored
+        now = time.monotonic()
+        if now - self.__dict__.get('_grid_drag_paint', 0.0) > 0.016:
+            self._grid_drag_paint = now
+            self._refresh_grid_view(live=True)
+        return True
+
+    def grid_handle_release(self):
+        if self.__dict__.pop('_grid_drag', None) is None:
+            return False
+        self._save_grid_points()
+        self.apply_tool_cursor()
+        self._refresh_grid_view()
+        return True
+
+    def _save_grid_points(self):
+        try:
+            self._settings.setValue("comp_grid_points", json.dumps(self.__dict__.get('_grid_points') or {}))
+        except Exception as e:
+            print(f"▦ grid points not saved: {e!r}")
+
+    def _load_grid_points(self):
+        try:
+            raw = json.loads(str(self._settings.value("comp_grid_points", "") or "{}"))
+            return {k: [[float(x), float(y)] for x, y in v] for k, v in raw.items()}
+        except Exception:
+            return {}
+
+    def _refresh_grid_view(self, live=False):
+        """The grids drawn again: on the GPU canvas a repaint (they are its
+        overlay), else the view made again."""
+        gpu = self.__dict__.get('_gpu_canvas')
+        if self.__dict__.get('_gpu_display') and gpu is not None and getattr(gpu, 'active', False):
+            gpu._full = True
+            gpu.update()
+            return
+        if live and not self.current_image:
+            return
+        self.enhancement_cache.clear()
+        self.scaled_cache.clear()
+        if self.current_image:
+            self.display_image(self.current_image)
 
     def _comp_grid_rects(self, draw_x, draw_y, zoomed_width, zoomed_height):
         """Where the ▦ grids go (display coords): the picture - in ◧ Studio
@@ -2733,7 +2902,10 @@ class RandomImageViewer(QMainWindow):
                         painter.drawImage(render[2] + shift, render[1])
                         continue
                     if (render is not None and on_screen and self._canvas_k is not None
-                            and not getattr(mark, 'erase', False)
+                            # (🧽 an erase stroke from the GPU brush too: its rub
+                            # as drawn, taken out - laying all the hairs again
+                            # cost ~200 ms at the pen-up)
+                            and (not getattr(mark, 'erase', False) or getattr(mark, 'gpu_render', False))
                             and self._burn_render(painter, mark, render, view)):
                         continue
                     tint = getattr(mark, 'history', None)
@@ -3183,6 +3355,9 @@ class RandomImageViewer(QMainWindow):
         if fill.get('stars') and (len(points) >= 3 or fill['stars'].get('band')):
             self._paint_star_fill(painter, fill, to_display, color)
             return
+        if (fill.get('fill_tip') and len(points) >= 3 and fill.get('shape') != 'polyline'
+                and self._paint_texture_fill(painter, fill, to_display, antialias)):
+            return          # 🖌 through the brush's tip
         if fill.get('gradient') and fill.get('shape') == 'polyline':
             self._paint_gradient_line(painter, dict(fill, color=color), to_display,
                                       self._line_pen_width(fill, painter), antialias)
@@ -3571,6 +3746,7 @@ class RandomImageViewer(QMainWindow):
         # ▦ composition grids (drawing/comp_grids): {key: orient} of the ones on,
         # any number at once; remembered. grid_overlay: any of them on.
         self._comp_grids = self._load_comp_grids()
+        self._grid_points = self._load_grid_points()     # ▦ moved vanishing points
         self._comp_grid_opacity = self._settings_int("comp_grid_opacity", 80, 10, 100)
         self.grid_overlay = bool(self._comp_grids)
         self._grids_window = None
@@ -4210,10 +4386,11 @@ class RandomImageViewer(QMainWindow):
         self.v_shortcut.activated.connect(lambda: self.select_tool_btn.toggle())
         self.ctrl_a_shortcut = QShortcut("Ctrl+A", self)
         self.ctrl_a_shortcut.activated.connect(self.select_all_marks)
-        # ✏ B picks up the freehand brush (pressed again, it stays up)
+        # 🖌 B picks up the brush, as a click on it does - the Brush panel with
+        # it (pressed again while painting, nothing changes: no panel flashing)
         self.b_shortcut = QShortcut("B", self)
         self.b_shortcut.activated.connect(
-            lambda: self.free_draw_tool_btn.isChecked() or self.free_draw_tool_btn.setChecked(True))
+            lambda: self.free_draw_tool_btn.isChecked() or self.free_draw_tool_btn.click())
 
         # Enter applies a crop; only enabled while a frame is on the picture.
         self._crop_shortcuts = []
@@ -4259,6 +4436,11 @@ class RandomImageViewer(QMainWindow):
         elif not self._ui_chrome_visible():
             print("EMERGENCY: Restoring UI from minimal mode")
             self.toggle_toolbar_visibility(True)  # Show UI
+        elif (getattr(self, 'free_draw_mode', False)
+                and not getattr(self, 'is_drawing_free_stroke', False)):
+            # 🖌 Esc puts the brush down (a click on 🖌 shows / hides its panel now)
+            self.free_draw_tool_btn.setChecked(False)
+            self.status.showMessage("🖌 Brush put down — B or a click on 🖌 picks it up", 2500)
 
     def emergency_toggle_fullscreen(self):
         """Emergency toggle fullscreen"""
@@ -4333,7 +4515,18 @@ class RandomImageViewer(QMainWindow):
         self.snapshot_layer_btn = QToolButton(); self.snapshot_layer_btn.setText("📸"); self.snapshot_layer_btn.setToolTip("Snapshot to layer: what is on screen now (effects and marks too) onto a new layer, like 💾 saves it.\nRight-click: ⌇ only the picture's edges, on transparency (in ◧ Studio over the canvas)"); self.snapshot_layer_btn.setFixedSize(24,24); self.snapshot_layer_btn.clicked.connect(self.snapshot_to_layer); toolbar.addWidget(self.snapshot_layer_btn)
         self.snapshot_layer_btn.setContextMenuPolicy(Qt.CustomContextMenu)
         self.snapshot_layer_btn.customContextMenuRequested.connect(self._snapshot_menu)
-        self.free_draw_tool_btn = QToolButton(); self.free_draw_tool_btn.setText("✏"); self.free_draw_tool_btn.setToolTip("Free Draw Tool (drag to draw)"); self.free_draw_tool_btn.setCheckable(True); self.free_draw_tool_btn.setFixedSize(24,24); self.free_draw_tool_btn.toggled.connect(self.toggle_free_draw); toolbar.addWidget(self.free_draw_tool_btn)
+        # 🖌 The main brush (B): round, the knobs' size, showing the tip in
+        # use. A click picks the brush up and opens the 🖌 Brush panel; a
+        # click while it is in hand shows / hides the panel (it stays the
+        # tool - another tool, Esc ... puts it down). See _main_brush_clicked.
+        from random_image_viewer.widgets.scrub_knob import RoundToolButton
+        self.free_draw_tool_btn = RoundToolButton("🖌", sticky=True)
+        self.free_draw_tool_btn.setToolTip(
+            "🖌 Brush (B): paint with the tip shown - click to pick it up and open the Brush panel "
+            "(tip, mode, hairs ...); click again to show / hide the panel")
+        self.free_draw_tool_btn.toggled.connect(self.toggle_free_draw)
+        self.free_draw_tool_btn.clicked.connect(self._main_brush_clicked)
+        toolbar.addWidget(self.free_draw_tool_btn)
         add_spacer(2)
         self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Erase with the brush (6): the brush rubs out what is drawn on the selected layer - with its tip, size, pressure and opacity, never the picture. Click again for the mode it was in"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_brush_erase); toolbar.addWidget(self.eraser_tool_btn)
         self.select_tool_btn = QToolButton(); self.select_tool_btn.setText("⬚"); self.select_tool_btn.setToolTip("Select + transform (V): draw a lasso round marks on the selected layer (or click one, Ctrl+A for all), then drag inside to move, a corner to scale, outside to turn (Shift: 15° steps). Enter or double-click applies, Esc cancels, Ctrl+Z undoes. Strokes stay sharp at any size"); self.select_tool_btn.setCheckable(True); self.select_tool_btn.setFixedSize(24,24); self.select_tool_btn.toggled.connect(self.toggle_select_tool); toolbar.addWidget(self.select_tool_btn)
@@ -4403,16 +4596,38 @@ class RandomImageViewer(QMainWindow):
         self.line_thickness_slider.setToolTip("Brush size (1-400px) — small for line work, large to block in areas")
         self.line_thickness_slider.valueChanged.connect(self._on_brush_slider_changed)
         self.line_thickness_slider.sliderReleased.connect(self._on_brush_slider_released)
-        _bs.addWidget(self.line_thickness_slider)
-        self.line_thickness_label = QLabel(f"{self.line_thickness}px")
-        self.line_thickness_label.setFixedWidth(38)
-        self.line_thickness_label.setStyleSheet("font-size: 10px; color: #b8bcc0;")
-        self.line_thickness_label.setToolTip("Current brush size")
-        _bs.addWidget(self.line_thickness_label)
-        self.brush_size_widget.setFixedHeight(24)
+        # (the slider is kept - the size's position on the curve, read and set
+        # everywhere - but not shown: the ⟷ knob scrubs it, see _on_size_knob)
+        self.line_thickness_slider.setParent(self.brush_size_widget)
+        self.line_thickness_slider.hide()
+        # ⟷ Scrub knobs, as HeavyPaint's: drag sideways on them. Size shows
+        # the brush's outline at its real size under the panel meanwhile,
+        # Jitter a sample stroke with that much colour jitter.
+        from random_image_viewer.widgets.scrub_knob import ScrubKnob, JitterKnob, ScrubPreview
+        self._size_knob = ScrubKnob("Size", 0, self._BRUSH_STEPS, rate=3.0, step=25)
+        self._size_knob.value_source = lambda: self.line_thickness_slider.value()
+        self._size_knob.setToolTip(
+            "⟷ Brush size: drag sideways (Shift: finer), or the wheel - the brush's outline shows "
+            "at its real size under the panel while you drag. [ and ] step it too")
+        self._size_knob.scrubbed.connect(self._on_size_knob)
+        _bs.addWidget(self._size_knob)
+        # every place that showed the size in the old label sets the knob's face
+        self.line_thickness_label = self._size_knob
+        self._size_knob.setText(f"{self.line_thickness}px")
+        self._jitter_knob = JitterKnob()
+        self._jitter_knob.value_source = self._jitter_amount
+        self._jitter_knob.colour_source = lambda: self.line_color
+        self._jitter_knob.started.connect(self._on_jitter_knob_start)
+        self._jitter_knob.scrubbed.connect(self._on_jitter_knob)
+        _bs.addWidget(self._jitter_knob)
+        self._scrub_preview = ScrubPreview()
         toolbar.addWidget(self.brush_size_widget)
         self.brush_texture_btn = QToolButton(); self.brush_texture_btn.setText("🖌"); self.brush_texture_btn.setCheckable(True); self.brush_texture_btn.setFixedSize(24,24); self.brush_texture_btn.toggled.connect(self.toggle_brush_window); toolbar.addWidget(self.brush_texture_btn)
-        self.brush_mode_btn = QToolButton(); self.brush_mode_btn.setFixedSize(24,24); self.brush_mode_btn.clicked.connect(self.cycle_brush_mode); toolbar.addWidget(self.brush_mode_btn)
+        # 🖍 the brush mode (Paint, Blend, Smudge ...): round, in PAINT by the brush
+        self.brush_mode_btn = RoundToolButton("", checkable=False); self.brush_mode_btn.clicked.connect(self.cycle_brush_mode); toolbar.addWidget(self.brush_mode_btn)
+        # held down (pen or mouse) or right-clicked: all the modes to pick from
+        self.brush_mode_btn.hold_enabled = True
+        self.brush_mode_btn.long_pressed.connect(self._show_mode_menu)
         self._update_brush_button()
         self._update_brush_mode_button()
         add_spacer(4)
@@ -4457,7 +4672,8 @@ class RandomImageViewer(QMainWindow):
             btn=QToolButton(); btn.setText(emoji); btn.setToolTip(f"Set Line Color to {color_name}"); btn.setFixedSize(18,24); btn.clicked.connect(lambda checked, c=color_hex: self.set_line_color(c)); btn.setStyleSheet("QToolButton { border:1px solid #444; margin:1px; }"); toolbar.addWidget(btn); self.quick_color_btns.append(btn)
         add_spacer(2)
         # 💉 Color Snap (eyedropper) — sample a color from the image as line color
-        self.color_snap_btn = QToolButton(); self.color_snap_btn.setText("💉"); self.color_snap_btn.setToolTip("Color Snap (I): hover to preview (after ~350ms), click to pick (saves to palette →)"); self.color_snap_btn.setCheckable(True); self.color_snap_btn.setFixedSize(24,24); self.color_snap_btn.toggled.connect(self.toggle_color_snap); toolbar.addWidget(self.color_snap_btn)
+        # 💉 Colour snap: a main tool too - round, the knobs' size, by the brush
+        self.color_snap_btn = RoundToolButton("💉"); self.color_snap_btn.setToolTip("Color Snap (I): hover to preview (after ~350ms), click to pick (saves to palette →)"); self.color_snap_btn.toggled.connect(self.toggle_color_snap); toolbar.addWidget(self.color_snap_btn)
         # ✨ Auto-extract palette from current image
         self.palette_extract_btn = QToolButton(); self.palette_extract_btn.setText("✨"); self.palette_extract_btn.setToolTip("Auto-extract dominant colors from current image into palette"); self.palette_extract_btn.setFixedSize(24,24); self.palette_extract_btn.clicked.connect(self.extract_palette_from_image); toolbar.addWidget(self.palette_extract_btn)
         # 🧽 Clear palette
@@ -4739,14 +4955,19 @@ class RandomImageViewer(QMainWindow):
             # helpers. Each size control sits by its tool (brush size by the
             # brush, eraser size by the eraser). Colour used to be a separate
             # LINE / COLOR panel, a trip away from the brush every time.
+            # 🖌 PAINT: the main tools, a small panel of their own - the brush
+            # (its tip; opens the Brush panel), ⟷ size, 🎲 jitter, 💉 colour
+            # snap - all round, one size
+            ("PAINT", [
+                'free_draw_tool_btn', 'brush_mode_btn', 'brush_size_widget', 'color_snap_btn',
+            ]),
             ("DRAW", [
-                'free_draw_tool_btn', 'brush_size_widget', 'brush_texture_btn', 'brush_mode_btn',
                 'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn', 'polyline_btn',
                 '__sep__',
                 'lasso_fill_btn', 'polygon_fill_btn',
                 'rect_fill_btn', 'ellipse_fill_btn', 'triangle_fill_btn', 'gradient_fill_btn',
                 '__sep__',
-                'line_color_btn', '__quick_colors__', 'color_snap_btn',
+                'line_color_btn', '__quick_colors__',
                 'palette_extract_btn', 'palette_clear_btn',
                 '__sep__',
                 'line_opacity_widget', 'antialiasing_btn', 'pen_pressure_btn',
@@ -4888,6 +5109,8 @@ class RandomImageViewer(QMainWindow):
             st = data.get(key)
             if st:
                 panel.apply_state(st)
+        if not data.get('PAINT'):
+            self._place_paint_panel()       # new: by DRAW, not packed in at the top left
         ctx = getattr(self, '_context_panel', None)
         if ctx is not None and data.get(ctx._persist_key):
             # Width, folded and place, as the others; whether it shows is
@@ -4895,6 +5118,41 @@ class RandomImageViewer(QMainWindow):
             ctx.apply_state(dict(data[ctx._persist_key]))
         # Re-pack any panels the user never moved so restored widths tile neatly.
         self._arrange_floating_panels()
+
+    def _place_paint_panel(self, under_draw=False):
+        """🖌 PAINT laid next to DRAW, right-aligned with it: just above it
+        (or under it when *under_draw*, or when there is no room above),
+        anchored to the same corner so the two stay together."""
+        by_key = getattr(self, '_panel_by_key', {})
+        paint, draw = by_key.get('PAINT'), by_key.get('DRAW')
+        if paint is None:
+            return
+        paint.show()
+        if paint.collapsed:
+            paint.set_collapsed(False, emit=False)
+        canvas = self.image_label
+        gap = 8
+        if draw is None or draw.isHidden():
+            paint.dock('right', 'top')
+            paint.raise_()
+            return
+        x = draw.x() + draw.width() - paint.width()
+        above = draw.y() - gap - paint.height()
+        if under_draw or above < gap:
+            y = draw.y() + draw.height() + gap
+        else:
+            y = above
+        x = max(gap, min(canvas.width() - paint.width() - gap, x))
+        y = max(gap, min(canvas.height() - paint.height() - gap, y))
+        paint.move(int(x), int(y))
+        paint.mark_user_moved(True)
+        paint.update_anchor()
+        paint.raise_()
+        if y < draw.y():
+            # 🧲 DRAW stuck under it: moving PAINT takes DRAW along (dragged
+            # away and let go elsewhere, DRAW comes loose)
+            draw.stick_to(paint, 'below', draw.x() - paint.x())
+            draw.update_anchor()
 
     def _arrange_floating_panels(self):
         """Pack panels left-to-right along the top edge, wrapping as needed.
@@ -5025,14 +5283,18 @@ class RandomImageViewer(QMainWindow):
         margin = 8
         gap = 8
         # Top-to-bottom order matching the default right-hand stack.
-        order = ["FILE / NAV", "TRANSFORM / VIEW", "EFFECTS", "DRAW"]
-        # Collapse panels first so heights reflect the default (closed) look.
+        order = ["FILE / NAV", "TRANSFORM / VIEW", "EFFECTS", "PAINT", "DRAW"]
+        # Collapse panels first so heights reflect the default (closed) look -
+        # all but 🖌 PAINT, the main tools: small, and always in use.
         panels = []
         for key in order:
             panel = by_key.get(key)
             if panel is None or panel.isHidden():
                 continue
-            if not panel.collapsed:
+            if key == 'PAINT':
+                if panel.collapsed:
+                    panel.set_collapsed(False, emit=False)
+            elif not panel.collapsed:
                 panel.set_collapsed(True, emit=False)
             panels.append(panel)
         # The PAGES panel (a PDF / EPUB / comic open) goes on top of the
@@ -10794,6 +11056,28 @@ class RandomImageViewer(QMainWindow):
                   'push': ("🧊", "Push (liquify): moves the paint under the pen along as a mass, "
                                  "crisp - Ice cracks it into fragments (Strength, Ice in 🖌)")}
 
+    def _show_mode_menu(self):
+        """🖍 held down (or right-clicked): every brush mode in a list under
+        it - pick one (with the pen: let go over it, or tap it), instead of
+        clicking round them all."""
+        from PySide6.QtWidgets import QMenu
+        btn = self.brush_mode_btn
+        menu = QMenu(btn)
+        menu.setToolTipsVisible(True)
+        now = self.brush_settings.get('mode', 'paint')
+        keys = {m: i + 1 for i, m in enumerate(('paint', 'blend', 'smudge', 'history', 'pick', 'erase'))}
+        for mode in brushes.MODES:
+            emoji, tip = self._MODE_LOOK.get(mode, ("", mode))
+            name = tip.split(':', 1)[0]
+            key = keys.get(mode)
+            act = menu.addAction(f"{emoji}  {name}" + (f"\t{key}" if key else ""))
+            act.setCheckable(True)
+            act.setChecked(mode == now)
+            act.setToolTip(tip)
+            act.triggered.connect(lambda _on=False, m=mode: self.set_brush_mode(m))
+        self._mode_menu = menu          # (kept while it is up)
+        menu.popup(btn.mapToGlobal(QPoint(0, btn.height())))
+
     def cycle_brush_mode(self):
         """Paint → Blend → Smudge → History → Paint, the toolbar switch."""
         modes = brushes.MODES
@@ -10962,8 +11246,35 @@ class RandomImageViewer(QMainWindow):
         self._settings.setValue("brush_settings", json.dumps(self.brush_settings))
         self._settings.setValue("brush_textures", json.dumps(self.brush_textures))
 
+    def _main_brush_clicked(self):
+        """🖌 (B): picked up - the Brush panel opens with it; clicked while in
+        hand - the panel shows / hides (the brush stays the tool)."""
+        main = self.free_draw_tool_btn
+        panel = getattr(self, 'brush_texture_btn', None)
+        if panel is None:
+            return
+        if main.was_on:
+            panel.toggle()
+        elif not panel.isChecked():
+            panel.setChecked(True)
+
     def _update_brush_button(self):
         texture = self._brush_texture()
+        main = getattr(self, 'free_draw_tool_btn', None)
+        if main is not None and hasattr(main, 'set_image'):
+            # 🖌 the main brush button shows the tip in use (Round: the round tip)
+            tip = texture if texture is not None else brushes.load_texture(brushes.ROUND)
+            dpr = self.devicePixelRatioF() if hasattr(self, 'devicePixelRatioF') else 1.0
+            try:
+                image = tip.thumbnail(max(24, int(round(28 * dpr)))) if tip is not None else None
+            except Exception:
+                image = None
+            if image is not None:
+                image.setDevicePixelRatio(dpr)
+            main.set_image(image)
+            name = texture.name if texture is not None else "Round"
+            main.setToolTip(f"🖌 Brush (B): {name} - click to pick it up and open the Brush panel "
+                            "(tip, mode, hairs ...); click again to show / hide the panel")
         btn = getattr(self, 'brush_texture_btn', None)
         if btn is None:
             return
@@ -11046,7 +11357,7 @@ class RandomImageViewer(QMainWindow):
                 self._brush_window = win
                 win.show_second_colour(self.second_color())     # (the shared one)
             self._refresh_brush_window()
-            btn = self.brush_texture_btn
+            btn = self.free_draw_tool_btn       # (🖌 opens it now; the tip button is not shown)
             self._brush_window.move(self._brush_window_pos
                                     or btn.mapToGlobal(btn.rect().bottomLeft()) + QPoint(0, 4))
             self._brush_window.show()
@@ -11109,6 +11420,8 @@ class RandomImageViewer(QMainWindow):
                 self._settings.setValue("tool_sizes", json.dumps(sizes))
         settings[key] = value
         self._save_brush_settings()
+        if key in self._JITTER_KEYS and self.__dict__.get('_jitter_knob') is not None:
+            self._jitter_knob.update()      # 🎲 the knob shows the largest of the three
         if key in ('mode', 'line_stars'):
             self._recall_size_in_hand(size)     # whose size the slider is now
         if key == 'gradient_mid':
@@ -11646,7 +11959,7 @@ class RandomImageViewer(QMainWindow):
         drag = self._sel_drag
         if drag is None or not buttons & Qt.LeftButton:
             part = self._sel_part_at(pos) if self._sel is not None else None
-            label.setCursor(self._SEL_CURSORS.get(part, Qt.CrossCursor))
+            label.setCursor(self._SEL_CURSORS.get(part) or self._cross_cursor())
             return
         now = self._to_picture(pos)
         if now is None:
@@ -11827,7 +12140,9 @@ class RandomImageViewer(QMainWindow):
         return part or 'move'
 
     def _crop_cursor(self, part):
-        return {'new': Qt.CrossCursor, 'move': Qt.SizeAllCursor,
+        if part == 'new':
+            return self._cross_cursor()
+        return {'move': Qt.SizeAllCursor,
                 'l': Qt.SizeHorCursor, 'r': Qt.SizeHorCursor,
                 't': Qt.SizeVerCursor, 'b': Qt.SizeVerCursor,
                 'lt': Qt.SizeFDiagCursor, 'rb': Qt.SizeFDiagCursor,
@@ -12226,15 +12541,16 @@ class RandomImageViewer(QMainWindow):
         """A mark was made: the next one gets a colour of its own."""
         self._next_mark_colour = None
 
-    def _mark_jitter(self, angle=0.0):
+    def _mark_jitter(self, angle=0.0, force=False):
         """For a new line or shape with 'Jitter lines & shapes too' and a
         Colour jitter mode other than once per stroke: how its colour varies
         as it is painted ({'mode', 'h', 's', 'v', 'seed', 'cell', 'angle'}),
         kept with the mark so later brush changes never restyle it. None:
-        one colour (see _mark_color)."""
+        one colour (see _mark_color). *force*: whether or not that box is
+        ticked (🖌 a shape filled through the brush's tip is the brush's)."""
         s = self.brush_settings
         mode = s.get('jitter_per_stamp')
-        if not s.get('jitter_marks') or mode in (False, None, 0):
+        if not (s.get('jitter_marks') or force) or mode in (False, None, 0):
             return None
         if not (s['hue_jitter'] or s['sat_jitter'] or s['val_jitter']):
             return None
@@ -12678,6 +12994,92 @@ class RandomImageViewer(QMainWindow):
         stars'; not a polyline, not the gradient tool, the brush in Paint)."""
         return (shape not in ('polyline', 'gradient') and bool(self.brush_settings.get('shape_stars'))
                 and self._brush_mode_for_marks() is None)
+
+    def _fill_texture_tip(self, shape):
+        """🖌 'Shapes fill with the brush texture': the tip (its path, as
+        brushes.load_texture takes it) a new fill of *shape* goes through,
+        or None - not a polyline, the gradient tool, stars, nor the brush in
+        another mode than Paint; the round pen has no tip."""
+        if (shape in ('polyline', 'gradient') or not self.brush_settings.get('shape_texture')
+                or self._fill_gets_stars(shape) or self._brush_mode_for_marks() is not None):
+            return None
+        tip = self._brush_texture()
+        return getattr(tip, 'path', None) if tip is not None else None
+
+    def _fill_tip_mask(self, path, tip):
+        """The tip as a fill's mask: its own grain, but at full strength - a
+        tip is often faint (a stamp builds up over many dabs), and laid once
+        it left a shape all but empty. Its alpha scaled so the strongest 1 %
+        is opaque. Kept per tip."""
+        import numpy as np
+        kept = self.__dict__.setdefault('_fill_tip_masks', {})
+        mask = kept.get(path)
+        if mask is not None:
+            return mask
+        src = tip._levels[0].convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        w, h = src.width(), src.height()
+        a = np.frombuffer(src.constBits(), np.uint8, count=src.sizeInBytes()).reshape(
+            h, src.bytesPerLine())[:, :w * 4].reshape(h, w, 4)[..., 3].astype(np.float32)
+        nz = a[a > 0]
+        if len(nz):
+            # a curve, not one gain: the strongest 1 % opaque and the tip's
+            # middle at half - a faint wash with a few bright specks (alpha
+            # ~4 with specks at 166) came out all but empty when only scaled
+            top = max(1.0, float(np.percentile(nz, 99)))
+            mid = max(1.0, float(np.percentile(nz, 50)))
+            ratio = min(0.95, mid / top)
+            g = max(0.2, min(1.0, math.log(0.5) / math.log(ratio))) if ratio > 0 else 1.0
+            alpha = (np.clip(a / top, 0, 1) ** g * 255.0).astype(np.uint8)
+        else:
+            alpha = a.astype(np.uint8)
+        out = np.empty((h, w, 4), np.uint8)
+        out[..., :3] = alpha[..., None]         # premultiplied white
+        out[..., 3] = alpha
+        mask = QImage(out.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+        if len(kept) > 16:
+            kept.clear()
+        kept[path] = mask
+        return mask
+
+    def _paint_texture_fill(self, painter, fill, to_display, antialias=True):
+        """🖌 A fill seen through its brush tip: the fill as it would be
+        (colour, gradient, jitter) laid into a buffer over the shape, then
+        kept only where the tip - stretched to cover the shape's box, its
+        aspect kept - has paint; cut to the shape as the fill is. False when
+        the tip cannot be read (then the fill is painted plain)."""
+        tip = brushes.load_texture(fill.get('fill_tip'))
+        if tip is None or not tip._levels:
+            return False
+        pts = [to_display(*tuple(p[:2])) if not isinstance(p, QPointF) else to_display(p.x(), p.y())
+               for p in fill['points']]
+        poly = QPolygonF([QPointF(*p) if not isinstance(p, QPointF) else p for p in pts])
+        box = poly.boundingRect()
+        if box.width() < 1 or box.height() < 1:
+            return True
+        k = math.sqrt(abs(painter.worldTransform().determinant())) or 1.0     # device px per unit
+        k = min(k, 8000.0 / max(box.width(), box.height()))
+        w, h = max(1, math.ceil(box.width() * k)), max(1, math.ceil(box.height() * k))
+        buf = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        buf.fill(Qt.transparent)
+        bp = QPainter(buf)
+        bp.scale(k, k)
+        bp.translate(-box.x(), -box.y())
+        self._paint_one_fill(bp, {key: v for key, v in fill.items() if key != 'fill_tip'},
+                             to_display, antialias)
+        # the tip over it: covering the box, its own aspect kept, centred
+        mask = self._fill_tip_mask(fill.get('fill_tip'), tip)
+        mw, mh = mask.width(), mask.height()
+        cover = max(box.width() / max(1, mw), box.height() / max(1, mh))
+        tw, th = mw * cover, mh * cover
+        bp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        bp.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        bp.drawImage(QRectF(box.center().x() - tw / 2, box.center().y() - th / 2, tw, th), mask)
+        bp.end()
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawImage(box, buf)
+        painter.restore()
+        return True
 
     def _stars_of(self, colour):
         """The 'stars' a new starfield fill gets, from the brush settings."""
@@ -13494,9 +13896,22 @@ class RandomImageViewer(QMainWindow):
             record['color'] = QColor(self.line_color)
             record['color'].setAlpha(getattr(self, 'line_transparency', 255))
         else:
-            jitter = self._mark_jitter(self._shape_angle(points))
+            # (🖌 filled through the brush's tip: the brush's colour jitter
+            # too, 'Jitter lines & shapes too' or not - it is a dab of it)
+            textured = bool(self._fill_texture_tip(fill['shape']))
+            jitter = self._mark_jitter(self._shape_angle(points), force=textured)
             if jitter:
                 record['jitter'] = jitter       # 🎲 a colour per stamp / streak / speck
+            elif textured and not self.brush_settings.get('jitter_marks'):
+                s = self.brush_settings
+                if s.get('hue_jitter') or s.get('sat_jitter') or s.get('val_jitter'):
+                    # once per stroke: the shape one jittered colour, as a stroke is
+                    c = brushes.jitter_color(QColor(record['color']), s)
+                    c.setAlpha(QColor(record['color']).alpha())
+                    record['color'] = c
+        tip = self._fill_texture_tip(fill['shape'])
+        if tip:
+            record['fill_tip'] = tip            # 🖌 seen through the brush's tip (_paint_texture_fill)
         self._roll_mark_color()
         if fill['shape'] == 'polyline':
             # Its own width and open / closed state, so later brush changes
@@ -13972,7 +14387,9 @@ class RandomImageViewer(QMainWindow):
         p.setRenderHint(QPainter.Antialiasing, True)
         c = edge / 2.0
         r = d / 2.0
-        for colour, width in ((QColor(0, 0, 0, 170), 2.6), (QColor(255, 255, 255, 235), 1.0)):
+        # (a dark outline strong enough to hold the white line on mid grey -
+        # at 170 / 2.6 px the arms faded into the grey canvas)
+        for colour, width in ((QColor(0, 0, 0, 215), 3.0), (QColor(255, 255, 255, 245), 1.2)):
             p.setPen(QPen(colour, width, Qt.SolidLine, Qt.RoundCap))
             if d >= 6:
                 p.drawEllipse(QPointF(c, c), r, r)
@@ -14010,11 +14427,27 @@ class RandomImageViewer(QMainWindow):
         for dx, dy in ((0, 2), (4, 2), (2, 0), (2, 4), (1, 1), (3, 3), (1, 3), (3, 1)):
             p.drawImage(dx, dy, tint)
         p.end()
+        # ... and a thin dark edge right round the white lines, inside the
+        # colour: the white alone vanished over white or pale paint.
+        dark = QImage(src.size(), QImage.Format_ARGB32_Premultiplied)
+        dark.fill(QColor(0, 0, 0))
+        p = QPainter(dark)
+        p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        p.drawImage(0, 0, src)
+        p.end()
+        edge = QImage(ring.size(), QImage.Format_ARGB32_Premultiplied)
+        edge.fill(Qt.transparent)
+        p = QPainter(edge)
+        for dx, dy in ((1, 2), (3, 2), (2, 1), (2, 3)):
+            p.drawImage(dx, dy, dark)
+        p.end()
         out = QImage(ring.size(), QImage.Format_ARGB32_Premultiplied)
         out.fill(Qt.transparent)
         p = QPainter(out)
         p.setOpacity(rim.alphaF())
         p.drawImage(0, 0, ring)
+        p.setOpacity(0.55)
+        p.drawImage(0, 0, edge)
         p.setOpacity(1.0)
         p.drawImage(2, 2, src)
         p.end()
@@ -14696,9 +15129,43 @@ class RandomImageViewer(QMainWindow):
                 or self.line_drawing_mode or self.horizontal_line_drawing_mode
                 or getattr(self, 'fill_mode', None) or self.crop_mode
                 or getattr(self, 'select_mode', False)):
-            label.setCursor(Qt.CrossCursor)
+            label.setCursor(self._cross_cursor())
         else:
             label.setCursor(Qt.ArrowCursor)
+
+    def _cross_cursor(self):
+        """✛ The line / shape / select / snap tools' crosshair: a white line
+        in a dark outline, so it shows on any background. Windows' own cross
+        is drawn inverted - on the middle-grey canvas (128 -> 127) it was
+        gone; so is any 'difference' cursor there. Two tones always differ
+        from what is under one of them."""
+        dpr = self.image_label.devicePixelRatioF() if hasattr(self, 'image_label') else 1.0
+        kept = self.__dict__.get('_cross_cursor_kept')
+        if kept is not None and kept[0] == dpr:
+            return kept[1]
+        edge, gap, arm = 25, 3.0, 9.0          # odd: a centre pixel
+        pix = QPixmap(int(round(edge * dpr)), int(round(edge * dpr)))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        c = edge / 2.0
+        for colour, width in ((QColor(0, 0, 0, 215), 3.0), (QColor(255, 255, 255, 245), 1.2)):
+            p.setPen(QPen(colour, width, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(c, c - gap), QPointF(c, c - gap - arm))
+            p.drawLine(QPointF(c, c + gap), QPointF(c, c + gap + arm))
+            p.drawLine(QPointF(c - gap, c), QPointF(c - gap - arm, c))
+            p.drawLine(QPointF(c + gap, c), QPointF(c + gap + arm, c))
+        # the exact point: a dot in the middle, dark-rimmed too
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 215))
+        p.drawEllipse(QPointF(c, c), 1.6, 1.6)
+        p.setBrush(QColor(255, 255, 255, 245))
+        p.drawEllipse(QPointF(c, c), 0.7, 0.7)
+        p.end()
+        cursor = QCursor(pix)           # hot spot: the middle
+        self._cross_cursor_kept = (dpr, cursor)
+        return cursor
 
     def toggle_pen_pressure(self, checked):
         """Toggle pen pressure sensitivity"""
@@ -14798,6 +15265,129 @@ class RandomImageViewer(QMainWindow):
         if getattr(self, 'line_thickness_label', None) is not None:
             self.line_thickness_label.setText(f"{size}px")
         self.update_line_thickness(size)
+
+    # -- ⟷ scrub knobs (DRAW panel) ---------------------------------------
+
+    def _on_size_knob(self, position, done):
+        """⟷ Size knob scrubbed: the size as the panel slider sets it, and
+        the brush's outline at its real size under the panel meanwhile."""
+        self._on_panel_size(int(round(position)), done)
+        preview = self.__dict__.get('_scrub_preview')
+        if preview is None:
+            return
+        if done:
+            # (let go, or a wheel step: shown a moment, then gone)
+            QTimer.singleShot(450, self._hide_scrub_preview)
+            if getattr(self, 'free_draw_mode', False):
+                self.apply_tool_cursor()
+        try:
+            pixmap = self._brush_cursor().pixmap()
+        except Exception:
+            pixmap = None
+        if pixmap is not None and not pixmap.isNull():
+            preview.show_under(self._size_knob, pixmap)
+
+    def _hide_scrub_preview(self):
+        preview = self.__dict__.get('_scrub_preview')
+        if preview is None:
+            return
+        for knob in (self.__dict__.get('_size_knob'), self.__dict__.get('_jitter_knob')):
+            if knob is not None and knob.is_scrubbing():
+                return
+        preview.hide()
+
+    _JITTER_KEYS = ('hue_jitter', 'sat_jitter', 'val_jitter')
+    _JITTER_SHARE = (1.0, 0.8, 0.6)     # how a jitter from nothing spreads over hue / sat / value
+
+    def _jitter_amount(self):
+        """🎲 The knob's one number: the largest of Hue ±, Sat ±, Value ±."""
+        s = self.brush_settings
+        return max(int(s.get(k, 0) or 0) for k in self._JITTER_KEYS)
+
+    def _on_jitter_knob_start(self):
+        """A drag on 🎲 starts: the three jitters keep the proportions they have."""
+        s = self.brush_settings
+        now = [int(s.get(k, 0) or 0) for k in self._JITTER_KEYS]
+        top = max(now)
+        self._jitter_share = tuple(v / top for v in now) if top > 0 else self._JITTER_SHARE
+
+    def _on_jitter_knob(self, amount, done):
+        """🎲 Jitter knob scrubbed: Hue ±, Sat ± and Value ± scaled together;
+        a sample stroke with that much jitter under the panel meanwhile."""
+        share = self.__dict__.get('_jitter_share')
+        if share is None:
+            self._on_jitter_knob_start()
+            share = self._jitter_share
+        s = self.brush_settings
+        values = [int(round(amount * k)) for k in share]
+        for key, value in zip(self._JITTER_KEYS, values):
+            s[key] = value
+        if done:
+            self._jitter_share = None
+            self._save_brush_settings()
+            self._refresh_brush_window()
+            if not self._jitter_knob.is_scrubbing():
+                QTimer.singleShot(500, self._hide_scrub_preview)
+        # The sample stroke: laid at most every ~50 ms while dragging.
+        self._jitter_wanted = int(round(amount))
+        if not self.__dict__.get('_jitter_pending'):
+            self._jitter_pending = True
+            QTimer.singleShot(0 if done else 40, self._show_jitter_sample)
+
+    def _show_jitter_sample(self):
+        self._jitter_pending = False
+        preview = self.__dict__.get('_scrub_preview')
+        knob = self.__dict__.get('_jitter_knob')
+        if preview is None or knob is None:
+            return
+        amount = self.__dict__.get('_jitter_wanted', 0)
+        try:
+            pixmap = self._jitter_sample_pixmap()
+        except Exception as e:
+            print(f"🎲 jitter sample failed: {e!r}")
+            pixmap = None
+        if pixmap is not None:
+            preview.show_under(knob, pixmap, f"Colour jitter  {amount}", amount / 100.0, card=True)
+
+    def _jitter_sample_pixmap(self, w=220, h=86):
+        """A short S-stroke with the brush as set now (in Paint, its blend
+        mode left out), as a sample of the colour jitter."""
+        dpr = self.image_label.devicePixelRatioF() if hasattr(self, 'image_label') else 1.0
+        settings = dict(self.brush_settings)
+        settings.update(mode='paint', brush_blend='Normal', size_pressure=False, opacity_pressure=False,
+                        smoothing=0, scatter=0)
+        path = settings['texture'] or brushes.ROUND
+        settings['texture'] = path
+        if path == brushes.SPRAY:
+            path = brushes.spray_path(settings, 26)
+        elif path == brushes.RAKE:
+            path = brushes.rake_path(settings)
+        elif path == brushes.SOFT:
+            path = brushes.soft_path(settings)
+        texture = brushes.load_texture(path)
+        if texture is None:
+            return None
+        W, H = int(w * dpr), int(h * dpr)
+        image = QImage(W, H, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        size = max(8.0, min(30.0, float(self.line_thickness))) * dpr
+        trail = brushes.StampTrail(settings, texture, QColor(self.line_color), size, QTransform(), False)
+        stamps = []
+        n = 40
+        for i in range(n + 1):
+            t = i / n
+            x = W * (0.1 + 0.8 * t)
+            y = H * (0.5 - 0.26 * math.sin(t * 2 * math.pi))
+            stamps += trail.add(x, y, 1.0) or []
+        stamps += trail.finish(1.0) or []
+        p = QPainter(image)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        brushes.paint_stamps(p, trail.texture, stamps, QTransform(), (W, H), flat=trail.settings['flat'])
+        p.end()
+        pixmap = QPixmap.fromImage(image)
+        pixmap.setDevicePixelRatio(dpr)
+        return pixmap
 
     def step_brush_size(self, sign):
         """[ / ]: brush size down / up by about a tenth (at least 1 px), so
@@ -15360,6 +15950,9 @@ class RandomImageViewer(QMainWindow):
         new palette entries all change colour behind its back, and a picker
         left open on the canvas has to keep showing the truth.
         """
+        knob = self.__dict__.get('_jitter_knob')
+        if knob is not None:
+            knob.update()           # 🎲 its disc is the brush colour
         if self._canvas_popup is not None and self._canvas_popup.isVisible():
             self._canvas_popup.set_palette_colors(self._snapped_colors())
         popup = getattr(self, '_color_popup', None)
@@ -15379,6 +15972,9 @@ class RandomImageViewer(QMainWindow):
             self.edge_color = QColor(color.red(), color.green(), color.blue())
             # Update button background to show selected color
             self.line_color_btn.setStyleSheet(f"QToolButton {{ background-color: {self.line_color.name()}; border: 1px solid #666; }}")
+            knob = self.__dict__.get('_jitter_knob')
+            if knob is not None:
+                knob.update()           # 🎲 its disc is the brush colour
             # Clear LUT cache since line appearance changed
             if hasattr(self, '_lut_process_cache'):
                 self._lut_process_cache.clear()
@@ -16328,7 +16924,7 @@ class RandomImageViewer(QMainWindow):
         """The stroke starting blends (see _brush_blend): what is under it -
         the picture and the layers up to this one, as Sample 'below' reads
         them - kept at the stroke buffer's size, and the blended preview."""
-        self._bb_under = self._bb_preview = None
+        self._bb_under = self._bb_preview = self._bb_note = None
         mode = self._brush_blend()
         image = getattr(self, '_stroke_image', None)
         if mode is None or image is None or image.isNull():
@@ -16521,8 +17117,13 @@ class RandomImageViewer(QMainWindow):
         of the screen's size on the card; read back once when the pen lifts
         and burnt in like the CPU's. None where it does not do: other modes,
         History, Spray, the plain canvas."""
-        if (not self.__dict__.get('_gpu_display') or image is None or history or mode != 'paint'
-                or self._brush_blend() is not None      # (blended on the CPU, see _brush_blend_refresh)
+        # (🧽 Erase too: the rub laid on the card, the piece that changed read
+        # back each frame for _erase_partial - see _flush_flat_live)
+        if (not self.__dict__.get('_gpu_display') or image is None or history
+                or mode not in ('paint', 'erase')
+                # (a brush blend mode: blended on the card too, see _gpu_overlay -
+                # unless that shader would not, then the CPU's _brush_blend_refresh)
+                or (self._brush_blend() is not None and not self._gpu_brush_blend_ok())
                 or not self._stamp_trail.settings['flat'] or texture is None
                 # (speckled all along: the CPU's FlatStroke lays that)
                 or self._stamp_trail.speckled
@@ -16550,6 +17151,14 @@ class RandomImageViewer(QMainWindow):
             print(f"🎮 GPU brush off, the CPU one paints: {e}")
             self._gpu_flat_failed = True
             return None
+
+    def _gpu_brush_blend_ok(self):
+        """🖍 A brush blend mode can be shown by the GPU canvas's shader (see
+        GpuView.draw_brush_blend): the stroke then stays on the card."""
+        gpu = self.__dict__.get('_gpu_canvas')
+        return (gpu is not None and not getattr(gpu, '_brush_blend_failed', False)
+                and hasattr(gpu, 'draw_brush_blend')
+                and gpu._blend_id(self._brush_blend()) is not None)
 
     def _gpu_flat_off(self):
         self._gpu_flat_failed = True
@@ -16594,6 +17203,20 @@ class RandomImageViewer(QMainWindow):
             except Exception as e:
                 print(f"🎮 GPU brush preview failed: {e}")
                 rect = None
+            if rect is not None and self._brush_erasing():
+                # 🧽 the rub, as the CPU's erase puts the frame together from it
+                image = getattr(self, '_stroke_image', None)
+                try:
+                    if image is not None and not image.isNull():
+                        rect = rect.intersected(image.rect())
+                        if not rect.isEmpty():
+                            piece = gflat.read_overlay(rect)
+                            painter = QPainter(image)
+                            painter.setCompositionMode(QPainter.CompositionMode_Source)
+                            painter.drawImage(rect.topLeft(), piece)
+                            painter.end()
+                except Exception as e:
+                    print(f"🎮 GPU rub read back failed: {e}")
             if rect is not None:
                 self._mark_live_dirty(rect)
         pending = self.__dict__.get('_flat_pending')
@@ -16621,8 +17244,8 @@ class RandomImageViewer(QMainWindow):
             # and swapping it in cost ~8 ms a frame at 1.5x - for a 5 px dab.
             self._live_direct = True
             dirty, self._live_dirty = self._live_dirty, None
-            if self.__dict__.get('_bb_preview') is not None:
-                self._brush_blend_refresh(dirty)
+            if self.__dict__.get('_bb_preview') is not None and self.__dict__.get('_gpu_flat') is None:
+                self._brush_blend_refresh(dirty)    # (a GPU stroke: blended by the canvas)
             label = self.image_label
             if dirty is None:
                 self._live_update(None)
@@ -16971,6 +17594,7 @@ class RandomImageViewer(QMainWindow):
                 stroke.clip = self.__dict__.get('_pending_clip')    # a shape run over (_brush_along)
                 live_hairs = (self._flat_live if self._flat_live is not None
                               else getattr(self.__dict__.get('_gpu_flat'), 'model', None))
+                stroke.gpu_render = self.__dict__.get('_gpu_flat') is not None
                 stroke.render = (self._finished_render(trail, stamps)
                                  or self._live_stroke_render(trail, stamps))
                 if isinstance(live_hairs, brushes.BristleStroke) and live_hairs.recorded:
@@ -17792,6 +18416,7 @@ class RandomImageViewer(QMainWindow):
             win.opacity_changed.connect(self.set_comp_grid_opacity)
             win.clear_requested.connect(self.clear_comp_grids)
             win.closed.connect(self._sync_grid_button)
+            win.closed.connect(self._refresh_grid_view)     # (its ▦ handles go)
             win.set_state(self._comp_grids, self._comp_grid_opacity)
         return win
 
@@ -17815,6 +18440,7 @@ class RandomImageViewer(QMainWindow):
         else:
             win.hide()
         self._sync_grid_button()
+        self._refresh_grid_view()       # ▦ the vanishing points' handles come / go with it
 
     # Mid grey: dark and light strokes both read against it, which is why it
     # is the traditional ground for a sketch.
@@ -17948,10 +18574,7 @@ class RandomImageViewer(QMainWindow):
         draw = getattr(self, '_panel_by_key', {}).get('DRAW')
         if (draw is not None and not getattr(self, '_panels_hidden', False)
                 and self._ui_chrome_visible()):
-            draw.show()
-            draw.set_collapsed(False, emit=False)
-            draw.dock('right', 'top')
-            draw.raise_()
+            self._dock_paint_and_draw()     # 🖌 PAINT on top, DRAW under it
         self._dock_place()
         for win in (getattr(self, '_brush_window', None), getattr(self, '_layer_window', None)):
             if win is not None and win.isVisible():
@@ -18046,21 +18669,45 @@ class RandomImageViewer(QMainWindow):
         if on:
             if getattr(self, '_panels_hidden', False) or not self._ui_chrome_visible():
                 return
+            paint = getattr(self, '_panel_by_key', {}).get('PAINT')
             if self._studio_draw_was is None:
-                self._studio_draw_was = (panel.state(), panel.isHidden())
-            panel.show()
-            panel.set_collapsed(False, emit=False)
-            panel.dock('right', 'top')
-            panel.raise_()
+                self._studio_draw_was = (panel.state(), panel.isHidden(),
+                                         (paint.state(), paint.isHidden()) if paint is not None else None)
+            self._dock_paint_and_draw()
         elif self._studio_draw_was is not None:
-            st, hidden = self._studio_draw_was
+            st, hidden, paint_was = self._studio_draw_was
             self._studio_draw_was = None
-            panel.apply_state(st)
-            if not st.get('moved'):
-                panel.mark_user_moved(False)
-            if hidden:
-                panel.hide()
+            paint = getattr(self, '_panel_by_key', {}).get('PAINT')
+            for p, (pst, phidden) in ((panel, (st, hidden)),) + (((paint, paint_was),)
+                                                                 if paint is not None and paint_was else ()):
+                p.apply_state(pst)
+                if not pst.get('moved'):
+                    p.mark_user_moved(False)
+                if phidden:
+                    p.hide()
             self._arrange_floating_panels()
+
+    def _dock_paint_and_draw(self):
+        """🖌 PAINT open in the top right corner, DRAW open right under it
+        (◧ Studio, a new sketch)."""
+        by_key = getattr(self, '_panel_by_key', {})
+        paint, draw = by_key.get('PAINT'), by_key.get('DRAW')
+        top = 8
+        if paint is not None:
+            paint.show()
+            paint.set_collapsed(False, emit=False)
+            paint.dock('right', 'top')
+            paint.raise_()
+            top = 8 + paint.height() + 8
+        if draw is not None:
+            draw.show()
+            draw.set_collapsed(False, emit=False)
+            draw.dock('right', 'top', gap_y=top)
+            if paint is not None:
+                # 🧲 stuck under PAINT, right edges lined up
+                draw.stick_to(paint, 'below', paint.width() - draw.width())
+                draw.update_anchor()
+            draw.raise_()
 
     def toggle_studio_mode(self, on):
         """◧ Studio on / off: a blank grey canvas the size of the picture on
@@ -21648,7 +22295,8 @@ class RandomImageViewer(QMainWindow):
         gpu = self.__dict__.get('_gpu_canvas')
         if live is not None and gpu is not None and gpu.__dict__.get('_live_merged'):
             live = None         # laid into its blended layer already (see _live_merge)
-        if live is not None and gflat is not None and gpu is not None:
+        if (live is not None and gflat is not None and gpu is not None
+                and not self._brush_erasing()):         # (🧽: the frame, not the rub)
             pm = label.pixmap()
             if pm is not None and not pm.isNull():
                 image, opacity, mode = live
@@ -21657,8 +22305,21 @@ class RandomImageViewer(QMainWindow):
                 x0, y0 = (label.width() - sw) // 2, (label.height() - sh) // 2
                 k = image.width() / max(1.0, sw)
                 ow, oh = gflat.overlay_size
-                if gpu.draw_texture_id(p, gflat.overlay_texture_id, ow, oh,
-                                       QTransform(1.0 / k, 0, 0, 1.0 / k, x0, y0), opacity, area):
+                to_canvas = QTransform(1.0 / k, 0, 0, 1.0 / k, x0, y0)
+                under = self.__dict__.get('_bb_under')
+                if under is not None:
+                    # 🖍 brush blend: blended with what was under it, on the card
+                    note = self.__dict__.get('_bb_note')
+                    if note is None:
+                        note = self._bb_note = {'key': None, 'rects': [], 'all': True, 'mip': False}
+                    if gpu.draw_brush_blend(p, gflat.overlay_texture_id, (ow, oh),
+                                            (under.width(), under.height()), under, note, to_canvas,
+                                            opacity, getattr(self, '_live_ink_alpha', 1.0),
+                                            self._bb_mode, area):
+                        live = None
+                    elif gpu.draw_texture_id(p, gflat.overlay_texture_id, ow, oh, to_canvas, opacity, area):
+                        live = None     # (the shader would not: the stroke as it is, blended at pen-up)
+                elif gpu.draw_texture_id(p, gflat.overlay_texture_id, ow, oh, to_canvas, opacity, area):
                     live = None
         if live is not None:
             pm = label.pixmap()

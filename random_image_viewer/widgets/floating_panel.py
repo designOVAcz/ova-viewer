@@ -351,9 +351,17 @@ class FloatingPanel(QWidget):
             "anchor_v": self._anchor_v,
             "right_gap": self._right_gap,
             "bottom_gap": self._bottom_gap,
+            # 🧲 stuck to another panel (its key), on which side, how far along
+            "stuck_to": self._stuck_key,
+            "stuck_side": self._stuck_side,
+            "stuck_d": self._stuck_d,
         }
 
     def apply_state(self, st):
+        # 🧲 (resolved by key when it moves: the other panel may not be restored yet)
+        self._stuck_key = st.get("stuck_to") or None
+        self._stuck_side = st.get("stuck_side") or 'below'
+        self._stuck_d = int(st.get("stuck_d") or 0)
         try:
             if st.get("w"):
                 self._apply_content_width(int(st["w"]))
@@ -387,6 +395,142 @@ class FloatingPanel(QWidget):
                     self.update_anchor()
         except Exception:
             pass
+
+    # ── 🧲 sticking to another panel ──
+    #
+    # Dragged near another panel's edge, a panel snaps to it (under, over,
+    # beside it, edges or middles lined up); let go there and it sticks: it
+    # follows that panel wherever it goes, folds or unfolds. Dragged away
+    # and let go elsewhere, it comes loose. Chains work (A <- B <- C).
+
+    SNAP = 14           # px: how near an edge snaps
+    STICK_GAP = 4       # px between panels stuck together
+
+    _stuck_key = None   # the persist key of the panel this one is stuck to
+    _stuck_side = None  # 'below', 'above', 'left', 'right' of it
+    _stuck_d = 0        # the offset along that side (x for below/above, y for left/right)
+    _snap = None        # (panel, side, d) while a drag is snapped
+
+    def _siblings(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return []
+        return [w for w in parent.children()
+                if isinstance(w, FloatingPanel) and w is not self]
+
+    def stuck_to(self):
+        """The panel this one follows, or None."""
+        if not self._stuck_key:
+            return None
+        for p in self._siblings():
+            if getattr(p, '_persist_key', None) == self._stuck_key:
+                return p
+        return None
+
+    def _leads(self, other):
+        """Does *other* follow this panel (directly or down a chain)?"""
+        seen = set()
+        p = other
+        while p is not None and id(p) not in seen:
+            seen.add(id(p))
+            lead = p.stuck_to()
+            if lead is self:
+                return True
+            p = lead
+        return False
+
+    def stick_to(self, panel, side='below', d=None):
+        """Stick to *panel* on *side* (None: come loose)."""
+        if panel is None or not getattr(panel, '_persist_key', None):
+            self._stuck_key = None
+            return
+        if panel is self or self._leads(panel):
+            return                      # (no loops)
+        self._stuck_key = panel._persist_key
+        self._stuck_side = side
+        if d is None:
+            d = (self.x() - panel.x()) if side in ('below', 'above') else (self.y() - panel.y())
+        self._stuck_d = int(d)
+        self._user_moved = True
+        self.follow()
+
+    def _stuck_pos(self, lead, side, d):
+        g = self.STICK_GAP
+        if side == 'below':
+            return QPoint(lead.x() + d, lead.y() + lead.height() + g)
+        if side == 'above':
+            return QPoint(lead.x() + d, lead.y() - self.height() - g)
+        if side == 'right':
+            return QPoint(lead.x() + lead.width() + g, lead.y() + d)
+        return QPoint(lead.x() - self.width() - g, lead.y() + d)
+
+    def follow(self):
+        """Back in place by the panel this one is stuck to. True when moved there."""
+        lead = self.stuck_to()
+        if lead is None or lead.isHidden() or self.isHidden():
+            return False
+        pos = self._stuck_pos(lead, self._stuck_side or 'below', self._stuck_d)
+        parent = self.parentWidget()
+        if parent is not None:      # (never pushed off the canvas)
+            pos = QPoint(min(max(0, pos.x()), max(0, parent.width() - self.width())),
+                         min(max(0, pos.y()), max(0, parent.height() - self.height())))
+        if pos != self.pos():
+            self.move(pos)
+        return True
+
+    def _followers(self):
+        return [p for p in self._siblings() if p._stuck_key and p._stuck_key == getattr(self, '_persist_key', None)]
+
+    def _move_followers(self):
+        for p in self._followers():
+            p.follow()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._move_followers()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._move_followers()          # (folded / unfolded: the one under it moves up / down)
+
+    def _snapped(self, pos):
+        """*pos* pulled onto a nearby panel's edge: (pos, (panel, side, d) or None)."""
+        w, h = self.width(), self.height()
+        g, snap = self.STICK_GAP, self.SNAP
+        best = None
+        for p in self._siblings():
+            if p.isHidden() or self._leads(p) or p is self:
+                continue
+            px, py, pw, ph = p.x(), p.y(), p.width(), p.height()
+            cands = []
+            # under / over it: horizontally overlapping
+            if pos.x() < px + pw and pos.x() + w > px:
+                cands.append(('below', abs(pos.y() - (py + ph + g))))
+                cands.append(('above', abs(pos.y() + h + g - py)))
+            # beside it: vertically overlapping
+            if pos.y() < py + ph and pos.y() + h > py:
+                cands.append(('right', abs(pos.x() - (px + pw + g))))
+                cands.append(('left', abs(pos.x() + w + g - px)))
+            for side, dist in cands:
+                if dist <= snap and (best is None or dist < best[0]):
+                    best = (dist, p, side)
+        if best is None:
+            return pos, None
+        _dist, p, side = best
+        # along the side: lined up with its edges or middle when near
+        if side in ('below', 'above'):
+            d = pos.x() - p.x()
+            for want in (0, p.width() - w, (p.width() - w) // 2):
+                if abs(d - want) <= snap:
+                    d = want
+                    break
+        else:
+            d = pos.y() - p.y()
+            for want in (0, p.height() - h, (p.height() - h) // 2):
+                if abs(d - want) <= snap:
+                    d = want
+                    break
+        return self._stuck_pos(p, side, d), (p, side, d)
 
     def mark_user_moved(self, moved=True):
         self._user_moved = moved
@@ -464,6 +608,10 @@ class FloatingPanel(QWidget):
                 nx = min(max(0, new_pos.x()), max_x)
                 ny = min(max(0, new_pos.y()), max_y)
                 new_pos = QPoint(nx, ny)
+            # 🧲 near another panel's edge: pulled onto it (Shift: no snapping)
+            self._snap = None
+            if not (event.modifiers() & Qt.ShiftModifier):
+                new_pos, self._snap = self._snapped(new_pos)
             self.move(new_pos)
             event.accept()
             return
@@ -484,12 +632,28 @@ class FloatingPanel(QWidget):
             self._drag_offset = None
             self._handle.setCursor(Qt.OpenHandCursor)
             self._user_moved = True
+            # 🧲 let go snapped: stuck to that panel; anywhere else: loose
+            snap, self._snap = self._snap, None
+            if snap is not None:
+                self.stick_to(snap[0], snap[1], snap[2])
+            else:
+                self._stuck_key = None
             self.moved_by_user.emit()
             changed = True
         if changed:
             # Recompute which corner this panel is docked to after the
             # user finishes moving/resizing it.
             self.update_anchor()
+            # ... and those stuck to it, down the chain (where they are now
+            # is kept too, should this one be hidden)
+            todo, seen = self._followers(), set()
+            while todo:
+                p = todo.pop()
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+                p.update_anchor()
+                todo += p._followers()
             self.changed.emit()
             event.accept()
             return
@@ -549,6 +713,8 @@ class FloatingPanel(QWidget):
         parent = self.parentWidget()
         if parent is None:
             return
+        if self.follow():
+            return          # 🧲 stuck to another panel: it says where
         pw = parent.width()
         ph = parent.height()
         if self._anchor_h == 'right':
