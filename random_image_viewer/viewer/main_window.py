@@ -948,7 +948,7 @@ class RandomImageViewer(QMainWindow):
             painter.drawLine(cx, draw_y, cx, draw_y + zoomed_height)
             painter.drawLine(draw_x, cy, draw_x + zoomed_width, cy)
 
-        if self._comp_grids:
+        if self._comp_grids and self.__dict__.get('_comp_grids_shown', True):
             from random_image_viewer.drawing import comp_grids
             grids = list(self._comp_grids.items())
             points = self.__dict__.get('_grid_points') or {}
@@ -973,6 +973,7 @@ class RandomImageViewer(QMainWindow):
     def _grid_handles_on(self):
         win = self.__dict__.get('_grids_window')
         return bool(win is not None and win.isVisible() and self._comp_grids
+                    and self.__dict__.get('_comp_grids_shown', True)
                     and getattr(self, 'lines_visible', True))
 
     def _grid_handles(self):
@@ -3748,7 +3749,9 @@ class RandomImageViewer(QMainWindow):
         self._comp_grids = self._load_comp_grids()
         self._grid_points = self._load_grid_points()     # ▦ moved vanishing points
         self._comp_grid_opacity = self._settings_int("comp_grid_opacity", 80, 10, 100)
-        self.grid_overlay = bool(self._comp_grids)
+        # ▦ On / Off for all the chosen grids (they stay chosen while off)
+        self._comp_grids_shown = str(self._settings.value("comp_grids_shown", "true")).lower() != "false"
+        self.grid_overlay = bool(self._comp_grids) and self._comp_grids_shown
         self._grids_window = None
         # Pen each guide was switched on with (see _guide_pen); None = off
         self._crosshair_pen = None
@@ -18315,9 +18318,14 @@ class RandomImageViewer(QMainWindow):
         """Right-click on the grid button: grids off, the dot grid, its spacing."""
         from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
-        a = menu.addAction("▦ Composition grids off")
+        a = menu.addAction("▦ Composition grids shown")
+        a.setCheckable(True)
+        a.setChecked(bool(self._comp_grids_shown))
         a.setEnabled(bool(self._comp_grids))
-        a.triggered.connect(self.clear_comp_grids)
+        a.toggled.connect(self.set_comp_grids_shown)
+        c = menu.addAction("▦ Clear the chosen grids")
+        c.setEnabled(bool(self._comp_grids))
+        c.triggered.connect(self.clear_comp_grids)
         d = menu.addAction("∴ Dot grid")
         d.setCheckable(True)
         d.setChecked(self.dot_grid)
@@ -18358,10 +18366,11 @@ class RandomImageViewer(QMainWindow):
         drawn again."""
         self._settings.setValue("comp_grids", ",".join(f"{k}:{o}" for k, o in self._comp_grids.items()))
         self._settings.setValue("comp_grid_opacity", int(self._comp_grid_opacity))
-        self.grid_overlay = bool(self._comp_grids)
+        self._settings.setValue("comp_grids_shown", "true" if self._comp_grids_shown else "false")
+        self.grid_overlay = bool(self._comp_grids) and self._comp_grids_shown
         win = self.__dict__.get('_grids_window')
         if win is not None:
-            win.set_state(self._comp_grids, self._comp_grid_opacity)
+            win.set_state(self._comp_grids, self._comp_grid_opacity, self._comp_grids_shown)
         self._sync_grid_button()
         self.enhancement_cache.clear()
         self.scaled_cache.clear()
@@ -18374,7 +18383,7 @@ class RandomImageViewer(QMainWindow):
         if btn is None:
             return
         win = self.__dict__.get('_grids_window')
-        on = bool(self._comp_grids) or (win is not None and win.isVisible())
+        on = (bool(self._comp_grids) and self._comp_grids_shown) or (win is not None and win.isVisible())
         if btn.isChecked() != on:
             btn.blockSignals(True)
             btn.setChecked(on)
@@ -18385,6 +18394,7 @@ class RandomImageViewer(QMainWindow):
         if on:
             self._comp_grids[key] = (orient if orient is not None
                                      else self._comp_grids.get(key, self._grid_palette_orient(key)))
+            self._comp_grids_shown = True       # (a grid picked while they were off: shown)
         else:
             self._comp_grids.pop(key, None)
         self._comp_grids_changed()
@@ -18406,6 +18416,11 @@ class RandomImageViewer(QMainWindow):
         self._comp_grids.clear()
         self._comp_grids_changed()
 
+    def set_comp_grids_shown(self, on):
+        """▦ On / Off: the chosen grids shown or hidden - kept chosen either way."""
+        self._comp_grids_shown = bool(on)
+        self._comp_grids_changed()
+
     def _ensure_grids_window(self):
         win = self.__dict__.get('_grids_window')
         if win is None:
@@ -18415,9 +18430,10 @@ class RandomImageViewer(QMainWindow):
             win.orient_changed.connect(self._turn_comp_grid)
             win.opacity_changed.connect(self.set_comp_grid_opacity)
             win.clear_requested.connect(self.clear_comp_grids)
+            win.shown_toggled.connect(self.set_comp_grids_shown)
             win.closed.connect(self._sync_grid_button)
             win.closed.connect(self._refresh_grid_view)     # (its ▦ handles go)
-            win.set_state(self._comp_grids, self._comp_grid_opacity)
+            win.set_state(self._comp_grids, self._comp_grid_opacity, self._comp_grids_shown)
         return win
 
     def toggle_grid_overlay(self, _checked=None):

@@ -7,7 +7,8 @@ Signals:
     grid_toggled(str, bool)      a tile clicked on / off
     orient_changed(str, int)     a tile turned (right-click)
     opacity_changed(int)         0..100
-    clear_requested()            None: every grid off
+    clear_requested()            every grid off (now only from ▦'s right-click menu)
+    shown_toggled(bool)          On / Off: all the chosen ones shown or hidden, kept chosen
     closed()                     ✕
     drag_finished()              moved by its title row
 """
@@ -27,6 +28,7 @@ class GridsWindow(QWidget):
     orient_changed = Signal(str, int)
     opacity_changed = Signal(int)
     clear_requested = Signal()
+    shown_toggled = Signal(bool)    # all the chosen grids shown / hidden (kept chosen)
     closed = Signal()
     drag_finished = Signal()
 
@@ -61,12 +63,19 @@ class GridsWindow(QWidget):
         self._header.setCursor(Qt.SizeAllCursor)
         self._header.setToolTip("Drag to move")
         header.addWidget(self._header, 1)
-        none_btn = QToolButton()
-        none_btn.setText("None")
-        none_btn.setToolTip("Every grid off")
-        none_btn.setStyleSheet("QToolButton { color: #c8c8c8; font-size: 9pt; padding: 0 6px; }")
-        none_btn.clicked.connect(self.clear_requested.emit)
-        header.addWidget(none_btn)
+        # On / off for all of them at once - the ones chosen stay chosen (it
+        # used to be "None", which forgot them: picked again one by one)
+        self._shown = QToolButton()
+        self._shown.setCheckable(True)
+        self._shown.setChecked(True)
+        self._shown.setToolTip("Show or hide the grids - the ones chosen below stay chosen")
+        self._shown.setStyleSheet(
+            "QToolButton { color: #c8c8c8; font-size: 9pt; padding: 0 8px; border: 1px solid #4a4d50;"
+            " border-radius: 4px; background: #232528; min-height: 0; }"
+            "QToolButton:checked { color: #fff; background: #2f3a48; border-color: #7aa2ff; }")
+        self._shown.toggled.connect(self._on_shown)
+        self._show_label(True)
+        header.addWidget(self._shown)
         close = QToolButton()
         close.setText("✕")
         close.setFixedSize(18, 18)
@@ -145,8 +154,36 @@ class GridsWindow(QWidget):
         self._opacity_value.setText(f"{v}%")
         self.opacity_changed.emit(v)
 
-    def set_state(self, grids, opacity):
-        """Show *grids* ({key: orient}) as on, the rest off; *opacity* 0..100."""
+    def _show_label(self, on):
+        self._shown.setText("👁 On" if on else "Off")
+
+    def _on_shown(self, on):
+        self._show_label(on)
+        self._dim_tiles(not on)
+        self.shown_toggled.emit(bool(on))
+
+    def _dim_tiles(self, dim):
+        """Hidden: the chosen tiles shown faded - still chosen, not drawn."""
+        for b in self._tiles.values():
+            effect = b.graphicsEffect()
+            if dim:
+                if effect is None:
+                    from PySide6.QtWidgets import QGraphicsOpacityEffect
+                    effect = QGraphicsOpacityEffect(b)
+                    b.setGraphicsEffect(effect)
+                effect.setOpacity(0.45)
+            elif effect is not None:
+                effect.setOpacity(1.0)
+
+    def set_state(self, grids, opacity, shown=True):
+        """Show *grids* ({key: orient}) as on, the rest off; *opacity* 0..100;
+        *shown*: the on / off for all of them."""
+        if self._shown.isChecked() != bool(shown):
+            self._shown.blockSignals(True)
+            self._shown.setChecked(bool(shown))
+            self._shown.blockSignals(False)
+            self._show_label(bool(shown))
+            self._dim_tiles(not shown)
         for key, b in self._tiles.items():
             on = key in grids
             if key in grids and grids[key] != self._orient[key]:
