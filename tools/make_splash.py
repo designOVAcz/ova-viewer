@@ -48,22 +48,22 @@ line_w = round((x1 - x0) * scale)
 rgb = im[seam - 1:seam + 1, x0:x1, :3].mean(axis=0)
 k = np.ones(5) / 5
 smooth = np.stack([np.convolve(rgb[:, c], k, mode="same") for c in range(3)], axis=1)
-# ⏳ The boot image is the loader as it starts (splash.py goes on from it):
-# a 1 px near-white line, just its first BOOT_START share - the rest of the
-# line's width transparent (no track): it keeps the image the line's width,
-# so the launcher, which centres it, puts that start where the line starts.
-# (The launcher's splash can only show a still image; on Windows its fully
-# transparent pixels show through.)
-FILL, START = (238, 240, 242), 0.06         # = splash.LOADER_FILL / BOOT_START
-line = np.zeros((line_w, 4), np.uint8)
-line[:int(round(line_w * START))] = FILL + (255,)
-Image.fromarray(line[None, :, :], "RGBA").save(out)
+# ⏳ The boot image is only the box the launcher's splash window takes its
+# size from - all transparent: the loader line itself is drawn and animated
+# by splash_boot.tcl (in the launcher's own thread, moving while Python
+# loads), scaled by the screen's DPI. Wide enough for the line at up to
+# 250 %, 3 px high with the line in the middle row; the launcher centres it,
+# so the line's middle is the screen's middle, as splash.py's equator is.
+BOX_W_BOOT = int(np.ceil(line_w * 2.5)) + 4
+box = np.zeros((3, BOX_W_BOOT, 4), np.uint8)
+Image.fromarray(box, "RGBA").save(out)
+print("boot box", (BOX_W_BOOT, 3), "- the line (", line_w, "px at 100 %) is splash_boot.tcl's")
 
 stops = []
 for t in np.linspace(0, 1, STOPS):
     r, g, b = (int(round(v)) for v in smooth[int(round(t * (len(smooth) - 1)))])
     stops.append((round(float(t), 3), (r, g, b)))
-print("saved", out, (line_w, 1))
+print("saved", out, (BOX_W_BOOT, 3))
 print(f"EQUATOR_Y = {seam / H:.5f}        # row {seam} of {H}")
 print(f"EQUATOR_X = ({x0 / W:.5f}, {x1 / W:.5f})   # x {x0}..{x1} of {W}")
 print("EQUATOR_STOPS = (")

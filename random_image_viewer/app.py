@@ -21,47 +21,6 @@ def _boot_text(boot, text):
             pass
 
 
-def _boot_close(boot):
-    try:
-        boot.close()
-    except Exception:
-        pass
-
-
-def _boot_line_hide():
-    """The launcher's line window (Tk, this process), hidden: its handle, or
-    None (not Windows, not found)."""
-    if sys.platform != "win32":
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        pid, found = os.getpid(), []
-
-        def each(hwnd, _):
-            owner = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if owner.value == pid and user32.IsWindowVisible(hwnd):
-                name = ctypes.create_unicode_buffer(64)
-                user32.GetClassNameW(hwnd, name, 64)
-                if name.value.startswith("Tk"):
-                    found.append(hwnd)
-            return True
-
-        user32.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(each), 0)
-        if not found:
-            return None
-        # (all of them: with its transparent pixels the launcher's window may
-        # come as more than one - one left up kept the short start of the
-        # line on screen over the splash)
-        for hwnd in found:
-            user32.ShowWindow(hwnd, 0)                  # SW_HIDE
-        return found[0]
-    except Exception:
-        return None
-
-
 def main():
     launch_t0 = time.perf_counter()
     boot = _boot_splash()
@@ -88,22 +47,17 @@ def main():
     except Exception:
         pass
     from random_image_viewer.splash import show_splash, close_splash
-    # The launcher's line through the QApplication: Qt makes the process
-    # DPI-aware per monitor, and from then on the line's window (laid out by
-    # an unaware Tk, centred) is taken at its numbers in real pixels - it
-    # jumps up and left and shrinks to 2/3 at 150 %. So it is hidden for the
-    # QApplication (~0.1 s), and the splash takes over with the same line
-    # drawn by Qt - same place, same size at any scale - before the launcher's
-    # window goes. The globe then fades in around it (the line is its equator).
-    line = _boot_line_hide() if boot is not None else None
-    if boot is not None and line is None:
-        _boot_close(boot)
-        boot = None
+    # ⏳ The launcher's loader line (splash_boot.tcl) stays up and moving
+    # through Qt's start and the splash's slow first steps (the font
+    # database: seconds on a cold start) - it moves in a thread of its own,
+    # Python cannot hold it still. The exe is DPI-aware from the start (its
+    # manifest), so the line stays put when Qt starts. The splash takes over
+    # at the end of reveal(): the line run to its end, the same line full in
+    # the splash, the launcher's window closed, the globe faded in around it.
     app = QApplication(sys.argv)
-    splash = show_splash(app)
-    if boot is not None:
-        _boot_close(boot)
-    splash.reveal()
+    splash = show_splash(app, own_line=boot is None)
+    splash.reveal(boot)
+    boot = None
 
     def status(msg):
         splash.set_status(msg)

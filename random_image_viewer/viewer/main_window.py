@@ -847,20 +847,35 @@ class VideoControlsOverlay(QWidget):
         self._hide_timer.start(self.HIDE_DELAY_MS)
 
     # ── event filter: track mouse on parent label ─────────────
+    # Shown only with the pointer near it - the top of the view, where it
+    # sits (a "hot zone", as mpv's): moving the mouse anywhere over the
+    # picture brought it up every time and covered the video. Away from it,
+    # it goes a moment later.
+    HOT_ZONE = 60           # px below the bar that still bring it up
+
+    def _in_hot_zone(self, pos):
+        return pos.y() <= self.geometry().bottom() + self.HOT_ZONE
+
     def eventFilter(self, obj, event):
         if obj is self._parent_label:
             etype = event.type()
             if etype == QEvent.MouseMove:
                 if self.isVisible() and self._viewer and self._viewer._video_playing:
                     self._reposition()
-                    if not self._visible_state:
-                        self._fade_in()
-                    else:
-                        self._hide_timer.start(self.HIDE_DELAY_MS)
+                    if self._in_hot_zone(event.position()):
+                        if not self._visible_state:
+                            self._fade_in()
+                        else:
+                            self._hide_timer.start(self.HIDE_DELAY_MS)
+                    elif self._visible_state and not self.underMouse():
+                        if not self._hide_timer.isActive() or self._hide_timer.remainingTime() > 700:
+                            self._hide_timer.start(700)
             elif etype == QEvent.Resize:
                 self._reposition()
             elif etype == QEvent.Enter:
-                if self.isVisible() and self._viewer and self._viewer._video_playing:
+                pos = getattr(event, 'position', None)
+                if (self.isVisible() and self._viewer and self._viewer._video_playing
+                        and pos is not None and self._in_hot_zone(pos())):
                     self._fade_in()
             elif etype == QEvent.Leave:
                 if self._visible_state:
@@ -5221,6 +5236,8 @@ class RandomImageViewer(QMainWindow):
         """▣ in the status bar: hide or show every tool panel (frame and status
         bar stay, unlike minimal mode)."""
         self._panels_hidden = not visible
+        if visible:
+            self._panels_off_for_video = False      # (shown: no longer hidden for a 🎬 video)
         btn = getattr(self, 'panels_btn', None)
         if btn is not None and btn.isChecked() != visible:
             btn.blockSignals(True)
@@ -5807,9 +5824,116 @@ class RandomImageViewer(QMainWindow):
         if hasattr(self, 'image_label') and self.image_label:
             self.image_label.stop_animation()
 
+    # -- ⏯ resume: each video / song goes on where it was left ---------------
+    #
+    # Its position kept per file (as it plays, every few seconds, and when it
+    # is left): opened again - moved past it by accident, or another day - it
+    # goes on from there. Not near its start (nothing to go back to) and not
+    # near its end (heard to the end: from the top next time). The last
+    # _RESUME_KEEP files, in the settings.
+
+    _RESUME_KEEP = 400
+    _RESUME_MIN_MS = 10_000         # less than this in: from the start
+    _RESUME_END_MS = 10_000         # less than this to go: done - from the start
+
+    def _resume_key(self, path):
+        return os.path.normcase(os.path.abspath(path)) if path else None
+
+    def _resume_positions(self):
+        kept = self.__dict__.get('_resume_pos')
+        if kept is None:
+            try:
+                raw = json.loads(str(self._settings.value("media_resume", "") or "{}"))
+                kept = {str(k): int(v) for k, v in raw.items()}
+            except Exception:
+                kept = {}
+            self._resume_pos = kept
+        return kept
+
+    def _note_media_position(self, path, pos_ms, dur_ms, save=False):
+        """*path* played to *pos_ms* of *dur_ms*: kept to go on from (or let
+        go: barely started, or finished). *save*: written to the settings."""
+        key = self._resume_key(path)
+        if key is None:
+            return
+        kept = self._resume_positions()
+        changed = False
+        if (pos_ms < self._RESUME_MIN_MS
+                or (dur_ms > 0 and dur_ms - pos_ms < self._RESUME_END_MS)):
+            changed = kept.pop(key, None) is not None
+        else:
+            kept.pop(key, None)             # (to the end: the newest last)
+            kept[key] = int(pos_ms)
+            changed = True
+            while len(kept) > self._RESUME_KEEP:
+                kept.pop(next(iter(kept)))
+        if changed:
+            self._resume_dirty = True
+        if save and self.__dict__.get('_resume_dirty'):
+            self._resume_dirty = False
+            try:
+                self._settings.setValue("media_resume", json.dumps(kept))
+            except Exception as e:
+                print(f"⏯ resume positions not saved: {e!r}")
+
+    def _resume_from_last(self, path, player):
+        """⏯ Seek *player* to where *path* was left, once it has loaded."""
+        pos = self._resume_positions().get(self._resume_key(path))
+        if not pos:
+            return
+        done = {'seeked': False}
+
+        def go(*_a):
+            if done['seeked']:
+                return
+            try:
+                dur = player.duration()
+                if dur <= 0 or not player.isSeekable():
+                    return      # (not loaded / not seekable yet: the next change)
+            except RuntimeError:
+                return
+            done['seeked'] = True
+            if pos >= dur - self._RESUME_END_MS:
+                return
+            player.setPosition(int(pos))
+
+            def check(tries=[0]):
+                # (a seek sent while the backend still opened the file was
+                # dropped and it played from the top: sent again)
+                try:
+                    if player.position() < pos - 1500 and tries[0] < 3:
+                        tries[0] += 1
+                        player.setPosition(int(pos))
+                        QTimer.singleShot(300, check)
+                except RuntimeError:
+                    pass
+            QTimer.singleShot(300, check)
+            m, s = divmod(int(pos) // 1000, 60)
+            h, m = divmod(m, 60)
+            at = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+            self.status.showMessage(f"⏯ Going on from {at}, where you left it — "
+                                    "drag the timeline to the start to begin again", 5000)
+        try:
+            player.durationChanged.connect(go)
+            player.mediaStatusChanged.connect(go)
+            player.seekableChanged.connect(go)
+        except RuntimeError:
+            pass
+
     def _stop_current_video(self):
         """Stop any currently playing video"""
         if hasattr(self, 'image_label') and self.image_label:
+            player = getattr(self.image_label, '_media_player', None)
+            # (by the player's own file: when another one is opened,
+            # current_image is that one already)
+            playing = self.__dict__.get('_media_path')
+            if player is not None and playing:
+                try:        # ⏯ where it was left, kept (see _note_media_position)
+                    self._note_media_position(playing, player.position(),
+                                              player.duration(), save=True)
+                except RuntimeError:
+                    pass
+            self._media_path = None
             self.image_label.stop_video()
         self._video_playing = False
         # Clear subtitle state
@@ -5836,6 +5960,7 @@ class RandomImageViewer(QMainWindow):
 
         self.current_image = img_path
         self._video_playing = True
+        self._media_path = img_path     # (what the player plays: current_image moves on first)
 
         # Load a sibling .srt subtitle file if one exists (same base name)
         self._load_subtitles_for(img_path)
@@ -5853,6 +5978,8 @@ class RandomImageViewer(QMainWindow):
                     player.mediaStatusChanged.connect(self._on_video_media_status)
                     player.errorOccurred.connect(
                         lambda _err, msg, p=img_path: self._on_video_error(p, msg))
+                    # ⏯ where it was left last time: back there once it loads
+                    self._resume_from_last(img_path, player)
                 except RuntimeError:
                     pass
                 self._video_controls_widget.show()
@@ -6045,6 +6172,17 @@ class RandomImageViewer(QMainWindow):
             self._video_overlay.show_thumbnail(ms, image)
 
     def _on_video_position_changed(self, position_ms):
+        # ⏯ kept as it plays (a crash, or the app closed mid-way, loses at
+        # most a few seconds): noted every 3 s, written every 20 s
+        now = time.monotonic()
+        if now - self.__dict__.get('_resume_noted', 0.0) > 3.0 and self.__dict__.get('_media_path'):
+            self._resume_noted = now
+            player = getattr(self.image_label, '_media_player', None)
+            dur = player.duration() if player is not None else 0
+            save = now - self.__dict__.get('_resume_saved', 0.0) > 20.0
+            if save:
+                self._resume_saved = now
+            self._note_media_position(self._media_path, position_ms, dur, save=save)
         if hasattr(self, '_video_seek_slider') and not self._video_seek_slider.isSliderDown():
             self._video_seek_slider.setValue(position_ms)
         if hasattr(self, '_video_time_label'):
@@ -6801,7 +6939,23 @@ class RandomImageViewer(QMainWindow):
         if gpu is not None and gpu.isVisible():
             gpu.put_away()
 
+    def _panels_for_media(self, video):
+        """🎬 A video opened: the palettes out of the way (▣ off), as if you
+        had hidden them - back when a picture is shown again. Shown again by
+        hand during the video (▣), they stay; already hidden, nothing to do."""
+        if video:
+            if not getattr(self, '_panels_hidden', False) and not self.__dict__.get('_panels_off_for_video'):
+                self.set_panels_visible(False)
+                self._panels_off_for_video = True       # (after: set_panels_visible clears it)
+        elif self.__dict__.get('_panels_off_for_video'):
+            self._panels_off_for_video = False
+            if getattr(self, '_panels_hidden', False):
+                self.set_panels_visible(True)
+
     def _display_image_now(self, img_path):
+        # (a video only: is_video_file counts music too - it plays through the
+        # same player - and songs keep their palettes)
+        self._panels_for_media(bool(img_path) and is_video_file(img_path) and not is_audio_file(img_path))
         # Video files: redirect to video display with full enhancement support
         if is_video_file(img_path):
             if self._video_playing and self.current_image == img_path:
@@ -23443,6 +23597,13 @@ class RandomImageViewer(QMainWindow):
             event.ignore()
             return
         self._end_safety()                      # 🛟 closed properly: nothing to recover
+        player = getattr(getattr(self, 'image_label', None), '_media_player', None)
+        if player is not None and self.__dict__.get('_media_path'):
+            try:                                # ⏯ the app closed mid-video / song: kept
+                self._note_media_position(self._media_path, player.position(),
+                                          player.duration(), save=True)
+            except RuntimeError:
+                pass
         if getattr(self, '_touch_pan', None) is not None:
             self._touch_pan.stop()
         if getattr(self, '_colour_sync', None) is not None:

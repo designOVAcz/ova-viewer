@@ -60,6 +60,21 @@ pyz = PYZ(a.pure)
 # splash could appear, and a second copy got started. Closed by app.py as
 # soon as the Qt splash is up. Just a thin white line - no card, no text.
 # (splash_boot.png: tools/make_splash.py)
+# ⏳ The line is a loader that moves the whole time Python loads (10-20 s on a
+# cold start): splash_boot.tcl draws and animates it in the launcher's own
+# splash thread - Python, holding its lock while it imports, could not move
+# anything meanwhile. Added to the end of PyInstaller's splash script.
+from PyInstaller.building import splash_templates as _splash_templates
+_OVA_LOADER_TCL = open(os.path.join(SPECPATH, 'splash_boot.tcl'), encoding='utf-8').read()
+if not getattr(_splash_templates.build_script, '_ova', False):
+    _pyi_build_script = _splash_templates.build_script
+
+    def _ova_build_script(text_options=None, always_on_top=False):
+        return _pyi_build_script(text_options=text_options, always_on_top=always_on_top) \
+            + "\n" + _OVA_LOADER_TCL
+    _ova_build_script._ova = True
+    _splash_templates.build_script = _ova_build_script
+
 splash = Splash(
     'splash_boot.png',
     binaries=a.binaries,
@@ -90,6 +105,18 @@ exe = EXE(
     entitlements_file=None,
     icon=['icon.ico'],
     version=version_info,
+    # DPI-aware (per monitor) from the first moment: the launcher's splash
+    # (Tk) is then laid out in real pixels too, and stays put when Qt starts.
+    # Unaware, Windows scaled it, and as Qt made the process aware the line
+    # jumped and shrank to 2/3 at 150 % - so it had to be hidden right then,
+    # and the moving loader could not last through Qt's slow start.
+    manifest=(
+        '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+        '<application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>'
+        '<dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>'
+        '<dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">'
+        'PerMonitorV2</dpiAwareness>'
+        '</windowsSettings></application></assembly>'),
 )
 coll = COLLECT(
     exe,

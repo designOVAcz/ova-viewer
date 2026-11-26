@@ -76,8 +76,10 @@ class DynamicSplash(QWidget):
     WIDTH = 420
     HEIGHT = 300
 
-    def __init__(self):
-        # Only the picture's size here, so the line can show at once; the
+    def __init__(self, own_line=True):
+        # *own_line* False: the launcher's loader line is up (the exe's
+        # splash, splash_boot.tcl) - none drawn here until it hands over (see
+        # reveal). Only the picture's size here, so the line can show at once; the
         # globe is loaded in reveal(). Read from the PNG header by hand:
         # QImageReader would set up Qt's PNG support first (~0.4 s), with
         # nothing on screen meanwhile.
@@ -108,6 +110,7 @@ class DynamicSplash(QWidget):
             self.move(round(c.x() - ex), round(c.y() - ey))
         self._status = "Starting Ova Viewer…"
         self._grown = BOOT_START    # ⏳ how far the loader line is filled
+        self._own_line = bool(own_line)
 
     def progress(self):
         """⏳ How far the loader line is filled, BOOT_START .. 1."""
@@ -129,27 +132,45 @@ class DynamicSplash(QWidget):
                 break
             time.sleep(0.012)
 
-    def reveal(self):
+    def reveal(self, boot=None):
         """⏳ The loader line grows to its full width - on between the bits of
         work done here (the globe loaded, the first font) - then the globe
         fades in around it while the line fades away (the line is its
-        equator). About 0.6 s plus that work, drawn frame by frame."""
+        equator). About 0.6 s plus that work, drawn frame by frame.
+
+        *boot*: the launcher's splash (pyi_splash), its loader line up and
+        moving in a thread of its own (splash_boot.tcl). Then the work here -
+        the slow part of a cold start: the font database, 1600+ families
+        read from disk, 6-10 s after a reboot - is done with that line still
+        moving; told "ova:done", it runs to its end, and this splash takes
+        over with the same line, full, before the globe comes in. (Moved
+        from here, the line stood still through it: Python holds its lock
+        while Qt works, even with the work on another thread.)"""
         if self._img_path is None or self._pixmap is not None:
+            if boot is not None:
+                self._hand_over(boot)
             return
-        self._grow_to(0.35)
+        if boot is None:
+            self._grow_to(0.35)
         src = QPixmap(self._img_path)
         if src.isNull():
             self._globe = 1.0
             self._img_path = None
+            if boot is not None:
+                self._hand_over(boot)
             self.repaint()
             return
         self._pixmap = src.scaled(self.WIDTH, self.HEIGHT, Qt.KeepAspectRatio,
                                   Qt.SmoothTransformation)
-        self._grow_to(0.7)
-        # The first text drawn loads the font database (~0.5 s): do it now,
-        # while the line is up, not in the middle of the fade.
+        if boot is None:
+            self._grow_to(0.7)
+        # The first text drawn loads the font database (~0.5 s; seconds on a
+        # cold start): do it now, while the line is up, not in the fade.
         QFontMetrics(self._status_font()).horizontalAdvance(self._status)
-        self._grow_to(1.0)
+        if boot is None:
+            self._grow_to(1.0)
+        else:
+            self._hand_over(boot)
         start = time.perf_counter()
         while True:
             t = min(1.0, (time.perf_counter() - start) / FADE_IN_S)
@@ -159,6 +180,28 @@ class DynamicSplash(QWidget):
             if t >= 1.0:
                 break
             time.sleep(0.012)
+
+    HAND_OVER_S = 0.22      # the launcher's line runs to its end in 0.18 s (splash_boot.tcl)
+
+    def _hand_over(self, boot):
+        """⏳ The launcher's line told to run to its end; then this splash's
+        own line, full, in its place, and the launcher's splash closed."""
+        try:
+            boot.update_text("ova:done")
+        except Exception:
+            pass
+        start = time.perf_counter()
+        while time.perf_counter() - start < self.HAND_OVER_S:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        self._grown = 1.0
+        self._own_line = True
+        self.repaint()
+        QApplication.processEvents()
+        try:
+            boot.close()
+        except Exception:
+            pass
 
     def fade_out(self):
         """Fade away over the main window, then close (runs in the event loop)."""
@@ -192,7 +235,7 @@ class DynamicSplash(QWidget):
             if self._pixmap is not None:
                 painter.drawPixmap(0, 0, self._pixmap)
             self.drawContents(painter)
-        if self._img_path is not None and self._globe < 1.0:
+        if self._img_path is not None and self._globe < 1.0 and self._own_line:
             # ⏳ The boot line, carried on as the loader: 1 px near white,
             # grown along the globe's equator; it fades as the globe comes in.
             painter.setOpacity((1.0 - self._globe) * self._opacity)
@@ -221,9 +264,10 @@ class DynamicSplash(QWidget):
                          Qt.AlignHCenter | Qt.AlignVCenter, self._status)
 
 
-def show_splash(app: QApplication) -> DynamicSplash:
-    """Create and show the splash - at first just the line (see reveal())."""
-    splash = DynamicSplash()
+def show_splash(app: QApplication, own_line=True) -> DynamicSplash:
+    """Create and show the splash - at first just the line (see reveal());
+    *own_line* False: none while the launcher's loader line is up."""
+    splash = DynamicSplash(own_line=own_line)
     splash.show()
     splash.repaint()
     app.processEvents()
