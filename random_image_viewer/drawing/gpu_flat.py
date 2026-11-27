@@ -414,6 +414,7 @@ class _FlatKit:
         self._shelf = [0, 0, 0]
         self._rows.clear()
         self._slots.clear()
+        self.__dict__.pop('_slot_info', None)     # (🖌 bristle colours' places, see _bristle_instances)
 
     def entry(self, key, make):
         """(x, y, w, h) of *key* in the atlas; *make*() -> (h, w) uint8 array,
@@ -1244,12 +1245,18 @@ class GpuBristleStroke(GpuFlatStroke):
         rows[:, 14], rows[:, 15] = m4, m5                       # ... here
         rows[:, 16], rows[:, 17], rows[:, 18], rows[:, 19] = sx, sy, 1, ph
         # each colour: its palette slot; the column through a 1 x 1 index map
-        slot_of = {}
-        for c in np.unique(colours):
-            row, col = k.slot(int(c))
-            ix, iy, _, _ = k.entry(('const', col), lambda col=col: np.full((1, 1), col, np.uint8))
-            slot_of[int(c)] = (row, ix, iy)
-        info = np.array([slot_of[int(c)] for c in colours], np.float32).reshape(-1, 3)
+        # (the distinct colours looked up once, each segment's row by index)
+        # (a wet brush: nearly every hair a colour of its own, so a colour's
+        # place is kept with the slots - one lookup, not slot() and entry())
+        uniq, inv = np.unique(colours, return_inverse=True)
+        known = k.__dict__.setdefault('_slot_info', {})        # (cleared by reset_atlas)
+        found = [known.get(c) for c in uniq.tolist()]
+        for j, c in enumerate(uniq.tolist()):
+            if found[j] is None:
+                row, col = k.slot(c)
+                ix, iy, _, _ = k.entry(('const', col), lambda col=col: np.full((1, 1), col, np.uint8))
+                found[j] = known[c] = (row, ix, iy)
+        info = np.array(found, np.float32)[inv.reshape(-1)]
         rows[:, 20], rows[:, 21] = info[:, 1], info[:, 2]
         rows[:, 22], rows[:, 23] = 1, 1
         rows[:, 24] = np.clip(np.rint(alpha * 255.0), 1, 255)   # coverage

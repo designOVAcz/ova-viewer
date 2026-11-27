@@ -16,6 +16,7 @@ millimetres on the tablet. No library, no touch tablet: it stays quiet.
 import ctypes
 import math
 import sys
+import time
 from ctypes import POINTER, Structure, c_bool, c_float, c_int, c_size_t, c_ushort, c_void_p
 
 from PySide6.QtCore import QObject, Signal
@@ -65,6 +66,17 @@ class WacomTwoFingerPan(QObject):
         self._callbacks = []            # keep the ctypes callbacks alive
         self._last = {}                 # device -> (id pair, midpoint mm)
         self._sizes = {}                # device -> (mm per logical x, y, origin x, y)
+        self._gesture = {}              # device -> [id pair, start middle, start spread, 'pan' | 'pinch' | None]
+        self.pinch_t = 0.0              # time.monotonic() of the last pinch movement
+
+    DECIDE_MM = 3.0                     # fingers moved / spread this far: pan or pinch decided
+
+    def pinching(self, within=0.6):
+        """Two fingers pinching on the tablet now (or a moment ago): the
+        driver's Ctrl+wheel then is that pinch, not a mouse."""
+        if any(g[3] != 'pan' for g in list(self._gesture.values())):
+            return True             # (two fingers down, not panning: the pinch before it is decided)
+        return time.monotonic() - self.pinch_t < within
 
     def start(self):
         """Hook up to every touch tablet attached. Returns why not, or ''."""
@@ -134,13 +146,35 @@ class WacomTwoFingerPan(QObject):
                     and data.Fingers[i].Confidence]
             if len(down) != 2:
                 self._last.pop(device, None)
+                self._gesture.pop(device, None)
                 return 0
             a, b = sorted(down, key=lambda f: f.FingerID)
             mx = ((a.X + b.X) / 2 - size[2]) * size[0]
             my = ((a.Y + b.Y) / 2 - size[3]) * size[1]
+            spread = math.hypot((a.X - b.X) * size[0], (a.Y - b.Y) * size[1])
             pair = (a.FingerID, b.FingerID)
             last = self._last.get(device)
             self._last[device] = (pair, (mx, my))
+            # 🤏 A pan or a pinch: the first few mm decide, held until the
+            # fingers lift. The middle between two pinching fingers wanders
+            # too - taken as a pan, the picture slid away while the driver
+            # zoomed it, each pinch from somewhere else.
+            g = self._gesture.get(device)
+            if g is None or g[0] != pair:
+                g = self._gesture[device] = [pair, (mx, my), spread, None]
+            if g[3] is None:
+                moved = math.hypot(mx - g[1][0], my - g[1][1])
+                stretched = abs(spread - g[2])
+                if max(moved, stretched) < self.DECIDE_MM:
+                    return 0
+                g[3] = 'pinch' if stretched > moved else 'pan'
+                if g[3] == 'pan':
+                    # the way already come, not lost to the deciding
+                    self.panned.emit(mx - g[1][0], my - g[1][1])
+                    return 0
+            if g[3] == 'pinch':
+                self.pinch_t = time.monotonic()
+                return 0
             if last is not None and last[0] == pair:
                 dx, dy = mx - last[1][0], my - last[1][1]
                 if (dx or dy) and math.hypot(dx, dy) < 40:      # mm: no jumps

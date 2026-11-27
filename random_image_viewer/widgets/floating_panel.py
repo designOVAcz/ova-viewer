@@ -532,6 +532,23 @@ class FloatingPanel(QWidget):
                     break
         return self._stuck_pos(p, side, d), (p, side, d)
 
+    HOME_GAP = 8        # px from the top edge at the top middle
+
+    def _snapped_home(self, pos):
+        """*pos* pulled to the canvas's middle line when near it, and then to
+        the top edge too: the top middle, where 🖌 PAINT sits by default. Let
+        go there, the panel stays centred however the window is resized."""
+        parent = self.parentWidget()
+        if parent is None:
+            return pos
+        mid = (parent.width() - self.width()) // 2
+        if abs(pos.x() - mid) > self.SNAP:
+            return pos
+        y = pos.y()
+        if abs(y - self.HOME_GAP) <= self.SNAP * 2:
+            y = self.HOME_GAP
+        return QPoint(mid, y)
+
     def mark_user_moved(self, moved=True):
         self._user_moved = moved
 
@@ -612,6 +629,8 @@ class FloatingPanel(QWidget):
             self._snap = None
             if not (event.modifiers() & Qt.ShiftModifier):
                 new_pos, self._snap = self._snapped(new_pos)
+                if self._snap is None:
+                    new_pos = self._snapped_home(new_pos)
             self.move(new_pos)
             event.accept()
             return
@@ -687,7 +706,10 @@ class FloatingPanel(QWidget):
         ph = parent.height()
         center_x = self.x() + self.width() / 2
         center_y = self.y() + self.height() / 2
-        self._anchor_h = 'right' if pw and center_x > pw / 2 else 'left'
+        if pw and abs(self.x() - (pw - self.width()) // 2) <= 1:
+            self._anchor_h = 'center'       # on the middle line: kept centred
+        else:
+            self._anchor_h = 'right' if pw and center_x > pw / 2 else 'left'
         self._anchor_v = 'bottom' if ph and center_y > ph / 2 else 'top'
         self._left_pos = self.x()
         self._top_pos = self.y()
@@ -719,6 +741,8 @@ class FloatingPanel(QWidget):
         ph = parent.height()
         if self._anchor_h == 'right':
             x = pw - self.width() - self._right_gap
+        elif self._anchor_h == 'center':
+            x = (pw - self.width()) // 2
         else:
             x = self._left_pos
         if self._anchor_v == 'bottom':

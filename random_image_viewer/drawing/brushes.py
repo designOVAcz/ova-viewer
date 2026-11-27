@@ -2524,9 +2524,15 @@ class SmudgeStroke(SmearStroke):
             self.backdrop = _image_array(backdrop.convertToFormat(QImage.Format_ARGB32_Premultiplied))
 
     def _reached(self, local):
+        """Where the tip went in *local*, as its own (h, w) uint8 array - a
+        copy: a view into `grey` pointed at freed memory once it was gone,
+        and reading it crashed the app (an access violation at the pen's
+        lift, a smudge laid along a line)."""
+        if local.isEmpty():
+            return np.zeros((max(0, local.height()), max(0, local.width())), np.uint8)
         grey = self.mask.copy(local).convertToFormat(QImage.Format_Grayscale8)
         a = np.frombuffer(grey.constBits(), np.uint8, count=grey.bytesPerLine() * grey.height())
-        return a.reshape(grey.height(), grey.bytesPerLine())[:, :grey.width()]
+        return a.reshape(grey.height(), grey.bytesPerLine())[:, :grey.width()].copy()
 
     def compose(self, rect):
         """As seen while smudging: with a backdrop, the smudged layer over
@@ -2535,6 +2541,8 @@ class SmudgeStroke(SmearStroke):
         if self.backdrop is None:
             return super().compose(rect)
         local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        if local.isEmpty():
+            return _clear_image(rect.size())
         part = (slice(local.y(), local.y() + local.height()), slice(local.x(), local.x() + local.width()))
         top = _image_array(self.work.copy(local)).astype(np.float32)
         under = self.backdrop[part].astype(np.float32)
@@ -2550,6 +2558,8 @@ class SmudgeStroke(SmearStroke):
         """Where the smudge replaces the layer's paint, in device *rect*: an
         alpha mask (premultiplied ARGB, black)."""
         local = rect.translated(-self.rect.x(), -self.rect.y()).intersected(self.work.rect())
+        if local.isEmpty():
+            return _clear_image(rect.size())
         a = self._reached(local)
         out = np.zeros(a.shape + (4,), np.uint8)
         out[..., 3] = a
@@ -3169,6 +3179,13 @@ def _image_array(image):
     return data[:, :w * 4].reshape(h, w, 4).copy()
 
 
+def _clear_image(size):
+    """A transparent premultiplied ARGB32 QImage of *size* (at least 1 x 1)."""
+    image = QImage(max(1, size.width()), max(1, size.height()), QImage.Format_ARGB32_Premultiplied)
+    image.fill(0)
+    return image
+
+
 def _array_image(array):
     """(h, w, 4) BGRA uint8 back to a premultiplied ARGB32 QImage (a copy)."""
     array = np.ascontiguousarray(array)
@@ -3236,7 +3253,10 @@ class BristleStroke(FlatStroke):
         img = image.convertToFormat(QImage.Format_ARGB32)
         h, w = img.height(), img.width()
         a = np.frombuffer(img.constBits(), np.uint8, count=img.sizeInBytes())
-        self._under = a.reshape(h, img.bytesPerLine())[:, :w * 4].reshape(h, w, 4).copy()
+        # read in place, the image kept with it (a copy of a screen-sized
+        # image was a few ms more at every pen-down)
+        self._under_image = img
+        self._under = a.reshape(h, img.bytesPerLine())[:, :w * 4].reshape(h, w, 4)
 
     def stamped(self, stamps):
         """*stamps* with each hair's colour as it was laid (Wet): laid again
@@ -3315,6 +3335,34 @@ class BristleStroke(FlatStroke):
         n = len(u)
         if isinstance(rgb, tuple) and rgb and rgb[0] == self.PER_HAIR and len(rgb) == n + 1:
             return list(rgb[1:])
+        base = self._base_colours(rgb, u)
+        if self._under is None:
+            return base
+        hairs = self._hairs
+        fresh = np.array([((c >> 16) & 255, (c >> 8) & 255, c & 255) for c in base], np.float64)
+        if self._carry is None:
+            self._carry = fresh.copy()
+        if pos is not None and step > 0:
+            h, w = self._under.shape[:2]
+            dx = view.m11() * pos[:, 0] + view.m21() * pos[:, 1] + view.dx() - self.rect.x()
+            dy = view.m12() * pos[:, 0] + view.m22() * pos[:, 1] + view.dy() - self.rect.y()
+            xi = np.clip(np.rint(dx).astype(np.int64), 0, w - 1)
+            yi = np.clip(np.rint(dy).astype(np.int64), 0, h - 1)
+            px = self._under[yi, xi].astype(np.float64)              # B G R A
+            seen = px[:, 3] / 255.0
+            under = px[:, [2, 1, 0]]
+            k = (1.0 - np.exp(-hairs['wet'] * step / (0.5 * size))) * seen
+            self._carry += (under - self._carry) * k[:, None]
+            reload = (1.0 - hairs['wet']) * (1.0 - math.exp(-step / (0.8 * size)))
+            self._carry += (fresh - self._carry) * reload[:, None]
+        c = np.clip(np.rint(self._carry), 0, 255).astype(np.int64)
+        cols = [int((r << 16) | (g << 8) | b) for r, g, b in c]
+        self.recorded.append(tuple(cols))
+        return cols
+
+    def _base_colours(self, rgb, u):
+        """Each hair's own colour for a stamp of colour *rgb* (before Wet)."""
+        n = len(u)
         if isinstance(rgb, tuple) and rgb and rgb[0] < 0:
             # Colour jitter 'every speck (particles)': every hair its own
             # colour from them (HeavyPaint's per-point colour), the same hair
@@ -3343,95 +3391,210 @@ class BristleStroke(FlatStroke):
             base = list(dealt)
         else:
             base = self._colours(rgb, u)
-        if self._under is None:
-            return base
-        hairs = self._hairs
-        fresh = np.array([((c >> 16) & 255, (c >> 8) & 255, c & 255) for c in base], np.float64)
-        if self._carry is None:
-            self._carry = fresh.copy()
-        if pos is not None and step > 0:
-            h, w = self._under.shape[:2]
-            dx = view.m11() * pos[:, 0] + view.m21() * pos[:, 1] + view.dx() - self.rect.x()
-            dy = view.m12() * pos[:, 0] + view.m22() * pos[:, 1] + view.dy() - self.rect.y()
-            xi = np.clip(np.rint(dx).astype(np.int64), 0, w - 1)
-            yi = np.clip(np.rint(dy).astype(np.int64), 0, h - 1)
-            px = self._under[yi, xi].astype(np.float64)              # B G R A
-            seen = px[:, 3] / 255.0
-            under = px[:, [2, 1, 0]]
-            k = (1.0 - np.exp(-hairs['wet'] * step / (0.5 * size))) * seen
-            self._carry += (under - self._carry) * k[:, None]
-            reload = (1.0 - hairs['wet']) * (1.0 - math.exp(-step / (0.8 * size)))
-            self._carry += (fresh - self._carry) * reload[:, None]
-        c = np.clip(np.rint(self._carry), 0, 255).astype(np.int64)
-        cols = [int((r << 16) | (g << 8) | b) for r, g, b in c]
-        self.recorded.append(tuple(cols))
-        return cols
+        return base
 
     def segments(self, texture, stamps, view):
         """The bristles moved on over *stamps* (picture coords, *view* to
         device px): per stamp laid, (p0, p1, width, alpha, colours) - where
         each hair's line runs (n, 2 device px of this stroke's rect), its
         width (device px), how strongly it lays (0..1) and its colour
-        (0xRRGGBB ints, n). All in arrays: no work hair by hair, so a brush
-        of a couple of hundred hairs costs about what one of a dozen does.
-        The CPU (add) and the graphics card (gpu_flat.GpuBristleStroke) draw
-        the same segments."""
+        (0xRRGGBB ints, n). The CPU (add) and the graphics card
+        (gpu_flat.GpuBristleStroke) draw the same segments.
+
+        All the stamps of a call at once, in (stamps, hairs) arrays: only
+        the two things that follow from the stamp before - each hair's lag
+        behind the brush, and the colour a wet hair carries - go stamp by
+        stamp, a few array operations each. (Stamp by stamp it was ~0.4 ms
+        a stamp: a small brush at fine spacing lays dozens a pen event.)"""
         params = getattr(texture, 'hair_params', None) or {}
         if self._hairs is None:
             self._hairs = self._make(params)
         hairs = self._hairs
         u, v, lag = hairs['u'], hairs['v'], hairs['lag']
+        n = len(u)
         scale = math.sqrt(abs(view.determinant())) or 1.0
         m11, m12, m21, m22 = view.m11(), view.m12(), view.m21(), view.m22()
         ox, oy = view.dx() - self.rect.x(), view.dy() - self.rect.y()
         out = []
         self.seg_stamps = index = []        # (which stamp each of *out* is)
+        if not stamps:
+            return out
+
+        # -- the brush's way: where it is, which stamps lay (cheap, per stamp)
+        laid = []           # (stamp index, row in the arrays below)
+        rows = []           # x, y, size, angle, opacity, pressure, step, travel (laid stamps)
+        heads = {}          # stamp index -> its hairs' targets row (first stamp: where they start)
+        first_at = None     # the stamp the hairs started at, in this call
+        keys = []           # per stamp: ('skip' | 'first' | 'lay', row)
+        targets_of = []     # stamps whose hair targets are needed
         for i_stamp, stamp in enumerate(stamps):
             x, y, size, angle, opacity, rgb = stamp[:6]
             pressure = stamp[6] if len(stamp) > 6 else 1.0
             if size * scale < 0.4:
-                self._hair_colours(rgb, u, None, 0.0, size, view)      # (kept in step with the stamps)
+                keys.append(('skip', None))
                 continue
-            ax, ay = -math.sin(angle), math.cos(angle)                  # across the brush
-            fx, fy = ay, -ax                                            # along it
-            spread = size * (0.42 + 0.58 * max(0.0, min(1.0, pressure)))
-            tx = x + (ax * u + fx * v) * spread
-            ty = y + (ay * u + fy * v) * spread
-            if self._pos is None:
-                self._pos = np.stack([tx, ty], 1)
+            targets_of.append(i_stamp)
+            if self._pos is None and first_at is None:
+                first_at = i_stamp
                 self._at = (x, y)
-                self._hair_colours(rgb, u, None, 0.0, size, view)
+                keys.append(('first', None))
                 continue
             step = math.hypot(x - self._at[0], y - self._at[1])
             self._travel += step
             self._at = (x, y)
-            prev = self._pos
-            new = np.stack([prev[:, 0] + (tx - prev[:, 0]) * lag, prev[:, 1] + (ty - prev[:, 1]) * lag], 1)
-            self._pos = new
-            colours = np.asarray(self._hair_colours(rgb, u, new, step, size, view), np.int64)
+            keys.append(('lay', len(rows)))
+            rows.append((x, y, size, angle, opacity, pressure, step, self._travel))
+            laid.append(i_stamp)
+
+        # each hair's target, all stamps at once: the bundle placed by the
+        # brush's turn and splayed by its pressure
+        if targets_of:
+            st = np.array([tuple(stamps[i][:5]) + ((stamps[i][6] if len(stamps[i]) > 6 else 1.0),)
+                           for i in targets_of], np.float64)
+            sx, sy, ssize, sang, spres = st[:, 0], st[:, 1], st[:, 2], st[:, 3], st[:, 5]
+            ax, ay = -np.sin(sang), np.cos(sang)                    # across the brush
+            fx, fy = ay, -ax                                        # along it
+            spread = ssize * (0.42 + 0.58 * np.clip(spres, 0.0, 1.0))
+            tx = sx[:, None] + (ax[:, None] * u + fx[:, None] * v) * spread[:, None]
+            ty = sy[:, None] + (ay[:, None] * u + fy[:, None] * v) * spread[:, None]
+            row_of = {i: j for j, i in enumerate(targets_of)}
+
+        # each hair following its target with its own lag (per stamp: the
+        # one that came before), as complex numbers - one array a step
+        m = len(rows)
+        if m:
+            target = tx + 1j * ty
+            lagc = lag.astype(np.float64)
+            prev = np.empty((m, n), np.complex128)
+            new = np.empty((m, n), np.complex128)
+            if first_at is not None:
+                j0 = row_of[first_at]
+                pos = target[j0].copy()
+            else:
+                pos = self._pos[:, 0] + 1j * self._pos[:, 1]
+            for r, i_stamp in enumerate(laid):
+                prev[r] = pos
+                pos = pos + (target[row_of[i_stamp]] - pos) * lagc
+                new[r] = pos
+            self._pos = np.stack([pos.real, pos.imag], 1)
+        elif first_at is not None:
+            j0 = row_of[first_at]
+            self._pos = np.stack([tx[j0], ty[j0]], 1)
+
+        # -- colours: each hair's, per stamp (Wet: what it carries)
+        colours = self._stamp_colours(stamps, keys, new if m else None,
+                                      [r[6] for r in rows], view, u)
+
+        if not m:
+            return out
+        R = np.array(rows, np.float64)
+        size = R[:, 2:3]
+        angle = R[:, 3:4]
+        opacity = R[:, 4:5]
+        pressure = R[:, 5:6]
+        travel = R[:, 7:8]
+        touch = self._smooth(hairs['contact'] - 0.12, hairs['contact'] + 0.05, pressure)
+        start = hairs['start'] * size
+        started = self._smooth(start, start + 0.15 * size, travel)
+        ink = np.maximum(hairs['dry_floor'],
+                         1.0 - np.clip((travel - hairs['dry'] * size) / (3.0 * size), 0.0, 1.0))
+        alpha = np.clip(opacity * hairs['strength'] * touch * started * ink, 0.0, 1.0)
+        # each hair's trace: its flat tip's width across the way it moves
+        mv = new - prev
+        mx, my = mv.real, mv.imag
+        ml = np.hypot(mx, my)
+        ml[ml < 1e-9] = 1.0
+        nx, ny = -my / ml, mx / ml
+        axis = hairs['axis'] + angle
+        along = np.abs(np.cos(axis) * nx + np.sin(axis) * ny)
+        across = np.sqrt(np.clip(1.0 - along * along, 0.0, 1.0))
+        width = hairs['thick'] * size * scale * np.hypot(hairs['long'] * along, across)
+        thin = width < 0.8                  # thinner than a pixel: fainter instead
+        alpha = np.where(thin, alpha * width / 0.8, alpha)
+        width = np.where(thin, 0.8, width)
+        px0, py0, px1, py1 = prev.real, prev.imag, new.real, new.imag
+        p0 = np.stack([m11 * px0 + m21 * py0 + ox, m12 * px0 + m22 * py0 + oy], 2)
+        p1 = np.stack([m11 * px1 + m21 * py1 + ox, m12 * px1 + m22 * py1 + oy], 2)
+        for r, i_stamp in enumerate(laid):
+            rgb = stamps[i_stamp][5]
             if self._under is not None or (isinstance(rgb, tuple) and rgb and rgb[0] == self.PER_HAIR):
                 self.carries = True         # each hair's own colour, changing as it goes
-            touch = self._smooth(hairs['contact'] - 0.12, hairs['contact'] + 0.05, pressure)
-            started = self._smooth(hairs['start'] * size, hairs['start'] * size + 0.15 * size, self._travel)
-            ink = np.maximum(hairs['dry_floor'],
-                             1.0 - np.clip((self._travel - hairs['dry'] * size) / (3.0 * size), 0.0, 1.0))
-            alpha = np.clip(opacity * hairs['strength'] * touch * started * ink, 0.0, 1.0)
-            # each hair's trace: its flat tip's width across the way it moves
-            mx, my = new[:, 0] - prev[:, 0], new[:, 1] - prev[:, 1]
-            ml = np.hypot(mx, my)
-            ml[ml < 1e-9] = 1.0
-            nx, ny = -my / ml, mx / ml
-            axis = hairs['axis'] + angle
-            along = np.abs(np.cos(axis) * nx + np.sin(axis) * ny)
-            across = np.sqrt(np.clip(1.0 - along * along, 0.0, 1.0))
-            width = hairs['thick'] * size * scale * np.hypot(hairs['long'] * along, across)
-            thin = width < 0.8                  # thinner than a pixel: fainter instead
-            alpha = np.where(thin, alpha * width / 0.8, alpha)
-            width = np.where(thin, 0.8, width)
-            p0 = np.stack([m11 * prev[:, 0] + m21 * prev[:, 1] + ox, m12 * prev[:, 0] + m22 * prev[:, 1] + oy], 1)
-            p1 = np.stack([m11 * new[:, 0] + m21 * new[:, 1] + ox, m12 * new[:, 0] + m22 * new[:, 1] + oy], 1)
-            out.append((p0, p1, width, alpha, colours))
+            out.append((p0[r], p1[r], width[r], alpha[r], colours[r]))
             index.append(i_stamp)
+        return out
+
+    def _stamp_colours(self, stamps, keys, new, steps, view, u):
+        """Each hair's colour for every laid stamp (rows as *keys*' 'lay'),
+        as an (m, n) int64 array, the carried colour (Wet) kept up for every
+        stamp as _hair_colours did one by one - and recorded likewise."""
+        n = len(u)
+        m = sum(1 for k in keys if k[0] == 'lay')
+        out = np.empty((m, n), np.int64)
+        wet = self._under is not None
+        cache = {}
+
+        def base_of(rgb):
+            key = rgb if isinstance(rgb, int) else None
+            if key is not None and key in cache:
+                return cache[key]
+            b = np.asarray(self._base_colours(rgb, u), np.int64)
+            if key is not None:
+                cache[key] = b
+            return b
+
+        per_hair = [isinstance(s[5], tuple) and s[5] and s[5][0] == self.PER_HAIR
+                    and len(s[5]) == n + 1 for s in stamps]
+        if not wet or any(per_hair):
+            # laid again (each hair's colour kept in the stamp), or dry: no carry
+            for (kind, row), stamp, keep in zip(keys, stamps, per_hair):
+                if keep:
+                    cols = np.asarray(stamp[5][1:], np.int64)
+                elif wet:
+                    cols = np.asarray(self._hair_colours(stamp[5], u, None, 0.0, stamp[2], view), np.int64)
+                else:
+                    cols = base_of(stamp[5])
+                if kind == 'lay':
+                    out[row] = cols
+            return out
+        # 🖌 Wet: each hair picks up what is under it - read for all the laid
+        # stamps at once, the carry then brought along stamp by stamp
+        hairs = self._hairs
+        h, w = self._under.shape[:2]
+        if m:
+            dx = view.m11() * new.real + view.m21() * new.imag + view.dx() - self.rect.x()
+            dy = view.m12() * new.real + view.m22() * new.imag + view.dy() - self.rect.y()
+            xi = np.clip(np.rint(dx).astype(np.int64), 0, w - 1)
+            yi = np.clip(np.rint(dy).astype(np.int64), 0, h - 1)
+            px = self._under[yi, xi].astype(np.float64)                     # (m, n, BGRA)
+            seen = px[..., 3] / 255.0
+            under = px[..., [2, 1, 0]]
+        # (each stamp's own colour; how much each hair takes up and is topped
+        # up a laid stamp - all at once; only the carry itself goes in order)
+        b = np.stack([base_of(stamp[5]) for stamp in stamps])                  # (stamps, n)
+        fresh = np.stack([(b >> 16) & 255, (b >> 8) & 255, b & 255], 2).astype(np.float64)
+        if m:
+            step = np.asarray(steps, np.float64)[:, None]
+            size = np.array([stamps[i][2] for i, (kind, _r) in enumerate(keys) if kind == 'lay'],
+                            np.float64)[:, None]
+            take = ((1.0 - np.exp(-hairs['wet'] * step / (0.5 * size))) * seen)[..., None]
+            reload = ((1.0 - hairs['wet']) * (1.0 - np.exp(-step / (0.8 * size))))[..., None]
+            moved = step[:, 0] > 0
+        carried = np.empty((len(stamps), n, 3), np.float64)
+        carry = self._carry
+        for i, (kind, row) in enumerate(keys):
+            if carry is None:
+                carry = fresh[i].copy()
+            if kind == 'lay' and moved[row]:
+                carry = carry + (under[row] - carry) * take[row]
+                carry = carry + (fresh[i] - carry) * reload[row]
+            carried[i] = carry
+        self._carry = carry
+        c = np.clip(np.rint(carried), 0, 255).astype(np.int64)
+        ints = (c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]                  # (stamps, n)
+        self.recorded.extend(tuple(r) for r in ints.tolist())
+        for i, (kind, row) in enumerate(keys):
+            if kind == 'lay':
+                out[row] = ints[i]
         return out
 
     def add(self, texture, stamps, view):

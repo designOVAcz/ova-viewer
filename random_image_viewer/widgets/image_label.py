@@ -374,6 +374,11 @@ class ImageLabel(QLabel):
             painter = QPainter(self)
             viewer.paint_selection_overlay(painter)     # ⬚ the selection and its frame
             painter.end()
+        if viewer is not None and viewer.mask_mode and viewer._mask_view is not None:
+            painter = QPainter(self)
+            painter.setClipRegion(event.region())
+            viewer.paint_mask_overlay(painter)          # 🎭 the colour mask
+            painter.end()
         if (getattr(self, '_fill_overlay', None)
                 or (viewer is not None and viewer.__dict__.get('_grad_edit') is not None)):
             painter = QPainter(self)
@@ -1012,6 +1017,12 @@ class ImageLabel(QLabel):
 
             # Store mouse position for zoom centering
             mouse_pos = event.position()
+            # 🤏 A pinch on the Wacom's touch surface (the driver's Ctrl+wheel):
+            # zoomed about the middle of the view, not the pointer - that is
+            # wherever the pen last hovered, a different place each pinch.
+            touch = getattr(self.parent_viewer, '_touch_pan', None)
+            if touch is not None and (event.modifiers() & Qt.ControlModifier) and touch.pinching():
+                mouse_pos = QPointF(self.width() / 2, self.height() / 2)
 
             old_zoom = self.zoom_factor
 
@@ -1124,6 +1135,12 @@ class ImageLabel(QLabel):
         # Double-click on the picture opens the thumbnail grid (like G) — only
         # with no drawing / colour-snap tool engaged, so marking stays as it was.
         # With nothing open yet (the start screen) it opens a folder instead.
+        # ⏯ the first click of this pair paused / played the video: undone,
+        # so a double-click only opens the grid as before
+        toggled = self.__dict__.pop('_media_click_toggled', None)
+        if (event.button() == Qt.LeftButton and toggled is not None
+                and time.monotonic() - toggled < QApplication.doubleClickInterval() / 1000 + 0.1):
+            self.video_toggle_play_pause()
         if (event.button() == Qt.LeftButton and viewer is not None
                 and self._no_tool_engaged()):
             if viewer.images or viewer._open_document() is not None:
@@ -1195,7 +1212,7 @@ class ImageLabel(QLabel):
             or getattr(viewer, 'eraser_mode', False)
             or getattr(viewer, 'fill_mode', None)
             or getattr(viewer, 'color_snap_mode', False)
-            or viewer.crop_mode or viewer.select_mode)
+            or viewer.crop_mode or viewer.select_mode or viewer.mask_mode)
 
     def mousePressEvent(self, event):
         # ▦ a perspective grid's vanishing point (the grids palette open):
@@ -1204,6 +1221,13 @@ class ImageLabel(QLabel):
                 and self.parent_viewer.grid_handle_press(event.position(), event.button())):
             event.accept()
             return
+        # ⏯ A plain left click on a playing video / song pauses it (like
+        # Space) - decided on release, so a drag (panning) does not count.
+        self._media_click_at = None
+        if (event.button() == Qt.LeftButton and self._media_player is not None
+                and getattr(self.parent_viewer, '_video_playing', False)
+                and self._no_tool_engaged()):
+            self._media_click_at = event.position()
         # 🎮 A stroke or click while the GPU view still shows a zoom: the
         # plain canvas for this view first (see _finish_view_motion).
         if event.button() == Qt.LeftButton and self.parent_viewer is not None:
@@ -1231,6 +1255,13 @@ class ImageLabel(QLabel):
         if (event.button() == Qt.LeftButton and self.parent_viewer
                 and self.parent_viewer.select_mode):
             self.parent_viewer.select_press(event.position())
+            event.accept()
+            return
+
+        # 🎭 Colour mask: a click picks a colour (a drag then sets its threshold)
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.mask_mode):
+            self.parent_viewer.mask_press(event.position(), event.modifiers())
             event.accept()
             return
 
@@ -1457,6 +1488,11 @@ class ImageLabel(QLabel):
         if (self.parent_viewer and self.parent_viewer.select_mode
                 and not self.is_panning):
             self.parent_viewer.select_move(event.position(), event.buttons(), event.modifiers())
+            event.accept()
+            return
+        if (self.parent_viewer and self.parent_viewer.mask_mode
+                and not self.is_panning and event.buttons() & Qt.LeftButton):
+            self.parent_viewer.mask_move(event.position(), event.buttons())
             event.accept()
             return
 
@@ -1942,6 +1978,13 @@ class ImageLabel(QLabel):
         if self.parent_viewer is not None and self.parent_viewer.grid_handle_release():
             event.accept()
             return      # ▦ a vanishing point let go
+        # ⏯ the click on a video / song (see mousePressEvent): play / pause
+        press = self.__dict__.pop('_media_click_at', None)
+        if press is not None and event.button() == Qt.LeftButton and self._media_player is not None:
+            moved = event.position() - press
+            if moved.x() ** 2 + moved.y() ** 2 < 36:          # under 6 px: a click
+                self.video_toggle_play_pause()
+                self._media_click_toggled = time.monotonic()
         # End panning for either the right-button or the left-button/finger drag
         if event.button() in (Qt.RightButton, Qt.LeftButton) and self.is_panning:
             self.is_panning = False
@@ -1962,6 +2005,11 @@ class ImageLabel(QLabel):
         if (event.button() == Qt.LeftButton and self.parent_viewer
                 and self.parent_viewer.select_mode):
             self.parent_viewer.select_release()
+            event.accept()
+            return
+        if (event.button() == Qt.LeftButton and self.parent_viewer
+                and self.parent_viewer.mask_mode):
+            self.parent_viewer.mask_release()
             event.accept()
             return
 

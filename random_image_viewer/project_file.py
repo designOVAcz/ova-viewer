@@ -32,7 +32,7 @@ import os
 import time
 import zipfile
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QImage
 
 FORMAT = "ova-project"
@@ -57,6 +57,18 @@ def _plain(x):
     if x is None or type(x) in _PLAIN:
         return True
     return type(x) is tuple and all(y is None or type(y) in _PLAIN for y in x)
+
+
+def _rows(o, strict=False):
+    """*o* is rows of plain values (tuples of numbers, maybe a tuple in
+    them). Every row a tuple; the values of a few rows looked at - the rows
+    of one list are made by the same code. *strict*: every value (a save
+    tried again after json met something else)."""
+    if not all(type(t) is tuple for t in o):
+        return False
+    n = len(o)
+    look = o if strict else [o[i] for i in sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})]
+    return all(_plain(x) for t in look for x in t)
 
 
 def _raw_image(zf, name, image):
@@ -93,10 +105,11 @@ def _read_raw_image(zf, info):
 class _Writer:
     """Turns marks into JSON-able data; images and tips go into the archive."""
 
-    def __init__(self, zf):
+    def __init__(self, zf, strict=False):
         self.zf = zf
         self.images = 0
         self.tips = {}      # tip path -> entry name
+        self.strict = strict    # every value of every row checked (see _rows)
 
     def png(self, image):
         self.images += 1
@@ -141,11 +154,14 @@ class _Writer:
         if isinstance(o, tuple):
             return {'$': 'tuple', 'v': [self.enc(x) for x in o]}
         if isinstance(o, list):
-            if o and all(type(t) is tuple and all(_plain(x) for x in t) for t in o):
+            if o and _rows(o, self.strict):
                 # a stroke's points / stamps: rows of plain numbers (a stamp's
                 # speck colours a tuple in it) - kept as rows: one tagged
-                # object each read back ~1 M of them, seconds
-                return {'$': 'rows', 'v': [[list(x) if type(x) is tuple else x for x in t] for t in o]}
+                # object each read back ~1 M of them, seconds. Handed to
+                # json as they are (it writes a tuple as an array: the same
+                # text as lists) - made into lists one by one, and every
+                # value checked, it was 5 of an autosave's 8 s.
+                return {'$': 'rows', 'v': o}
             return [self.enc(x) for x in o]
         if isinstance(o, dict):
             out = {}
@@ -257,92 +273,200 @@ def save_project(viewer, path, progress=None, thumbnail=True):
     file first and swapped in, so a failed save never spoils the last one.
     *progress*(fraction, step): told how far it got. *thumbnail* False:
     none (an autosave - on the GPU canvas it lays the whole view again)."""
-    progress = progress or _no_progress
+    write_snapshot(snapshot(viewer, thumbnail), path, progress)
+
+
+def snapshot(viewer, thumbnail=True, patches=True):
+    """What a save writes, taken on the main thread in a moment: the lists
+    of marks (the marks themselves do not change once made), the layer
+    images copied (they are painted into), the settings. write_snapshot
+    can then run in a thread of its own - an autosave of a big painting
+    held the app 3-9 s, every minute or two. *patches* False: without the
+    undo pieces (an autosave: less to copy and write; undo after opening
+    it lays the layer again)."""
     picture = viewer.current_image
     if not picture or not os.path.isfile(picture):
         raise ValueError("no picture open to save a project of")
     label = viewer.image_label
-    tmp = path + ".saving"
-    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        w = _Writer(zf)
-        pic_entry = "picture/" + os.path.basename(picture)
-        progress(0.02, "the picture")
-        zf.write(picture, pic_entry, compress_type=zipfile.ZIP_STORED)
-        layers = []
-        total = max(1, sum(len(items) for layer in viewer.layers for items in layer.marks.values()))
-        done = 0
-        for n, layer in enumerate(viewer.layers):
-            entry = {k: getattr(layer, k, None) for k in _LAYER_FIELDS}
-            entry['tag'] = layer.tag.name() if getattr(layer, 'tag', None) is not None else None
-            entry['fill'] = layer.fill.name(QColor.HexArgb) if layer.fill is not None else None
-            entry['marks'] = {}
-            for field, items in layer.marks.items():
-                entry['marks'][field] = w.enc(list(items))
-                done += len(items)
-                progress(0.15 + 0.6 * done / total,
-                         f"layer {n + 1} of {len(viewer.layers)} - {layer.name}")
-            try:
-                entry['raster'] = _save_raster(zf, viewer, layer, n)
-            except Exception as e:
-                print(f"\U0001F4BC Layer image not kept (laid again on opening): {e}")
-            layers.append(entry)
-        under = viewer.under_canvas
-        manifest = {
-            'format': FORMAT, 'version': VERSION,
-            'saved': time.strftime("%Y-%m-%dT%H:%M:%S"),
-            'app': _app_version(),
-            'picture': {'entry': pic_entry, 'name': os.path.basename(picture), 'original_path': picture,
-                        'sketch': os.path.basename(picture).startswith("sketch_")},
-            'mode': {'studio': bool(viewer.studio_mode), 'image_visible': bool(viewer.image_visible),
-                     'under_canvas': under.name(QColor.HexArgb) if under is not None else None,
-                     'under_canvas_visible': bool(getattr(viewer, 'under_canvas_visible', True)),
-                     'lines_visible': bool(getattr(viewer, 'lines_visible', True)),
-                     'guides_visible': bool(getattr(viewer, 'guides_visible', True))},
-            'view': {'zoom': float(label.zoom_factor), 'pan': [float(label.pan_offset_x), float(label.pan_offset_y)],
-                     'rotation': int(viewer.rotation_angle), 'flip_h': bool(viewer.flipped_h),
-                     'flip_v': bool(viewer.flipped_v)},
-            'layers': layers,
-            'active_layer': viewer.layers.index(viewer.active_layer),
-            'layer_count': int(getattr(viewer, '_layer_count', len(layers))),
-            'palette': [list(row) for row in getattr(viewer, 'snapped_rows', [])],
-        }
-        progress(0.78, "packing the marks")
-        zf.writestr("manifest.json", json.dumps(manifest, separators=(',', ':')))
-        progress(0.92, "the thumbnail")
+    layers = []
+    for n, layer in enumerate(viewer.layers):
+        entry = {k: getattr(layer, k, None) for k in _LAYER_FIELDS}
+        if isinstance(entry.get('impasto'), dict):
+            entry['impasto'] = dict(entry['impasto'])
+        entry['tag'] = layer.tag.name() if getattr(layer, 'tag', None) is not None else None
+        entry['fill'] = layer.fill.name(QColor.HexArgb) if layer.fill is not None else None
+        marks = {field: list(items) for field, items in layer.marks.items()}
         try:
-            if not thumbnail:
-                raise LookupError
+            raster = _raster_snapshot(viewer, layer, patches)
+        except Exception as e:
+            print(f"\U0001F4BC Layer image not kept (laid again on opening): {e}")
+            raster = None
+        layers.append((entry, marks, raster))
+    under = viewer.under_canvas
+    head = {
+        'format': FORMAT, 'version': VERSION,
+        'saved': time.strftime("%Y-%m-%dT%H:%M:%S"),
+        'app': _app_version(),
+        'picture': {'entry': "picture/" + os.path.basename(picture), 'name': os.path.basename(picture),
+                    'original_path': picture, 'sketch': os.path.basename(picture).startswith("sketch_")},
+        'mode': {'studio': bool(viewer.studio_mode), 'image_visible': bool(viewer.image_visible),
+                 'under_canvas': under.name(QColor.HexArgb) if under is not None else None,
+                 'under_canvas_visible': bool(getattr(viewer, 'under_canvas_visible', True)),
+                 'lines_visible': bool(getattr(viewer, 'lines_visible', True)),
+                 'guides_visible': bool(getattr(viewer, 'guides_visible', True))},
+        'view': {'zoom': float(label.zoom_factor), 'pan': [float(label.pan_offset_x), float(label.pan_offset_y)],
+                 'rotation': int(viewer.rotation_angle), 'flip_h': bool(viewer.flipped_h),
+                 'flip_v': bool(viewer.flipped_v)},
+        'active_layer': viewer.layers.index(viewer.active_layer),
+        'layer_count': int(getattr(viewer, '_layer_count', len(layers))),
+        'palette': [list(row) for row in getattr(viewer, 'snapped_rows', [])],
+    }
+    thumb = None
+    if thumbnail:
+        try:
             shown = viewer._view_pixmap() if hasattr(viewer, '_view_pixmap') else label.pixmap()
             if shown is not None and not shown.isNull():
                 thumb = shown.toImage().scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                zf.writestr("thumbnail.png", _png_bytes(thumb))
         except Exception:
-            pass
+            thumb = None
+    return {'picture': picture, 'head': head, 'layers': layers, 'thumb': thumb}
+
+
+def write_snapshot(snap, path, progress=None, pause=None):
+    """*snap* (see snapshot) into *path*. No viewer, no GUI: safe in a
+    thread. Its slow parts let the main thread run between them: PNG
+    encoding and zip compression in C without Python's lock, the marks
+    turned into JSON a mark at a time (one json.dumps of all of them is one
+    long call the main thread waits through). *pause*: a callable - while
+    it says True (the pen at work), the writing waits between its pieces."""
+    progress = progress or _no_progress
+    try:
+        _write_snapshot(snap, path, progress, strict=False, pause=pause)
+    except TypeError:
+        # (a row with something else in it, past what _rows looked at:
+        # once more, every value looked at)
+        _write_snapshot(snap, path, progress, strict=True, pause=pause)
+
+
+def _wait_while(pause):
+    """The background save giving way: painting comes first."""
+    if pause is None:
+        return
+    while pause():
+        time.sleep(0.05)
+
+
+def _write_snapshot(snap, path, progress, strict, pause=None):
+    import re
+    picture = snap['picture']
+    tmp = path + ".saving"
+    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        w = _Writer(zf, strict=strict)
+        progress(0.02, "the picture")
+        zf.write(picture, snap['head']['picture']['entry'], compress_type=zipfile.ZIP_STORED)
+        raw = []            # pieces of JSON made one by one, put in at the end
+
+        def piece(text):
+            raw.append(text)
+            return f"\x00RAW{len(raw) - 1}\x00"
+
+        dumps = _dumps_in_pieces
+        layers = []
+        total = max(1, sum(len(items) for _e, marks, _r in snap['layers'] for items in marks.values()))
+        done = 0
+        count = len(snap['layers'])
+        for n, (entry, marks, raster) in enumerate(snap['layers']):
+            entry = dict(entry)
+            entry['marks'] = {}
+            for field, items in marks.items():
+                if isinstance(items, list) and items and not _rows(items, strict):
+                    parts = []
+                    for item in items:          # a mark at a time, giving way to the pen
+                        _wait_while(pause)
+                        parts.append(dumps(w.enc(item)))
+                    entry['marks'][field] = piece("[" + ",".join(parts) + "]")
+                else:
+                    _wait_while(pause)
+                    coded = w.enc(items)
+                    if isinstance(coded, list):
+                        entry['marks'][field] = piece("[" + ",".join(dumps(x) for x in coded) + "]")
+                    else:
+                        entry['marks'][field] = piece(dumps(coded))
+                done += len(items)
+                progress(0.15 + 0.6 * done / total, f"layer {n + 1} of {count} - {entry.get('name')}")
+            try:
+                _wait_while(pause)
+                entry['raster'] = _write_raster(zf, raster, n) if raster is not None else None
+            except Exception as e:
+                print(f"\U0001F4BC Layer image not kept (laid again on opening): {e}")
+                entry['raster'] = None
+            layers.append(entry)
+        manifest = dict(snap['head'])
+        manifest['layers'] = layers
+        # (the same order of keys as ever: layers before active_layer)
+        order = ['format', 'version', 'saved', 'app', 'picture', 'mode', 'view', 'layers',
+                 'active_layer', 'layer_count', 'palette']
+        manifest = {k: manifest[k] for k in order if k in manifest}
+        progress(0.78, "packing the marks")
+        text = re.sub(r'"\\u0000RAW(\d+)\\u0000"', lambda m: raw[int(m.group(1))], dumps(manifest))
+        zf.writestr("manifest.json", text)
+        progress(0.92, "the thumbnail")
+        if snap.get('thumb') is not None:
+            try:
+                zf.writestr("thumbnail.png", _png_bytes(snap['thumb']))
+            except Exception:
+                pass
     os.replace(tmp, path)
     progress(1.0, "saved")
 
 
-def _save_raster(zf, viewer, layer, n):
-    """*layer*'s image and its undo patches into the archive, when the
-    image holds exactly its marks now; else None (laid again on opening)."""
+_PIECE_ROWS = 200       # a list longer than this goes to json in pieces of it (a hair
+                        # stroke's stamp row holds every hair's colour: kB each)
+
+
+def _dumps_in_pieces(o):
+    """json.dumps(o, separators=(',', ':')) - the very same text - made in
+    short calls. One call over a big stroke's stamps (one was 5 MB of JSON)
+    holds Python's lock all through it: the app's main thread, drawing a
+    frame, waited 1.8 s for an autosave in the background."""
+    if isinstance(o, dict):
+        return "{" + ",".join(json.dumps(str(k)) + ":" + _dumps_in_pieces(v) for k, v in o.items()) + "}"
+    if isinstance(o, (list, tuple)) and len(o) > _PIECE_ROWS:
+        return "[" + ",".join(json.dumps(o[i:i + _PIECE_ROWS], separators=(',', ':'))[1:-1]
+                              for i in range(0, len(o), _PIECE_ROWS)) + "]"
+    if isinstance(o, list) and any(isinstance(x, (dict, list)) for x in o[:1]):
+        return "[" + ",".join(_dumps_in_pieces(x) for x in o) + "]"
+    return json.dumps(o, separators=(',', ':'))
+
+
+def _raster_snapshot(viewer, layer, with_patches=True):
+    """*layer*'s image and its undo patches, copied, when the image holds
+    exactly its marks now; else None (laid again on opening)."""
     raster = getattr(layer, 'raster', None) or {}
     if not raster.get('canvas') or raster.get('image') is None:
         return None
     paint = viewer._layer_paint_marks(layer)
     if raster.get('count') != len(paint) or (paint and raster.get('last') is not paint[-1][1]):
         return None
-    rect = raster['rect']
-    out = _raw_image(zf, f"layers/{n:03d}.png", raster['image'])
-    out.update({'rect': [float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height())],
-                'k': float(raster['k']), 'cut_exact': True,
-                'count': len(paint), 'patches': []})
+    patches = []
     # the last few undos quick after opening (each is a piece of the image)
-    for i, p in enumerate((getattr(layer, 'canvas_patches', None) or [])[-_PATCHES_SAVED:]):
+    kept = (getattr(layer, 'canvas_patches', None) or [])[-_PATCHES_SAVED:] if with_patches else []
+    for i, p in enumerate(kept):
         if p.get('key') != raster.get('key'):
             continue
-        box = p['box']
-        info = _raw_image(zf, f"layers/{n:03d}_undo{i:03d}.png", p['image'])
-        info.update({'box': [box.x(), box.y(), box.width(), box.height()], 'count': p['count']})
+        patches.append((i, p['image'].copy(), QRect(p['box']), p['count']))
+    return {'image': raster['image'].copy(), 'rect': QRectF(raster['rect']), 'k': float(raster['k']),
+            'count': len(paint), 'patches': patches}
+
+
+def _write_raster(zf, snap, n):
+    rect = snap['rect']
+    out = _raw_image(zf, f"layers/{n:03d}.png", snap['image'])
+    out.update({'rect': [float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height())],
+                'k': snap['k'], 'cut_exact': True, 'count': snap['count'], 'patches': []})
+    for i, image, box, count in snap['patches']:
+        info = _raw_image(zf, f"layers/{n:03d}_undo{i:03d}.png", image)
+        info.update({'box': [box.x(), box.y(), box.width(), box.height()], 'count': count})
         out['patches'].append(info)
     return out
 

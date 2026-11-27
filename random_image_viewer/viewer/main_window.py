@@ -55,6 +55,7 @@ from random_image_viewer.widgets.layer_window import LayerWindow
 from random_image_viewer.drawing.layers import Layer, BLEND_MODES, MARK_FIELDS
 from random_image_viewer.drawing import brushes
 from random_image_viewer.drawing import transform as mark_transform
+from random_image_viewer.viewer.mask_tool import MaskToolMixin
 from random_image_viewer.widgets.brush_window import BrushWindow
 from random_image_viewer.services.frame_cache import FrameCache
 from random_image_viewer.widgets.image_label import ImageLabel
@@ -210,6 +211,9 @@ class _ProgressCard(QWidget):
         area = (QRect(canvas.mapToGlobal(QPoint(0, 0)), canvas.size())
                 if canvas is not None and canvas.isVisible() else self._viewer.frameGeometry())
         self.move(area.center().x() - self.W // 2, area.center().y() - self.H // 2)
+        watch = self._viewer.__dict__.get('_stall_watch')
+        if watch is not None and not self.isVisible():
+            watch.hold()                # ⏳ this card says it already
         self.show()
         self.raise_()
         self.repaint()
@@ -229,6 +233,9 @@ class _ProgressCard(QWidget):
 
 
     def finish(self):
+        watch = self._viewer.__dict__.get('_stall_watch')
+        if watch is not None and self.isVisible():
+            watch.release()
         self.hide()
 
     def paintEvent(self, _event):
@@ -893,7 +900,7 @@ class VideoControlsOverlay(QWidget):
         super().leaveEvent(event)
 
 
-class RandomImageViewer(QMainWindow):
+class RandomImageViewer(MaskToolMixin, QMainWindow):
     # Small toolbar spin boxes: hide the arrow buttons so the number shows.
     _SPIN_NO_ARROWS = "QSpinBox::up-button, QSpinBox::down-button { width: 0px; border: none; }"
 
@@ -1818,12 +1825,22 @@ class RandomImageViewer(QMainWindow):
         """*kept* (a layer image) moved whole into a bigger one holding the
         picture area *need*, at the same scale *k*: a copy, not every mark
         laid again (seconds with a few hundred strokes, at every stroke past
-        the edge). Its undo patches move with it. (image, rect) or None
-        where the scale is not the same."""
-        if abs(k - kept['k']) > 1e-9:
-            return None
+        the edge). Its undo patches move with it. (image, rect, k).
+
+        *kept* at another scale than *k* (a project's image saved finer than
+        this screen needs: k 2.5 against 1.8): it grows at its own scale while
+        that stays inside the size limits, else it is resampled once to *k*.
+        Laid again from every stroke instead, one 👆 smudge line past the
+        edge took 42 s (889 strokes) - and came out coarser."""
         old = QRectF(kept['rect'])
         need = QRectF(need).united(old)
+        if abs(k - kept['k']) > 1e-9:
+            kk = kept['k']
+            w, h = need.width() * kk, need.height() * kk
+            if kk > k and max(w, h) <= self._CANVAS_MAX_SIDE and w * h <= self._CANVAS_MAX_PIXELS:
+                k = kk                      # (room to stay as fine as it is)
+            else:
+                return self._resampled_canvas(layer, kept, need, k)
         # Whole pixels of offset, so the old image is copied, not resampled -
         # an even number: the thickness map (half the size) moves whole
         # pixels too, and is copied the same way (see _update_height).
@@ -1841,7 +1858,27 @@ class RandomImageViewer(QMainWindow):
         painter.end()
         for patch in getattr(layer, 'canvas_patches', None) or []:
             patch['box'] = patch['box'].translated(dx, dy)
-        return image, rect
+        return image, rect, k
+
+    def _resampled_canvas(self, layer, kept, need, k):
+        """*kept* drawn into a new layer image of picture area *need* at scale
+        *k* (smooth resampling: milliseconds, where laying every stroke again
+        took seconds). Its undo patches are at the old scale, so they go -
+        an undo past this lays the layer again."""
+        rect = QRectF(need)
+        w, h = self._canvas_view(rect, k)[:2]
+        image = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        old = QRectF(kept['rect'])
+        target = QRectF((old.x() - rect.x()) * k, (old.y() - rect.y()) * k,
+                        old.width() * k, old.height() * k)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.drawImage(target, kept['image'], QRectF(kept['image'].rect()))
+        painter.end()
+        layer.canvas_patches = []
+        return image, rect, k
 
     def _canvas_view(self, rect, k):
         """The _paint_marks view tuple that lays picture coords into a layer
@@ -1894,7 +1931,7 @@ class RandomImageViewer(QMainWindow):
         pen = ((self.line_color.rgba(), self.line_thickness)
                if self._marks_follow_pen(marks) else ())
         kept = layer.raster if (layer.raster or {}).get('canvas') else None
-        if (kept is not None and kept.get('key') == 'adopt' and marks
+        if (kept is not None and kept.get('key') == 'adopt' and marks and not kept.get('shifted')
                 and (kept['k'] < 0.9 * self._canvas_geometry(marks)[1]
                      # (or cut short of its paint: saved while layer images
                      # stopped a quarter of the sheet past its edges)
@@ -1933,12 +1970,12 @@ class RandomImageViewer(QMainWindow):
                         and (not kept['count'] or marks[kept['count'] - 1][1] is kept['last'])):
                     grown = self._grown_canvas(layer, kept, need, k)
                     if grown is not None:
-                        image, rect = grown
+                        image, rect, k = grown
                         new_key = key_for(rect, k)
                         for patch in getattr(layer, 'canvas_patches', None) or []:
                             if patch['key'] == kept['key']:
                                 patch['key'] = new_key
-                        kept = dict(kept, image=image, rect=rect, key=new_key)
+                        kept = dict(kept, image=image, rect=rect, key=new_key, k=k)
                         layer.raster = kept
         key = key_for(rect, k)
         view = self._canvas_view(rect, k)
@@ -2336,6 +2373,10 @@ class RandomImageViewer(QMainWindow):
             if not state['shown']:
                 state['shown'] = True
                 QApplication.setOverrideCursor(Qt.WaitCursor)
+                watch = self.__dict__.get('_stall_watch')
+                if watch is not None:
+                    watch.hold()            # ⏳ this loader says it already
+                    state['held'] = watch
             gpu = self._gpu_target() if self.__dict__.get('_gpu_display') else None
             if gpu is not None and hasattr(gpu, 'paint_busy') and gpu.isVisible():
                 try:
@@ -2372,6 +2413,8 @@ class RandomImageViewer(QMainWindow):
         finally:
             if state['shown']:
                 QApplication.restoreOverrideCursor()
+                if state.get('held') is not None:
+                    state['held'].release()
                 bar = self.__dict__.get('_busy_box')
                 if bar is not None:
                     bar.hide()
@@ -4402,6 +4445,9 @@ class RandomImageViewer(QMainWindow):
         # ⬚ Select + transform on / off; Ctrl+A takes every mark on the layer
         self.v_shortcut = QShortcut("V", self)
         self.v_shortcut.activated.connect(lambda: self.select_tool_btn.toggle())
+        # 🎭 Colour mask on / off
+        self.w_shortcut = QShortcut("W", self)
+        self.w_shortcut.activated.connect(lambda: self.mask_tool_btn.toggle())
         self.ctrl_a_shortcut = QShortcut("Ctrl+A", self)
         self.ctrl_a_shortcut.activated.connect(self.select_all_marks)
         # 🖌 B picks up the brush, as a click on it does - the Brush panel with
@@ -4548,6 +4594,12 @@ class RandomImageViewer(QMainWindow):
         add_spacer(2)
         self.eraser_tool_btn = QToolButton(); self.eraser_tool_btn.setText("⌫"); self.eraser_tool_btn.setToolTip("Erase with the brush (6): the brush rubs out what is drawn on the selected layer - with its tip, size, pressure and opacity, never the picture. Click again for the mode it was in"); self.eraser_tool_btn.setCheckable(True); self.eraser_tool_btn.setFixedSize(24,24); self.eraser_tool_btn.toggled.connect(self.toggle_brush_erase); toolbar.addWidget(self.eraser_tool_btn)
         self.select_tool_btn = QToolButton(); self.select_tool_btn.setText("⬚"); self.select_tool_btn.setToolTip("Select + transform (V): draw a lasso round marks on the selected layer (or click one, Ctrl+A for all), then drag inside to move, a corner to scale, outside to turn (Shift: 15° steps). Enter or double-click applies, Esc cancels, Ctrl+Z undoes. Strokes stay sharp at any size"); self.select_tool_btn.setCheckable(True); self.select_tool_btn.setFixedSize(24,24); self.select_tool_btn.toggled.connect(self.toggle_select_tool); toolbar.addWidget(self.select_tool_btn)
+        self.mask_tool_btn = QToolButton(); self.mask_tool_btn.setText("🎭")
+        self.mask_tool_btn.setToolTip("Colour mask (W): click colours on the picture or a layer - with a threshold, "
+                                      "grow / shrink and feather - then ⌫ Remove them, ✂ Cut or ⧉ Copy them to a "
+                                      "layer of their own. For taking a background away")
+        self.mask_tool_btn.setCheckable(True); self.mask_tool_btn.setFixedSize(24, 24)
+        self.mask_tool_btn.toggled.connect(self.toggle_mask_tool); toolbar.addWidget(self.mask_tool_btn)
         add_spacer(2)
         # Matches the brush range: erasing a 400px stroke with a 30px eraser is hopeless.
         self.eraser_size_spin = QSpinBox(); self.eraser_size_spin.setRange(1,400); self.eraser_size_spin.setValue(self.eraser_size); self.eraser_size_spin.setSuffix("px"); self.eraser_size_spin.setStyleSheet(self._SPIN_NO_ARROWS); self.eraser_size_spin.setAlignment(Qt.AlignCenter); self.eraser_size_spin.setFixedHeight(24); self.eraser_size_spin.setFixedWidth(58); self.eraser_size_spin.setToolTip("Eraser size (1-400px)"); self.eraser_size_spin.valueChanged.connect(self.update_eraser_size); toolbar.addWidget(self.eraser_size_spin)
@@ -4646,6 +4698,14 @@ class RandomImageViewer(QMainWindow):
         # held down (pen or mouse) or right-clicked: all the modes to pick from
         self.brush_mode_btn.hold_enabled = True
         self.brush_mode_btn.long_pressed.connect(self._show_mode_menu)
+        # ◐ the brush blend (Normal, Multiply, Screen ...): round, by the mode -
+        # click (or hold / right-click) for the list, the wheel steps through
+        self.brush_blend_btn = RoundToolButton("", checkable=False)
+        self.brush_blend_btn.clicked.connect(self._show_blend_menu)
+        self.brush_blend_btn.hold_enabled = True
+        self.brush_blend_btn.long_pressed.connect(self._show_blend_menu)
+        self.brush_blend_btn.wheelEvent = self._blend_wheel
+        toolbar.addWidget(self.brush_blend_btn)
         self._update_brush_button()
         self._update_brush_mode_button()
         add_spacer(4)
@@ -4977,7 +5037,8 @@ class RandomImageViewer(QMainWindow):
             # (its tip; opens the Brush panel), ⟷ size, 🎲 jitter, 💉 colour
             # snap - all round, one size
             ("PAINT", [
-                'free_draw_tool_btn', 'brush_mode_btn', 'brush_size_widget', 'color_snap_btn',
+                'free_draw_tool_btn', 'brush_mode_btn', 'brush_blend_btn', 'brush_size_widget',
+                'color_snap_btn',
             ]),
             ("DRAW", [
                 'line_tool_btn', 'hline_tool_btn', 'free_line_tool_btn', 'polyline_btn',
@@ -4992,7 +5053,7 @@ class RandomImageViewer(QMainWindow):
                 '__sep__',
                 # ⌫ is the brush in 🧽 Erase mode (its size is the brush size),
                 # so the old eraser's own size box is not placed.
-                'eraser_tool_btn', 'select_tool_btn',
+                'eraser_tool_btn', 'select_tool_btn', 'mask_tool_btn',
                 'undo_line_btn', 'redo_line_btn', 'clear_lines_btn',
                 '__sep__',
                 'crosshair_tool_btn', 'grid_tool_btn', 'cross_grid_btn',
@@ -5128,7 +5189,7 @@ class RandomImageViewer(QMainWindow):
             if st:
                 panel.apply_state(st)
         if not data.get('PAINT'):
-            self._place_paint_panel()       # new: by DRAW, not packed in at the top left
+            self._paint_panel_home()        # new: at the top middle, not packed in at the top left
         ctx = getattr(self, '_context_panel', None)
         if ctx is not None and data.get(ctx._persist_key):
             # Width, folded and place, as the others; whether it shows is
@@ -5136,6 +5197,21 @@ class RandomImageViewer(QMainWindow):
             ctx.apply_state(dict(data[ctx._persist_key]))
         # Re-pack any panels the user never moved so restored widths tile neatly.
         self._arrange_floating_panels()
+
+    def _paint_panel_home(self):
+        """🖌 PAINT open at the top middle of the canvas, kept centred as the
+        window resizes - its default place (dragged near it, it snaps back
+        there)."""
+        paint = getattr(self, '_panel_by_key', {}).get('PAINT')
+        if paint is None:
+            return None
+        paint.show()
+        if paint.collapsed:
+            paint.set_collapsed(False, emit=False)
+        paint.stick_to(None)
+        paint.dock('center', 'top', gap_y=paint.HOME_GAP)
+        paint.raise_()
+        return paint
 
     def _place_paint_panel(self, under_draw=False):
         """🖌 PAINT laid next to DRAW, right-aligned with it: just above it
@@ -5312,9 +5388,8 @@ class RandomImageViewer(QMainWindow):
             if panel is None or panel.isHidden():
                 continue
             if key == 'PAINT':
-                if panel.collapsed:
-                    panel.set_collapsed(False, emit=False)
-            elif not panel.collapsed:
+                continue                # (its own place: the top middle, below)
+            if not panel.collapsed:
                 panel.set_collapsed(True, emit=False)
             panels.append(panel)
         # The PAGES panel (a PDF / EPUB / comic open) goes on top of the
@@ -5327,11 +5402,15 @@ class RandomImageViewer(QMainWindow):
         for panel in reversed(panels):
             y -= panel.height()
             x = max(margin, canvas.width() - margin - panel.width())
+            panel.stick_to(None)        # (loose: DRAW no longer follows PAINT up top)
             panel.move(int(x), int(y))
             panel.mark_user_moved(True)
             panel.update_anchor()
             panel.raise_()
             y -= gap
+        paint = by_key.get('PAINT')
+        if paint is not None and not paint.isHidden():
+            self._paint_panel_home()
         self._save_panel_layout()
         # 🎨 Color, 🖌 Brush and 📚 Layers close (they open docked again).
         self.dock_panels()
@@ -10532,6 +10611,8 @@ class RandomImageViewer(QMainWindow):
             self._disable_crop_silent()
         if keep != 'select':
             self._disable_select_silent()
+        if keep != 'mask':
+            self._disable_mask_silent()         # 🎭
         if keep != 'line':
             self.line_drawing_mode = False
         if keep != 'hline':
@@ -11257,6 +11338,94 @@ class RandomImageViewer(QMainWindow):
             btn.setToolTip(f"{tip}. Click: Paint → Blend → Smudge → History → Pick blend "
                            "→ Erase (keys 1 / 2 / 3 / 4 / 5 / 6)")
         self._sync_erase_button()
+        self._update_brush_blend_button()
+
+    @staticmethod
+    def _blend_icon(name, size=26, dim=False):
+        """◐ what a blend does, drawn with it: a disc of warm paint laid in
+        *name* over a dark-to-light ground - Multiply darkens it, Screen
+        lightens, Difference inverts ... (a QPixmap, sharp on any screen)."""
+        from PySide6.QtGui import QLinearGradient
+        dpr = 2.0
+        img = QImage(int(size * dpr), int(size * dpr), QImage.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        ground = QLinearGradient(0, 0, size, 0)
+        ground.setColorAt(0.0, QColor(28, 30, 34))
+        ground.setColorAt(0.5, QColor(120, 128, 140))
+        ground.setColorAt(1.0, QColor(235, 238, 242))
+        p.fillRect(QRectF(0, 0, size, size), ground)
+        p.setCompositionMode(BLEND_MODES.get(name, QPainter.CompositionMode_SourceOver))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(232, 122, 58))
+        r = size * 0.3
+        p.drawEllipse(QPointF(size / 2, size / 2), r, r)
+        if dim:     # (not used by this brush mode)
+            p.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+            p.fillRect(QRectF(0, 0, size, size), QColor(30, 32, 35, 150))
+        p.end()
+        return QPixmap.fromImage(img)
+
+    def _blend_applies(self):
+        return self.brush_settings.get('mode', 'paint') in ('paint', 'history')
+
+    def _update_brush_blend_button(self):
+        btn = self.__dict__.get('brush_blend_btn')
+        if btn is None:
+            return
+        name = self.brush_settings.get('brush_blend', 'Normal')
+        if name not in BLEND_MODES:
+            name = 'Normal'
+        applies = self._blend_applies()
+        if getattr(btn, '_shown', None) != (name, applies):
+            btn._shown = (name, applies)
+            btn.set_image(self._blend_icon(name, dim=not applies))
+        tip = f"Brush blend: {name}"
+        if not applies:
+            tip += " - only 🖍 Paint and 🕘 History blend; this mode ignores it"
+        btn.setToolTip(tip + "\nHow the stroke mixes with what is under it: Multiply "
+                       "darkens, Screen lightens, Overlay / Soft Light add contrast ...\n"
+                       "Click: the list · wheel: the next / previous one")
+
+    def _show_blend_menu(self):
+        """◐ the brush blends in a list under the button, each drawn as what
+        it does - pick one."""
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui import QIcon
+        btn = self.brush_blend_btn
+        menu = QMenu(btn)
+        now = self.brush_settings.get('brush_blend', 'Normal')
+        for name in BLEND_MODES:
+            act = menu.addAction(QIcon(self._blend_icon(name, 18)), name)
+            act.setCheckable(True)
+            act.setChecked(name == now)
+            act.triggered.connect(lambda _on=False, n=name: self.set_brush_blend(n))
+        self._blend_menu = menu         # (kept while it is up)
+        menu.popup(btn.mapToGlobal(QPoint(0, btn.height())))
+
+    def _blend_wheel(self, event):
+        step = event.angleDelta().y()
+        if not step:
+            event.ignore()
+            return
+        names = list(BLEND_MODES)
+        now = self.brush_settings.get('brush_blend', 'Normal')
+        i = names.index(now) if now in names else 0
+        self.set_brush_blend(names[(i + (1 if step < 0 else -1)) % len(names)])
+        event.accept()
+
+    def set_brush_blend(self, name):
+        """◐ the brush blend set (the button, its list, its wheel)."""
+        if name not in BLEND_MODES:
+            return
+        self.set_brush_setting('brush_blend', name)
+        self._refresh_brush_window()
+        msg = f"Brush blend: {name}"
+        if not self._blend_applies():
+            msg += " (used by 🖍 Paint and 🕘 History)"
+        self.status.showMessage(msg, 2500)
 
     def _sync_erase_button(self):
         """⌫ shows whether the brush is rubbing out (🧽 Erase mode, brush on)."""
@@ -11289,11 +11458,14 @@ class RandomImageViewer(QMainWindow):
         the picture - with its effects - and only this layer and the ones
         under it ('below'), or this layer alone on nothing ('layer'). Made
         once, when the stroke starts."""
-        shown = self._view_pixmap()
         source = source or self.brush_settings.get('sample', 'below')
-        if (source == 'all' or shown is None or shown.isNull() or not self.current_image
+        # (the screen's own frame made only where it is what is read: made
+        # for nothing, it cost a whole CPU frame - and a new picture for the
+        # GPU canvas to take up, ~25 ms at every wet hair brush's pen-down)
+        label_pm = self.image_label.pixmap()
+        if (source == 'all' or label_pm is None or label_pm.isNull() or not self.current_image
                 or getattr(self, 'original_pixmap', None) is None):
-            return shown
+            return self._view_pixmap()
         try:
             index = self.layers.index(self.active_layer)
             wanted = self.layers[:index + 1] if source == 'below' else [self.active_layer]
@@ -11312,7 +11484,7 @@ class RandomImageViewer(QMainWindow):
                     view = self._fx_under(self.current_image,
                                           allow=lambda layer: layer.effects and id(layer) in allowed)
                     if view is None:
-                        return shown
+                        return self._view_pixmap()
                     view = self._effect_chain_over_paint(view, self._fx_paint_signature() + "|sample")
                     allowed = {i for i in allowed
                                if not next((l for l in self.layers if id(l) == i),
@@ -11329,7 +11501,7 @@ class RandomImageViewer(QMainWindow):
             return view
         except Exception as e:      # never let sampling stop the stroke
             print(f"_sample_view error: {e}")
-            return shown
+            return self._view_pixmap()
 
     def _screen_sampler(self, to_screen, shown=None):
         """f(x, y, size) -> the colour under a stamp (picture coords) in
@@ -11530,6 +11702,7 @@ class RandomImageViewer(QMainWindow):
             self.status.showMessage(f"Could not read {os.path.basename(path)} as a brush")
             return
         self.brush_settings['texture'] = path
+        self.brush_settings[f"texture_{self.brush_settings.get('mode', 'paint')}"] = path   # this mode's tip
         self._save_brush_settings()
         self._update_brush_button()
         if not self.free_draw_mode and hasattr(self, 'free_draw_tool_btn'):
@@ -11541,7 +11714,9 @@ class RandomImageViewer(QMainWindow):
     def reset_brush_settings(self):
         """↺ in the Brush panel: every brush setting back to its default -
         the tip and the mode stay (size and colour are not brush settings)."""
-        keep = {k: self.brush_settings[k] for k in ('texture', 'mode') if k in self.brush_settings}
+        keep = {k: v for k, v in self.brush_settings.items()
+                if k in ('texture', 'mode') or (k.startswith(('texture_', 'size_'))
+                                                and k not in brushes.DEFAULT_SETTINGS)}   # (each mode's tip and size too, not size_pressure)
         self.brush_settings = dict(brushes.DEFAULT_SETTINGS)
         self.brush_settings.update(keep)
         self.brush_settings['mix'] = brushes.MODE_MIX.get(self.brush_settings['mode'], 50)
@@ -11575,6 +11750,11 @@ class RandomImageViewer(QMainWindow):
             if sizes is not None:
                 sizes['brush'] = size
                 self._settings.setValue("tool_sizes", json.dumps(sizes))
+            # ... and its own tip: hair to Blend, a chalk to Paint, as left.
+            settings[f"texture_{settings['mode']}"] = settings.get('texture', '')
+            tip = settings.get(f"texture_{value}")
+            if tip is not None and (not tip or brushes.load_texture(tip) is not None):
+                settings['texture'] = tip           # (a tip since deleted: the one in hand stays)
         settings[key] = value
         self._save_brush_settings()
         if key in self._JITTER_KEYS and self.__dict__.get('_jitter_knob') is not None:
@@ -11583,6 +11763,8 @@ class RandomImageViewer(QMainWindow):
             self._recall_size_in_hand(size)     # whose size the slider is now
         if key == 'gradient_mid':
             self._regrade_last_gradient()
+        if key == 'brush_blend':
+            self._update_brush_blend_button()      # (picked in 🖌 too)
         if key == 'mode':
             self._refresh_brush_window()
             self._update_brush_mode_button()
@@ -11643,6 +11825,9 @@ class RandomImageViewer(QMainWindow):
         if self.brush_settings['texture'] == path:
             self.brush_settings['texture'] = ''
             self._update_brush_button()
+        for k, v in list(self.brush_settings.items()):
+            if k.startswith('texture_') and v == path:
+                self.brush_settings[k] = ''         # (no mode brings a removed tip back)
         self._save_brush_settings()
         self._refresh_brush_window()
 
@@ -11817,12 +12002,14 @@ class RandomImageViewer(QMainWindow):
                                                   self.brush_settings['spacing'],
                                                   self.brush_settings.get('pigment', True))
         else:
-            self._flat_live = (brushes.flat_stroke(texture, image.rect(), source)
-                               if (self._stamp_trail.settings['flat'] or history) and image is not None
-                               else None)
+            # laid on the graphics card where it can be (see _gpu_flat_stroke) -
+            # the CPU's stroke and its buffers only otherwise (made and thrown
+            # away, its six screen-sized buffers cost ~15-20 ms at every pen-down)
             self._gpu_flat = self._gpu_flat_stroke(image, mode, history, texture)
-            if self._gpu_flat is not None:
-                self._flat_live = None      # laid on the graphics card instead (see _gpu_flat_stroke)
+            self._flat_live = (brushes.flat_stroke(texture, image.rect(), source)
+                               if (self._gpu_flat is None and image is not None
+                                   and (self._stamp_trail.settings['flat'] or history))
+                               else None)
             live_hairs = (self._flat_live if self._flat_live is not None
                           else getattr(self._gpu_flat, 'model', None))     # (🖌 on the card: its bristles)
             if (isinstance(live_hairs, brushes.BristleStroke) and mode == 'paint'
@@ -15285,7 +15472,7 @@ class RandomImageViewer(QMainWindow):
         elif (getattr(self, 'color_snap_mode', False) or self.free_line_drawing_mode
                 or self.line_drawing_mode or self.horizontal_line_drawing_mode
                 or getattr(self, 'fill_mode', None) or self.crop_mode
-                or getattr(self, 'select_mode', False)):
+                or getattr(self, 'select_mode', False) or self.mask_mode):
             label.setCursor(self._cross_cursor())
         else:
             label.setCursor(Qt.ArrowCursor)
@@ -17864,6 +18051,7 @@ class RandomImageViewer(QMainWindow):
         self._wheel_nav_hint_shown = False
         self.cancel_fill()
         self._drop_selection()          # its marks go with the rest
+        self._mask_new_picture()        # 🎭 colours picked on the last one mean nothing here
         self._transform_undo = {}
         if not keep:
             self.__dict__.get('_kept_paintings', {}).pop(self.current_image, None)
@@ -18744,7 +18932,7 @@ class RandomImageViewer(QMainWindow):
         draw = getattr(self, '_panel_by_key', {}).get('DRAW')
         if (draw is not None and not getattr(self, '_panels_hidden', False)
                 and self._ui_chrome_visible()):
-            self._dock_paint_and_draw()     # 🖌 PAINT on top, DRAW under it
+            self._dock_paint_and_draw()     # 🖌 PAINT top middle, DRAW top right
         self._dock_place()
         for win in (getattr(self, '_brush_window', None), getattr(self, '_layer_window', None)):
             if win is not None and win.isVisible():
@@ -18825,7 +19013,25 @@ class RandomImageViewer(QMainWindow):
                 image['corners'] = [moved(p) for p in image['corners']]
             for stroke in marks['erase_strokes']:
                 stroke[:] = [moved(p) for p in stroke]
+            self._shift_raster(layer, dx)
+
+    def _shift_raster(self, layer, dx):
+        """*layer*'s image moved *dx* with its marks: the same pixels in a
+        new place, taken up again as a project's image is ('adopt': keyed
+        anew for the new sheet). Thrown away instead, every ◧ Studio on /
+        off laid every stroke again - 48 s with 1038 strokes."""
+        kept = layer.raster
+        if not (kept or {}).get('canvas') or kept.get('image') is None:
             layer.raster = None
+            return
+        old_key = kept.get('key')
+        # ('shifted': it held its paint before, and still does - the check
+        # a project's image gets measures every stroke, ~1 s twice here)
+        layer.raster = dict(kept, rect=QRectF(kept['rect']).translated(dx, 0), key='adopt',
+                            shifted=True)
+        for patch in getattr(layer, 'canvas_patches', None) or []:
+            if patch.get('key') == old_key:
+                patch['key'] = 'adopt'      # (its undo patches go with it)
 
     _studio_draw_was = None     # the DRAW panel's state before ◧ Studio moved it
 
@@ -18858,25 +19064,21 @@ class RandomImageViewer(QMainWindow):
             self._arrange_floating_panels()
 
     def _dock_paint_and_draw(self):
-        """🖌 PAINT open in the top right corner, DRAW open right under it
-        (◧ Studio, a new sketch)."""
+        """🖌 PAINT open at the top middle, DRAW open in the top right corner
+        - under PAINT's line when the two would overlap (◧ Studio, a new
+        sketch)."""
         by_key = getattr(self, '_panel_by_key', {})
-        paint, draw = by_key.get('PAINT'), by_key.get('DRAW')
-        top = 8
-        if paint is not None:
-            paint.show()
-            paint.set_collapsed(False, emit=False)
-            paint.dock('right', 'top')
-            paint.raise_()
-            top = 8 + paint.height() + 8
+        draw = by_key.get('DRAW')
+        paint = self._paint_panel_home()
         if draw is not None:
             draw.show()
             draw.set_collapsed(False, emit=False)
+            draw.stick_to(None)
+            top = 8
+            right = self.image_label.width() - 8 - draw.width()
+            if paint is not None and paint.x() + paint.width() + 8 > right:
+                top = 8 + paint.height() + 8
             draw.dock('right', 'top', gap_y=top)
-            if paint is not None:
-                # 🧲 stuck under PAINT, right edges lined up
-                draw.stick_to(paint, 'below', paint.width() - draw.width())
-                draw.update_anchor()
             draw.raise_()
 
     def toggle_studio_mode(self, on):
@@ -22311,6 +22513,10 @@ class RandomImageViewer(QMainWindow):
                     p.setPen(QPen(colour, width, Qt.SolidLine, Qt.SquareCap))
                     p.drawLine(*self._hairline_points(p, ends, width))
         label.paint_tool_overlay(p)
+        if self.mask_mode and self._mask_view is not None:
+            # 🎭 the colour mask in red (drawn on the plain canvas only, it
+            # sat hidden under this one wherever there was paint - ◧ Studio)
+            self.paint_mask_overlay(p)
         p.restore()
 
     def _gpu_display_frame(self, img_path):
@@ -23597,6 +23803,9 @@ class RandomImageViewer(QMainWindow):
             event.ignore()
             return
         self._end_safety()                      # 🛟 closed properly: nothing to recover
+        watch = self.__dict__.get('_stall_watch')
+        if watch is not None:
+            watch.stop()
         player = getattr(getattr(self, 'image_label', None), '_media_player', None)
         if player is not None and self.__dict__.get('_media_path'):
             try:                                # ⏯ the app closed mid-video / song: kept
@@ -23630,8 +23839,10 @@ class RandomImageViewer(QMainWindow):
     # start when the app did not close properly; a hang writes every
     # thread's stack (logs/hang_*.txt), a crash its own (logs/crash_*.txt).
 
-    _AUTOSAVE_QUIET_S = 2.0     # this long after the last stroke ...
-    _AUTOSAVE_GAP_S = 30.0      # ... and at most this often (longer when saving is slow)
+    # Conservative: painting must feel good, a recovery copy a few minutes
+    # old is enough (it was 2 s / 30 s, a big painting's save every minute).
+    _AUTOSAVE_QUIET_S = 6.0     # this long after the last stroke ...
+    _AUTOSAVE_GAP_S = 180.0     # ... and at most this often (longer when saving is slow)
 
     def _start_safety(self):
         if self.__dict__.get('_safety_started'):
@@ -23660,7 +23871,18 @@ class RandomImageViewer(QMainWindow):
 
     def _autosave_tick(self):
         """The painting into the recovery folder, when there is something
-        new, the pen has rested a moment and nothing else is under way."""
+        new, the pen has rested a moment and nothing else is under way.
+
+        Only a snapshot is taken here (project_file.snapshot: ms); it is
+        written by a thread of its own. Written here, a big painting held
+        the app 3-9 s every minute or two - just when the pen rested, as it
+        does while picking another layer: the next stroke waited."""
+        job = self.__dict__.get('_autosave_job')
+        if job is not None:
+            if job['thread'].is_alive():
+                return                  # (one at a time)
+            self._autosave_job = None
+            self._autosave_finished(job)
         try:
             if (self.is_drawing_free_stroke or self.current_stroke or self.current_fill
                     or not self.current_image or not os.path.isfile(self.current_image)
@@ -23680,18 +23902,58 @@ class RandomImageViewer(QMainWindow):
                 return
             from random_image_viewer import project_file
             from random_image_viewer.services import safety
+            import threading
             path = safety.recovery_path(self.current_image)
             t0 = time.perf_counter()
-            project_file.save_project(self, path, thumbnail=False)
-            took = time.perf_counter() - t0
-            self._autosaved_sig, self._autosave_t = sig, time.monotonic()
-            # never more than ~5 % of the time spent saving
-            self._autosave_gap = max(self._AUTOSAVE_GAP_S, 20.0 * took)
-            safety.prune_recovery()
-            print(f"🛟 Autosaved {os.path.basename(path)} in {took:.2f} s")
+            snap = project_file.snapshot(self, thumbnail=False, patches=False)
+            job = {'path': path, 'sig': sig, 'held_ms': (time.perf_counter() - t0) * 1000,
+                   'error': None, 'took': None}
+            self._autosave_t = time.monotonic()
+
+            def write():
+                if sys.platform == 'win32':
+                    try:            # below the painting (THREAD_PRIORITY_BELOW_NORMAL)
+                        import ctypes
+                        k32 = ctypes.WinDLL('kernel32')
+                        k32.GetCurrentThread.restype = ctypes.c_void_p
+                        k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                        k32.SetThreadPriority(k32.GetCurrentThread(), -1)
+                    except Exception:
+                        pass
+                t = time.perf_counter()
+
+                def painting():
+                    # (read from this thread: plain attributes, a moment old at worst)
+                    return bool(self.is_drawing_free_stroke or self.current_stroke
+                                or time.monotonic() - self.__dict__.get('_last_paint_t', 0.0) < 1.5)
+                try:
+                    project_file.write_snapshot(snap, path, pause=painting)
+                except Exception as e:
+                    job['error'] = e
+                job['took'] = time.perf_counter() - t
+            job['thread'] = threading.Thread(target=write, name="autosave", daemon=True)
+            job['thread'].start()
+            self._autosave_job = job
         except Exception as e:
             self._autosave_t = time.monotonic()
             print(f"🛟 Autosave failed: {e}")
+
+    def _autosave_finished(self, job):
+        """A written autosave: noted (or why not)."""
+        from random_image_viewer.services import safety
+        if job['error'] is not None:
+            print(f"🛟 Autosave failed: {job['error']}")
+            return
+        took = job['took'] or 0.0
+        self._autosaved_sig, self._autosave_t = job['sig'], time.monotonic()
+        # (in the background now, but still not more often than every ~30x its time)
+        self._autosave_gap = max(self._AUTOSAVE_GAP_S, 30.0 * took)
+        try:
+            safety.prune_recovery()
+        except Exception:
+            pass
+        print(f"🛟 Autosaved {os.path.basename(job['path'])} in {took:.2f} s "
+              f"(in the background; the app held {job['held_ms']:.0f} ms)")
 
     def _offer_recovery(self, files):
         """The last session ended without closing: its newest painting
@@ -23739,6 +24001,11 @@ class RandomImageViewer(QMainWindow):
         # The GPU view's OpenGL set up now, while idle, not on the first zoom.
         QTimer.singleShot(2500, self._gpu_warm_up)
         self._start_safety()
+        if self.__dict__.get('_stall_watch') is None:
+            # ⏳ busy over a second, whatever it is: a loader, and the cause logged
+            from random_image_viewer.services.stall_watch import StallWatch
+            self._stall_watch = StallWatch(self)
+            self._stall_watch.start()
         try:
             seconds = process_uptime_seconds()
             source = "process launch"
